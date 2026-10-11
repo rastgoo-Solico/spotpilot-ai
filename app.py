@@ -1616,12 +1616,13 @@ else:
                 for col in ["Open", "High", "Low", "Close", "ATR", "UT Stop"]:
                     signal_table[col] = signal_table[col].map(fmt_price)
 
-                st.caption("آخرین کندل‌های بسته‌شده")
-                st.dataframe(
-                    signal_table,
-                    use_container_width=True,
-                    hide_index=True,
-                )
+                with st.expander("جزئیات کندل‌های اخیر (برای بررسی پیشرفته)"):
+                    st.caption("۱۲ کندل بسته‌شدهٔ اخیر؛ زمان‌ها بر اساس UTC هستند.")
+                    st.dataframe(
+                        signal_table,
+                        use_container_width=True,
+                        hide_index=True,
+                    )
 
             except Exception as exc:
                 st.error(
