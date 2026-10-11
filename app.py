@@ -1281,24 +1281,25 @@ with st.sidebar:
     )
 
     st.divider()
-    st.header("تنظیمات UT Bot")
+    with st.expander("تنظیمات پیشرفته UT Bot"):
+        st.caption("اگر با این پارامترها آشنا نیستی، مقدار پیش‌فرض را تغییر نده.")
+        atr_period = st.number_input(
+            "دوره ATR",
+            min_value=1,
+            max_value=100,
+            value=1,
+            step=1,
+            help="تعداد کندل‌های مورد استفاده برای برآورد نوسان. مقدار ۱ بسیار سریع و حساس است.",
+        )
 
-    atr_period = st.number_input(
-        "دوره ATR",
-        min_value=1,
-        max_value=100,
-        value=1,
-        step=1,
-        help="مقدار پیش‌فرض ۱ مطابق ورودی c در اسکریپت ارسالی است.",
-    )
-
-    ut_multiplier = st.number_input(
-        "ضریب ATR (Key Value)",
-        min_value=0.1,
-        max_value=20.0,
-        value=2.0,
-        step=0.1,
-    )
+        ut_multiplier = st.number_input(
+            "ضریب ATR (Key Value)",
+            min_value=0.1,
+            max_value=20.0,
+            value=2.0,
+            step=0.1,
+            help="ضریب فاصله حد متحرک UT از قیمت؛ افزایش آن معمولاً فاصله را بیشتر می‌کند و سیگنال‌ها را تغییر می‌دهد.",
+        )
 
     refresh = st.button("🔄 به‌روزرسانی داده‌ها", use_container_width=True)
 
