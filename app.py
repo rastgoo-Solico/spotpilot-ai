@@ -5,15 +5,17 @@ import streamlit as st
 from datetime import datetime, timezone
 
 # =========================================================
-# SpotPilot AI — Live Market Screener
-# Data provider: LiveCoinWatch
+# SpotPilot AI — LiveCoinWatch + LBank Spot Analytics
+# Public market data only. No order execution.
 # =========================================================
 
-API_URL = "https://api.livecoinwatch.com"
+LCW_URL = "https://api.livecoinwatch.com"
+LBANK_URL = "https://api.lbank.info/v2"
+
 MIN_VOLUME_BTC = 1000
 PAGE_SIZE = 100
 MAX_PAGES = 20
-REQUEST_TIMEOUT = 25
+TIMEOUT = 20
 
 st.set_page_config(
     page_title="SpotPilot AI",
@@ -22,398 +24,680 @@ st.set_page_config(
 )
 
 st.title("📊 SpotPilot AI")
-st.caption("Live crypto market screener | No automatic trading")
+st.caption("Live market screening · LBank order book · Trade-flow analysis")
+st.markdown(
+    "[LiveCoinWatch API](https://www.livecoinwatch.com/tools/api) · "
+    "[LBank API documentation](https://www.lbank.com/docs/index.html)"
+)
 
 st.info(
-    "این داشبورد از داده‌های API استفاده می‌کند. "
-    "حجم گزارش‌شدهٔ بازار لزوماً به معنی حجم تأییدشدهٔ اسپات نیست. "
-    "هیچ سفارش خرید یا فروشی به‌صورت خودکار ارسال نمی‌شود."
+    "فقط داده عمومی بازار خوانده می‌شود. هیچ سفارشی ارسال نمی‌شود. "
+    "معاملات بزرگ، هویت نهنگ را اثبات نمی‌کنند؛ "
+    "جریان معاملات نیز معادل ورود قطعی پول تازه به بازار نیست."
 )
 
 
-def get_api_key():
-    """Read API key from Streamlit Secrets."""
+# ---------------------------------------------------------
+# HTTP helpers
+# ---------------------------------------------------------
+
+def get_json(url, params=None):
+    response = requests.get(
+        url,
+        params=params or {},
+        timeout=TIMEOUT,
+        headers={"User-Agent": "SpotPilotAI/1.0"},
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def lcw_post(api_key, endpoint, payload):
+    response = requests.post(
+        f"{LCW_URL}/{endpoint}",
+        headers={
+            "content-type": "application/json",
+            "x-api-key": api_key,
+        },
+        json=payload,
+        timeout=TIMEOUT,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def read_lcw_key():
     try:
-        return st.secrets["LIVECOINWATCH_API_KEY"].strip()
+        return str(st.secrets["LIVECOINWATCH_API_KEY"]).strip()
     except Exception:
         return ""
 
 
-def api_post(endpoint, api_key, payload=None):
-    """Send a request to LiveCoinWatch and validate the response."""
-    headers = {
-        "content-type": "application/json",
-        "accept": "application/json",
-        "x-api-key": api_key,
-    }
+# ---------------------------------------------------------
+# LiveCoinWatch market screener
+# ---------------------------------------------------------
 
-    response = requests.post(
-        f"{API_URL}/{endpoint}",
-        headers=headers,
-        json=payload or {},
-        timeout=REQUEST_TIMEOUT,
-    )
-
-    if not response.ok:
-        message = response.text[:500]
-        raise RuntimeError(
-            f"LiveCoinWatch returned HTTP {response.status_code}: "
-            f"{message}"
-        )
-
-    try:
-        return response.json()
-    except ValueError as exc:
-        raise RuntimeError(
-            "پاسخ API در قالب JSON معتبر نبود."
-        ) from exc
-
-
-def get_btc_usd_price(api_key):
-    """Get the current BTC price in USD."""
-    data = api_post(
-        "coins/single",
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_lcw_market(api_key):
+    btc_data = lcw_post(
         api_key,
+        "coins/single",
         {
             "currency": "USD",
             "code": "BTC",
             "meta": False,
         },
     )
+    btc_usd = float(btc_data["rate"])
+    if btc_usd <= 0:
+        raise ValueError("قیمت BTC از LiveCoinWatch معتبر نیست.")
 
-    price = float(data.get("rate") or 0)
-
-    if price <= 0:
-        raise RuntimeError(
-            "قیمت معتبر BTC از API دریافت نشد."
-        )
-
-    return price
-
-
-def fetch_market_data(api_key):
-    """
-    Fetch coins sorted by reported 24h volume in USD.
-    Convert the 1000 BTC threshold to USD using the live BTC price.
-    Stop once sorted results fall below the threshold.
-    """
-    btc_usd = get_btc_usd_price(api_key)
-    minimum_volume_usd = MIN_VOLUME_BTC * btc_usd
-
-    all_coins = []
+    threshold_usd = MIN_VOLUME_BTC * btc_usd
+    coins = []
+    threshold_reached = False
     pages_checked = 0
-    reached_threshold = False
 
     for page in range(MAX_PAGES):
-        payload = {
-            "currency": "USD",
-            "sort": "volume",
-            "order": "descending",
-            "offset": page * PAGE_SIZE,
-            "limit": PAGE_SIZE,
-            "meta": True,
-        }
+        data = lcw_post(
+            api_key,
+            "coins/list",
+            {
+                "currency": "USD",
+                "sort": "volume",
+                "order": "descending",
+                "offset": page * PAGE_SIZE,
+                "limit": PAGE_SIZE,
+                "meta": True,
+            },
+        )
 
-        result = api_post("coins/list", api_key, payload)
-
-        if not isinstance(result, list):
-            raise RuntimeError(
-                "ساختار پاسخ /coins/list مطابق انتظار نبود."
-            )
+        if not isinstance(data, list):
+            raise ValueError("ساختار پاسخ LiveCoinWatch غیرمنتظره است.")
 
         pages_checked += 1
-
-        if not result:
+        if not data:
             break
 
-        # Keep coins meeting the reported 24h volume threshold.
-        for coin in result:
+        for coin in data:
             try:
                 volume_usd = float(coin.get("volume") or 0)
             except (TypeError, ValueError):
                 continue
 
-            if volume_usd >= minimum_volume_usd:
-                coin_copy = dict(coin)
-                coin_copy["_volume_usd"] = volume_usd
-                all_coins.append(coin_copy)
+            if volume_usd < threshold_usd:
+                continue
 
-        # Results are requested in descending volume order.
-        # If the last coin is below threshold, later pages should
-        # not contain qualifying coins.
+            delta = coin.get("delta") or {}
+            try:
+                change_pct = (float(delta["day"]) - 1) * 100
+            except (KeyError, TypeError, ValueError):
+                change_pct = None
+
+            code = str(coin.get("code") or "").strip().upper()
+            if not code:
+                continue
+
+            coins.append({
+                "Symbol": code,
+                "Name": coin.get("name") or code,
+                "Price USD": float(coin.get("rate") or 0),
+                "Change 24h %": change_pct,
+                "Reported Volume USD": volume_usd,
+                "Volume BTC equivalent": volume_usd / btc_usd,
+                "Market Cap USD": float(coin.get("cap") or 0),
+                "LBank Pair": code.lower() + "_usdt",
+            })
+
         try:
-            last_volume = float(result[-1].get("volume") or 0)
+            last_volume = float(data[-1].get("volume") or 0)
         except (TypeError, ValueError):
             last_volume = 0
 
-        if last_volume < minimum_volume_usd:
-            reached_threshold = True
+        # Results were requested by descending volume.
+        if last_volume < threshold_usd:
+            threshold_reached = True
             break
 
-        if len(result) < PAGE_SIZE:
+        if len(data) < PAGE_SIZE:
             break
 
-    return {
-        "coins": all_coins,
-        "btc_usd": btc_usd,
-        "minimum_volume_usd": minimum_volume_usd,
-        "pages_checked": pages_checked,
-        "reached_threshold": reached_threshold,
-    }
-
-
-def prepare_dataframe(coins, btc_usd):
-    """Convert live API response into a readable table."""
-    rows = []
-
-    for coin in coins:
-        delta = coin.get("delta") or {}
-
-        try:
-            rate_usd = float(coin.get("rate") or 0)
-        except (TypeError, ValueError):
-            rate_usd = 0
-
-        try:
-            volume_usd = float(coin.get("_volume_usd") or 0)
-        except (TypeError, ValueError):
-            volume_usd = 0
-
-        try:
-            market_cap_usd = float(coin.get("cap") or 0)
-        except (TypeError, ValueError):
-            market_cap_usd = 0
-
-        try:
-            liquidity_usd = float(coin.get("liquidity") or 0)
-        except (TypeError, ValueError):
-            liquidity_usd = 0
-
-        try:
-            delta_day = float(delta.get("day") or 1)
-            change_24h_pct = (delta_day - 1) * 100
-        except (TypeError, ValueError):
-            change_24h_pct = None
-
-        rows.append({
-            "Symbol": coin.get("code", "N/A"),
-            "Name": coin.get("name", "N/A"),
-            "Price (USD)": rate_usd,
-            "24h Change (%)": change_24h_pct,
-            "Reported Volume (USD)": volume_usd,
-            "Volume (BTC equivalent)": (
-                volume_usd / btc_usd if btc_usd > 0 else None
-            ),
-            "Market Cap (USD)": market_cap_usd,
-            "Liquidity (USD)": liquidity_usd,
-            "Exchanges": coin.get("exchanges"),
-            "Markets": coin.get("markets"),
-        })
-
-    df = pd.DataFrame(rows)
-
+    df = pd.DataFrame(coins)
     if not df.empty:
         df = df.sort_values(
-            by="24h Change (%)",
+            "Change 24h %",
             ascending=False,
             na_position="last",
         ).reset_index(drop=True)
 
-    return df
+    return {
+        "coins": df,
+        "btc_usd": btc_usd,
+        "threshold_usd": threshold_usd,
+        "pages_checked": pages_checked,
+        "threshold_reached": threshold_reached,
+    }
 
 
-# =========================================================
-# Sidebar
-# =========================================================
+# ---------------------------------------------------------
+# LBank public spot data
+# ---------------------------------------------------------
 
-st.sidebar.header("Settings")
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_lbank_pairs():
+    result = get_json(f"{LBANK_URL}/currencyPairs.do")
+    pairs = result.get("data", [])
+    if not isinstance(pairs, list):
+        raise ValueError("فهرست جفت‌ارزهای LBank معتبر نیست.")
+    return {str(pair).lower() for pair in pairs}
 
-st.sidebar.metric(
-    "Minimum reported volume",
-    f"{MIN_VOLUME_BTC:,} BTC",
-)
 
-st.sidebar.write(
-    "ترتیب نمایش: درصد تغییر ۲۴ ساعته، از بیشترین به کمترین."
-)
-
-st.sidebar.caption(
-    f"حداکثر بررسی در هر بار اجرا: "
-    f"{MAX_PAGES * PAGE_SIZE:,} رکورد."
-)
-
-refresh = st.sidebar.button(
-    "🔄 دریافت داده‌های زنده",
-    type="primary",
-    use_container_width=True,
-)
-
-# =========================================================
-# Main application
-# =========================================================
-
-api_key = get_api_key()
-
-if not api_key:
-    st.warning(
-        "کلید API هنوز در Secrets تنظیم نشده است. "
-        "طبق راهنمای پایین صفحه آن را اضافه کن."
+@st.cache_data(ttl=10, show_spinner=False)
+def fetch_order_book(symbol, depth_size=100):
+    result = get_json(
+        f"{LBANK_URL}/depth.do",
+        {"symbol": symbol, "size": depth_size},
     )
-    st.stop()
+    data = result.get("data", result)
 
-if refresh or "market_result" not in st.session_state:
-    with st.spinner(
-        "در حال دریافت قیمت BTC و داده‌های بازار از LiveCoinWatch..."
-    ):
+    bids = data.get("bids") or []
+    asks = data.get("asks") or []
+
+    def parse_levels(levels):
+        parsed = []
+        for level in levels:
+            try:
+                price = float(level[0])
+                qty = float(level[1])
+                if price > 0 and qty >= 0:
+                    parsed.append({
+                        "price": price,
+                        "qty": qty,
+                        "notional": price * qty,
+                    })
+            except (TypeError, ValueError, IndexError):
+                continue
+        return parsed
+
+    return {
+        "bids": parse_levels(bids),
+        "asks": parse_levels(asks),
+        "timestamp": data.get("timestamp"),
+    }
+
+
+@st.cache_data(ttl=10, show_spinner=False)
+def fetch_recent_trades(symbol, size=500):
+    result = get_json(
+        f"{LBANK_URL}/supplement/trades.do",
+        {"symbol": symbol, "size": size},
+    )
+
+    data = result.get("data", result)
+    if not isinstance(data, list):
+        raise ValueError("ساختار معاملات اخیر LBank غیرمنتظره است.")
+
+    rows = []
+    for trade in data:
         try:
-            result = fetch_market_data(api_key)
-            st.session_state["market_result"] = result
-            st.session_state["market_error"] = None
-            st.session_state["last_updated"] = datetime.now(
-                timezone.utc
-            ).strftime("%Y-%m-%d %H:%M:%S UTC")
-        except Exception as exc:
-            st.session_state["market_error"] = str(exc)
+            price = float(trade.get("price") or 0)
+            qty = float(trade.get("qty") or 0)
+            quote_qty = float(trade.get("quoteQty") or price * qty)
 
-if st.session_state.get("market_error"):
+            if quote_qty <= 0:
+                continue
+
+            # LBank: if buyer is maker, seller was the taker.
+            # Aggressive sell => seller crossed the spread.
+            buyer_maker = trade.get("isBuyerMaker")
+
+            if buyer_maker is True:
+                side = "Sell"
+            elif buyer_maker is False:
+                side = "Buy"
+            else:
+                side = "Unknown"
+
+            rows.append({
+                "Time": trade.get("time"),
+                "Price": price,
+                "Quantity": qty,
+                "Value USDT": quote_qty,
+                "Aggressor": side,
+                "Trade ID": trade.get("id"),
+            })
+        except (TypeError, ValueError):
+            continue
+
+    return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------
+# Order-book analytics
+# ---------------------------------------------------------
+
+def analyze_order_book(book, levels=20, wall_multiplier=5.0):
+    bids = book["bids"][:levels]
+    asks = book["asks"][:levels]
+
+    if not bids or not asks:
+        raise ValueError("دفتر سفارش خرید یا فروش خالی است.")
+
+    best_bid = bids[0]["price"]
+    best_ask = asks[0]["price"]
+    mid = (best_bid + best_ask) / 2
+
+    spread = best_ask - best_bid
+    spread_pct = spread / mid * 100 if mid > 0 else 0
+
+    bid_value = sum(level["notional"] for level in bids)
+    ask_value = sum(level["notional"] for level in asks)
+    total = bid_value + ask_value
+
+    imbalance_pct = (
+        (bid_value - ask_value) / total * 100
+        if total > 0 else 0
+    )
+
+    all_levels = bids + asks
+    median_level_value = (
+        sorted(x["notional"] for x in all_levels)[len(all_levels) // 2]
+        if all_levels else 0
+    )
+    wall_threshold = median_level_value * wall_multiplier
+
+    walls = []
+    for side, side_levels in (("Bid wall", bids), ("Ask wall", asks)):
+        for level in side_levels:
+            if level["notional"] >= wall_threshold and level["notional"] > 0:
+                distance = (
+                    (level["price"] - mid) / mid * 100
+                    if mid else 0
+                )
+                walls.append({
+                    "Side": side,
+                    "Price": level["price"],
+                    "Quantity": level["qty"],
+                    "Value USDT": level["notional"],
+                    "Distance from mid %": distance,
+                })
+
+    walls.sort(key=lambda row: row["Value USDT"], reverse=True)
+
+    if imbalance_pct >= 15:
+        pressure = "فشار سفارش‌های خرید بیشتر"
+    elif imbalance_pct <= -15:
+        pressure = "فشار سفارش‌های فروش بیشتر"
+    else:
+        pressure = "تعادل نسبی دفتر سفارش"
+
+    return {
+        "best_bid": best_bid,
+        "best_ask": best_ask,
+        "mid": mid,
+        "spread": spread,
+        "spread_pct": spread_pct,
+        "bid_value": bid_value,
+        "ask_value": ask_value,
+        "imbalance_pct": imbalance_pct,
+        "pressure": pressure,
+        "walls": walls,
+    }
+
+
+# ---------------------------------------------------------
+# Recent-trade flow and large-trade flags
+# ---------------------------------------------------------
+
+def analyze_trades(trades, whale_threshold, median_multiplier=5.0):
+    if trades.empty:
+        return {
+            "trades": trades,
+            "buy_value": 0,
+            "sell_value": 0,
+            "net_flow": 0,
+            "buy_share": None,
+            "unknown_count": 0,
+            "large_trades": pd.DataFrame(),
+            "median_trade": 0,
+        }
+
+    buys = trades[trades["Aggressor"] == "Buy"]
+    sells = trades[trades["Aggressor"] == "Sell"]
+    unknown = trades[trades["Aggressor"] == "Unknown"]
+
+    buy_value = float(buys["Value USDT"].sum())
+    sell_value = float(sells["Value USDT"].sum())
+    known_total = buy_value + sell_value
+
+    median_trade = float(trades["Value USDT"].median())
+    adaptive_threshold = max(
+        float(whale_threshold),
+        median_trade * float(median_multiplier),
+    )
+
+    large_trades = trades[
+        (trades["Value USDT"] >= adaptive_threshold)
+        & (trades["Aggressor"] != "Unknown")
+    ].copy()
+
+    if not large_trades.empty:
+        large_trades["Large trade threshold USDT"] = adaptive_threshold
+
+    return {
+        "trades": trades,
+        "buy_value": buy_value,
+        "sell_value": sell_value,
+        "net_flow": buy_value - sell_value,
+        "buy_share": buy_value / known_total * 100 if known_total else None,
+        "unknown_count": len(unknown),
+        "large_trades": large_trades.sort_values(
+            "Value USDT", ascending=False
+        ),
+        "median_trade": median_trade,
+        "adaptive_threshold": adaptive_threshold,
+    }
+
+
+def flow_summary(net_flow, imbalance_pct):
+    if net_flow > 0 and imbalance_pct > 0:
+        return (
+            "خرید تهاجمی و دفتر سفارش هر دو متمایل به خریدند؛ "
+            "این هم‌جهتی نیازمند تأیید روند قیمت است."
+        )
+    if net_flow < 0 and imbalance_pct < 0:
+        return (
+            "فروش تهاجمی و دفتر سفارش هر دو متمایل به فروشند؛ "
+            "ریسک فشار نزولی بیشتر است."
+        )
+    return (
+        "جریان معاملات و دفتر سفارش هم‌جهت نیستند یا خنثی‌اند؛ "
+        "برای نتیجه‌گیری عجله نکن."
+    )
+
+
+# ---------------------------------------------------------
+# UI
+# ---------------------------------------------------------
+
+api_key = read_lcw_key()
+if not api_key:
     st.error(
-        "دریافت داده ناموفق بود. "
-        "پیام خطا برای بررسی:"
+        "کلید LiveCoinWatch تنظیم نشده است. "
+        "در Streamlit Cloud → Settings → Secrets این خط را اضافه کن:"
     )
-    st.code(st.session_state["market_error"])
-    st.caption(
-        "کلید API را در چت یا در مخزن عمومی GitHub ارسال نکن."
+    st.code('LIVECOINWATCH_API_KEY = "YOUR_API_KEY"')
+    st.stop()
+
+with st.sidebar:
+    st.header("تنظیمات تحلیل")
+    st.caption("همه اعداد بازار از API دریافت می‌شوند.")
+
+    whale_threshold = st.number_input(
+        "حداقل ارزش معامله بزرگ (USDT)",
+        min_value=100.0,
+        max_value=10_000_000.0,
+        value=10_000.0,
+        step=1000.0,
+    )
+
+    levels = st.select_slider(
+        "تعداد سطوح دفتر سفارش",
+        options=[10, 20, 50, 100, 200],
+        value=20,
+    )
+
+    wall_multiplier = st.slider(
+        "آستانه دیوار سفارش نسبت به میانه سطح‌ها",
+        min_value=2.0,
+        max_value=20.0,
+        value=5.0,
+        step=0.5,
+    )
+
+    refresh = st.button(
+        "🔄 تازه‌سازی داده‌ها",
+        use_container_width=True,
+    )
+
+if refresh:
+    st.cache_data.clear()
+    st.rerun()
+
+try:
+    with st.spinner("دریافت فیلتر زنده LiveCoinWatch..."):
+        market = fetch_lcw_market(api_key)
+        coins = market["coins"]
+except Exception as exc:
+    st.error(f"خطا در LiveCoinWatch: {exc}")
+    st.stop()
+
+if coins.empty:
+    st.warning(
+        "در محدوده بررسی‌شده ارز واجد شرایط پیدا نشد. "
+        "ممکن است محدودیت صفحات یا پاسخ API روی نتیجه اثر گذاشته باشد."
     )
     st.stop()
 
-result = st.session_state.get("market_result")
-
-if not result:
-    st.warning("هنوز داده‌ای دریافت نشده است.")
+try:
+    with st.spinner("دریافت جفت‌ارزهای قابل معامله در LBank..."):
+        lbank_pairs = fetch_lbank_pairs()
+except Exception as exc:
+    st.error(f"خطا در دریافت فهرست جفت‌ارزهای LBank: {exc}")
     st.stop()
 
-df = prepare_dataframe(
-    result["coins"],
-    result["btc_usd"],
-)
+coins["Available on LBank"] = coins["LBank Pair"].isin(lbank_pairs)
+eligible = coins[coins["Available on LBank"]].copy()
 
-# Top-level metrics
-col1, col2, col3 = st.columns(3)
-
-with col1:
-    st.metric(
-        "ارزهای واجد شرایط",
-        f"{len(df):,}",
-    )
-
-with col2:
-    st.metric(
-        "قیمت فعلی BTC",
-        f"${result['btc_usd']:,.2f}",
-    )
-
-with col3:
-    st.metric(
-        "معادل آستانه حجم",
-        f"${result['minimum_volume_usd']:,.0f}",
-    )
+col1, col2, col3, col4 = st.columns(4)
+col1.metric("ارزهای فیلترشده", f"{len(coins):,}")
+col2.metric("جفت‌ارزهای موجود در LBank", f"{len(eligible):,}")
+col3.metric("قیمت BTC", f"${market['btc_usd']:,.2f}")
+col4.metric("آستانه حجم گزارش‌شده", f"{MIN_VOLUME_BTC:,} BTC")
 
 st.caption(
     f"آخرین دریافت موفق: "
-    f"{st.session_state.get('last_updated', 'نامشخص')} "
-    f"| صفحات بررسی‌شده: {result['pages_checked']}"
+    f"{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')} "
+    f"| صفحات LiveCoinWatch: {market['pages_checked']}"
 )
 
-if not result["reached_threshold"]:
+if not market["threshold_reached"]:
     st.warning(
-        "محدودیت تعداد صفحات به پایان رسید یا API داده کافی نداد. "
-        "ممکن است بعضی ارزهای واجد شرایط خارج از محدوده بررسی‌شده باشند."
+        "محدوده بررسی LiveCoinWatch به پایان رسیده یا داده کافی نبود؛ "
+        "ممکن است فهرست کامل ارزهای واجد شرایط پوشش داده نشده باشد."
     )
 
-st.subheader("ارزها بر اساس رشد ۲۴ ساعته")
+st.subheader("۱. فیلتر بازار")
+st.dataframe(
+    eligible[
+        [
+            "Symbol",
+            "Name",
+            "Price USD",
+            "Change 24h %",
+            "Reported Volume USD",
+            "Volume BTC equivalent",
+        ]
+    ],
+    use_container_width=True,
+    hide_index=True,
+    column_config={
+        "Price USD": st.column_config.NumberColumn(format="$%.8f"),
+        "Change 24h %": st.column_config.NumberColumn(format="%.2f%%"),
+        "Reported Volume USD": st.column_config.NumberColumn(format="$%.0f"),
+        "Volume BTC equivalent": st.column_config.NumberColumn(format="%.2f"),
+    },
+)
 
-if df.empty:
-    st.warning(
-        "در محدوده بررسی‌شده، ارزی با حجم گزارش‌شده برابر یا بیشتر "
-        "از آستانه ۱۰۰۰ BTC پیدا نشد."
+if eligible.empty:
+    st.warning("هیچ ارز فیلترشده‌ای جفت‌ارز USDT در LBank ندارد.")
+    st.stop()
+
+symbols = eligible["LBank Pair"].tolist()
+selected_pair = st.selectbox(
+    "انتخاب جفت‌ارز برای تحلیل LBank",
+    symbols,
+    format_func=lambda pair: pair.upper(),
+)
+
+selected_coin = eligible[eligible["LBank Pair"] == selected_pair].iloc[0]
+st.subheader(
+    f"۲. تحلیل دفتر سفارش — {selected_pair.upper()}"
+)
+
+try:
+    with st.spinner("دریافت دفتر سفارش و معاملات اخیر LBank..."):
+        book = fetch_order_book(selected_pair, levels)
+        trades = fetch_recent_trades(selected_pair, 500)
+
+    book_stats = analyze_order_book(
+        book,
+        levels=levels,
+        wall_multiplier=wall_multiplier,
+    )
+    trade_stats = analyze_trades(
+        trades,
+        whale_threshold=whale_threshold,
+    )
+except Exception as exc:
+    st.error(
+        f"دریافت یا تحلیل داده LBank برای {selected_pair} ناموفق بود: {exc}"
+    )
+    st.caption(
+        "این خطا ممکن است به محدودیت API، جفت‌ارز ناموجود یا "
+        "ساختار متفاوت پاسخ مربوط باشد."
+    )
+    st.stop()
+
+a, b, c, d = st.columns(4)
+a.metric("بهترین خرید (Bid)", f"{book_stats['best_bid']:.8g} USDT")
+b.metric("بهترین فروش (Ask)", f"{book_stats['best_ask']:.8g} USDT")
+c.metric("Spread", f"{book_stats['spread_pct']:.4f}%")
+d.metric("عدم تعادل دفتر سفارش", f"{book_stats['imbalance_pct']:+.2f}%")
+
+st.write(f"**نتیجه دفتر سفارش:** {book_stats['pressure']}")
+
+left, right = st.columns(2)
+with left:
+    st.metric(
+        f"ارزش سفارش‌های خرید در {levels} سطح",
+        f"${book_stats['bid_value']:,.2f}",
+    )
+with right:
+    st.metric(
+        f"ارزش سفارش‌های فروش در {levels} سطح",
+        f"${book_stats['ask_value']:,.2f}",
+    )
+
+st.caption(
+    "عدم تعادل = (ارزش سفارش‌های خرید − ارزش سفارش‌های فروش) "
+    "/ مجموع ارزش دو طرف × ۱۰۰. سفارش‌ها ممکن است لغو شوند؛ "
+    "این شاخص تضمین‌کننده حرکت قیمت نیست."
+)
+
+st.subheader("۳. دیوارهای بزرگ سفارش")
+
+walls = pd.DataFrame(book_stats["walls"])
+if walls.empty:
+    st.info(
+        "با آستانه فعلی، دیوار سفارش برجسته‌ای در سطوح بررسی‌شده پیدا نشد."
     )
 else:
-    search = st.text_input(
-        "جست‌وجوی نام یا نماد ارز",
-        placeholder="مثلاً BTC یا Ethereum",
-    )
-
-    display_df = df.copy()
-
-    if search.strip():
-        term = search.strip().lower()
-        display_df = display_df[
-            display_df["Symbol"].astype(str).str.lower().str.contains(
-                term, na=False
-            )
-            | display_df["Name"].astype(str).str.lower().str.contains(
-                term, na=False
-            )
-        ]
-
     st.dataframe(
-        display_df,
+        walls.head(20),
         use_container_width=True,
         hide_index=True,
         column_config={
-            "Price (USD)": st.column_config.NumberColumn(
-                "Price (USD)",
-                format="$%.8f",
-            ),
-            "24h Change (%)": st.column_config.NumberColumn(
-                "24h Change (%)",
-                format="%.2f%%",
-            ),
-            "Reported Volume (USD)": st.column_config.NumberColumn(
-                "Reported Volume (USD)",
-                format="$%.0f",
-            ),
-            "Volume (BTC equivalent)": st.column_config.NumberColumn(
-                "Volume (BTC equivalent)",
-                format="%.2f BTC",
-            ),
-            "Market Cap (USD)": st.column_config.NumberColumn(
-                "Market Cap (USD)",
-                format="$%.0f",
-            ),
-            "Liquidity (USD)": st.column_config.NumberColumn(
-                "Liquidity (USD)",
-                format="$%.0f",
-            ),
+            "Price": st.column_config.NumberColumn(format="%.8g"),
+            "Quantity": st.column_config.NumberColumn(format="%.8g"),
+            "Value USDT": st.column_config.NumberColumn(format="$%.2f"),
+            "Distance from mid %": st.column_config.NumberColumn(format="%.3f%%"),
         },
     )
 
-    csv_data = display_df.to_csv(index=False).encode("utf-8-sig")
+st.subheader("۴. جریان خریدوفروش در معاملات اخیر")
 
-    st.download_button(
-        label="⬇️ دانلود CSV",
-        data=csv_data,
-        file_name="spotpilot_live_market.csv",
-        mime="text/csv",
+if trades.empty:
+    st.warning("LBank معامله‌ای با داده قابل استفاده برنگرداند.")
+else:
+    x, y, z = st.columns(3)
+    x.metric("خرید تهاجمی در نمونه", f"${trade_stats['buy_value']:,.2f}")
+    y.metric("فروش تهاجمی در نمونه", f"${trade_stats['sell_value']:,.2f}")
+    z.metric(
+        "جریان خالص نمونه",
+        f"${trade_stats['net_flow']:+,.2f}",
+    )
+
+    if trade_stats["buy_share"] is not None:
+        st.metric(
+            "سهم خرید از ارزش معاملات با جهت مشخص",
+            f"{trade_stats['buy_share']:.2f}%",
+        )
+
+    st.caption(
+        f"تعداد معاملات دریافت‌شده: {len(trades)}؛ "
+        f"تعداد جهت‌های نامشخص: {trade_stats['unknown_count']}. "
+        "این محاسبه روی نمونه آخرین معاملات برگشتی API است، "
+        "نه لزوماً کل یک ساعت."
+    )
+
+    st.write(
+        "**جمع‌بندی جریان و دفتر سفارش:** "
+        + flow_summary(
+            trade_stats["net_flow"],
+            book_stats["imbalance_pct"],
+        )
+    )
+
+    st.subheader("۵. معاملات بزرگ یا غیرعادی")
+
+    large_trades = trade_stats["large_trades"]
+    if large_trades.empty:
+        st.info(
+            "در نمونه فعلی معامله‌ای از آستانه انتخاب‌شده عبور نکرده است."
+        )
+    else:
+        st.caption(
+            f"آستانه علامت‌گذاری: حداقل "
+            f"${trade_stats['adaptive_threshold']:,.2f} "
+            "و حداقل چند برابر میانه ارزش معامله؛ "
+            "این‌ها معاملات بزرگ علامت‌گذاری‌شده‌اند، نه نهنگ‌های شناسایی‌شده."
+        )
+        st.dataframe(
+            large_trades[
+                ["Time", "Price", "Quantity", "Value USDT", "Aggressor", "Trade ID"]
+            ],
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Price": st.column_config.NumberColumn(format="%.8g"),
+                "Quantity": st.column_config.NumberColumn(format="%.8g"),
+                "Value USDT": st.column_config.NumberColumn(format="$%.2f"),
+            },
+        )
+
+    st.subheader("۶. معاملات اخیر")
+    st.dataframe(
+        trades.sort_values("Time", ascending=False, na_position="last"),
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Price": st.column_config.NumberColumn(format="%.8g"),
+            "Quantity": st.column_config.NumberColumn(format="%.8g"),
+            "Value USDT": st.column_config.NumberColumn(format="$%.2f"),
+        },
     )
 
 st.divider()
-
-st.subheader("محدودیت‌های این نسخه")
-
+st.subheader("محدودیت‌های تحلیل")
 st.markdown(
     """
-    - داده‌ها از API زنده دریافت می‌شوند؛ در صورت خطا، خطا نمایش داده می‌شود.
-    - حجم ۲۴ ساعته، حجم گزارش‌شده توسط LiveCoinWatch است؛
-      این داده به‌تنهایی ثابت نمی‌کند که تمام حجم مربوط به معاملات اسپات است.
-    - معادل BTC با استفاده از قیمت فعلی BTC به USD محاسبه می‌شود.
-    - این صفحه هنوز تحلیل مستقل دفتر سفارش چند صرافی،
-      شناسایی انتقال‌های آن‌چین نهنگ‌ها یا سیگنال خرید و فروش تأییدشده ندارد.
-    - هیچ معامله‌ای اجرا نمی‌شود.
+    - حجم LiveCoinWatch حجم گزارش‌شده بازار است و لزوماً حجم صرفاً اسپات نیست.
+    - آستانه ۱۰۰۰ BTC با قیمت جاری BTC به USD تبدیل می‌شود.
+    - فیلتر LiveCoinWatch حداکثر تعداد صفحات مشخص‌شده را بررسی می‌کند.
+    - جریان خرید/فروش فقط از نمونه معاملات اخیر LBank محاسبه می‌شود؛
+      برای تاریخچه پیوسته باید داده‌ها در طول زمان ذخیره شوند.
+    - معامله بزرگ به‌تنهایی اثبات حضور نهنگ نیست.
+    - دفتر سفارش یک تصویر لحظه‌ای است و سفارش‌ها ممکن است لغو یا جابه‌جا شوند.
+    - این داشبورد توصیه مالی قطعی نمی‌دهد و سفارش ثبت نمی‌کند.
     """
 )
-
-st.markdown(
-    '[داده‌ها و API از LiveCoinWatch](https://www.livecoinwatch.com/tools/api)'
-)
-
