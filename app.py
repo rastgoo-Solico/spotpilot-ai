@@ -8,6 +8,7 @@ import requests
 import pandas as pd
 import streamlit as st
 import ccxt
+import plotly.graph_objects as go
 
 from datetime import datetime, timezone
 from reportlab.lib import colors
@@ -1469,10 +1470,57 @@ else:
                 )
 
                 last = indicators.iloc[-1]
-                ma1, ma2, ma3 = st.columns(3)
-                ma1.metric("SMA 14", fmt_price(last.get("SMA 14")))
-                ma2.metric("SMA 50", fmt_price(last.get("SMA 50")))
-                ma3.metric("SMA 200", fmt_price(last.get("SMA 200")))
+                st.markdown("#### میانگین‌های متحرک؛ قیمت نسبت به روند کجاست؟")
+                st.caption(
+                    "میانگین متحرک قیمت را هموار می‌کند. درصد کنار هر عدد نشان می‌دهد "
+                    "قیمت آخرین کندل چند درصد بالاتر یا پایین‌تر از آن میانگین است."
+                )
+                ma_cols = st.columns(3)
+                ma_explanations = {
+                    14: "کوتاه‌مدت؛ سریع‌تر به تغییرات قیمت واکنش نشان می‌دهد.",
+                    50: "میان‌مدت؛ برای دیدن جهت کلی‌تر حرکت قیمت.",
+                    200: "بلندمدت؛ برای بررسی روند بزرگ‌تر، به تاریخچه کافی نیاز دارد.",
+                }
+                ma_values = {}
+                for col, period in zip(ma_cols, (14, 50, 200)):
+                    ma_value = number(last.get(f"SMA {period}"), float("nan"))
+                    ma_values[period] = ma_value
+                    if pd.isna(ma_value) or ma_value <= 0:
+                        col.metric(f"SMA {period}", "داده کافی نیست")
+                        col.caption(ma_explanations[period])
+                    else:
+                        distance_pct = (summary["close"] / ma_value - 1) * 100
+                        col.metric(
+                            f"SMA {period}",
+                            fmt_price(ma_value),
+                            delta=f"{distance_pct:+.2f}% قیمت نسبت به میانگین",
+                            help=ma_explanations[period],
+                        )
+                        col.caption(ma_explanations[period])
+
+                valid_ma = {
+                    period: value for period, value in ma_values.items()
+                    if pd.notna(value) and value > 0
+                }
+                if 50 in valid_ma and 200 in valid_ma:
+                    if summary["close"] > valid_ma[50] > valid_ma[200]:
+                        st.success("برداشت ساده: قیمت بالاتر از میانگین‌های ۵۰ و ۲۰۰ است؛ وضعیت روند فعلاً متمایل به صعودی است.")
+                    elif summary["close"] < valid_ma[50] < valid_ma[200]:
+                        st.warning("برداشت ساده: قیمت پایین‌تر از میانگین‌های ۵۰ و ۲۰۰ است؛ وضعیت روند فعلاً متمایل به نزولی است.")
+                    else:
+                        st.info("برداشت ساده: میانگین‌ها هم‌جهت نیستند؛ روند یک‌دست نیست یا بازار در حال تغییر جهت است.")
+                else:
+                    st.info("برای برداشت روند میان‌مدت و بلندمدت، ابتدا باید داده کافی برای SMA 50 و SMA 200 دریافت شود.")
+
+                with st.expander("راهنمای خیلی کوتاه میانگین‌های متحرک"):
+                    st.markdown(
+                        "- **قیمت بالاتر از میانگین:** نشانه‌ای از قدرت نسبی قیمت است، نه تضمین رشد.\n"
+                        "- **قیمت پایین‌تر از میانگین:** نشانه‌ای از ضعف نسبی قیمت است، نه پیش‌بینی قطعی ریزش.\n"
+                        "- **SMA 14:** سریع‌تر واکنش نشان می‌دهد، اما نویز بیشتری هم دارد.\n"
+                        "- **SMA 50:** برای دیدن روند میان‌مدت کاربرد دارد.\n"
+                        "- **SMA 200:** دید بلندمدت می‌دهد و به تاریخچه بیشتری نیاز دارد.\n"
+                        "- میانگین‌ها عقب‌نگرند؛ بهتر است همراه با ساختار قیمت، حجم و مدیریت ریسک بررسی شوند."
+                    )
 
                 st.write(f"**ساختار بازار:** {summary['structure']}")
 
@@ -1486,10 +1534,73 @@ else:
                 else:
                     st.warning(plan["reason"])
 
-                chart_df = indicators.tail(150).set_index("Time")
-                chart_cols = ["Close", "UT Stop", "SMA 14", "SMA 50", "SMA 200"]
-                chart_df = chart_df[chart_cols]
-                st.line_chart(chart_df, use_container_width=True)
+                st.markdown("#### نمودار قیمت و میانگین‌ها")
+                chart_df = indicators.tail(150).copy()
+                fig = go.Figure()
+                fig.add_trace(go.Candlestick(
+                    x=chart_df["Time"],
+                    open=chart_df["Open"],
+                    high=chart_df["High"],
+                    low=chart_df["Low"],
+                    close=chart_df["Close"],
+                    name="قیمت",
+                    increasing_line_color="#16a34a",
+                    decreasing_line_color="#dc2626",
+                ))
+                ma_styles = {
+                    14: ("#2563eb", "SMA 14 — کوتاه‌مدت"),
+                    50: ("#f59e0b", "SMA 50 — میان‌مدت"),
+                    200: ("#9333ea", "SMA 200 — بلندمدت"),
+                }
+                for period, (line_color, line_name) in ma_styles.items():
+                    column_name = f"SMA {period}"
+                    if column_name in chart_df.columns and chart_df[column_name].notna().any():
+                        fig.add_trace(go.Scatter(
+                            x=chart_df["Time"],
+                            y=chart_df[column_name],
+                            mode="lines",
+                            name=line_name,
+                            line={"color": line_color, "width": 2},
+                            connectgaps=False,
+                        ))
+                if "UT Stop" in chart_df.columns:
+                    fig.add_trace(go.Scatter(
+                        x=chart_df["Time"],
+                        y=chart_df["UT Stop"],
+                        mode="lines",
+                        name="حد متحرک UT",
+                        line={"color": "#64748b", "width": 1.5, "dash": "dash"},
+                    ))
+                buy_points = chart_df[chart_df["UT Buy"].astype(bool)]
+                sell_points = chart_df[chart_df["UT Sell"].astype(bool)]
+                if not buy_points.empty:
+                    fig.add_trace(go.Scatter(
+                        x=buy_points["Time"], y=buy_points["Low"] * 0.998,
+                        mode="markers", name="علامت خرید UT",
+                        marker={"symbol": "triangle-up", "size": 10, "color": "#16a34a"},
+                    ))
+                if not sell_points.empty:
+                    fig.add_trace(go.Scatter(
+                        x=sell_points["Time"], y=sell_points["High"] * 1.002,
+                        mode="markers", name="علامت فروش UT",
+                        marker={"symbol": "triangle-down", "size": 10, "color": "#dc2626"},
+                    ))
+                fig.update_layout(
+                    height=520,
+                    margin={"l": 12, "r": 12, "t": 28, "b": 12},
+                    hovermode="x unified",
+                    xaxis_title="زمان (UTC)",
+                    yaxis_title="قیمت",
+                    legend={"orientation": "h", "yanchor": "bottom", "y": 1.02, "xanchor": "left", "x": 0},
+                    xaxis={"rangeslider": {"visible": False}, "showgrid": True},
+                    yaxis={"side": "right", "showgrid": True},
+                    template="plotly_white",
+                )
+                st.plotly_chart(
+                    fig,
+                    use_container_width=True,
+                    config={"displaylogo": False, "scrollZoom": True},
+                )
 
                 signal_table = indicators.tail(12)[
                     [
