@@ -1258,10 +1258,16 @@ def calculate_trade_plan(book_stats, trade_stats):
 # -------------------- UI --------------------
 
 st.title("📊 SpotPilot AI")
-st.caption(
-    "LiveCoinWatch screening • Cross-exchange prices • "
-    "LBank order book and candles • No auto-trading"
-)
+st.caption("داشبورد بررسی بازار رمزارزها با داده‌های عمومی؛ بدون ثبت سفارش و بدون معامله خودکار.")
+
+with st.expander("راهنمای سریع: از کجا شروع کنم؟", expanded=True):
+    st.markdown(
+        "۱. **یک ارز انتخاب کن**؛ فهرست اولیه بر اساس حداقل حجم ۲۴ساعته فیلتر می‌شود.\n"
+        "۲. **قیمت صرافی‌ها را مقایسه کن**؛ اختلاف قیمت به‌تنهایی فرصت آربیتراژ نیست و کارمزد، زمان و نقدشوندگی هم مهم‌اند.\n"
+        "۳. **نمودار را بخوان**؛ کندل‌ها قیمت را نشان می‌دهند، میانگین‌ها روند را هموار می‌کنند و UT فقط یک ابزار کمکی است.\n"
+        "۴. **دفتر سفارش را بررسی کن**؛ سفارش‌های نمایش‌داده‌شده ممکن است پیش از اجرا لغو شوند.\n\n"
+        "**مهم:** خروجی‌ها ابزار بررسی‌اند، نه توصیه قطعی خرید یا فروش. این برنامه هیچ سفارشی ثبت نمی‌کند."
+    )
 
 with st.sidebar:
     pdf_download_placeholder = st.empty()
@@ -1341,24 +1347,43 @@ coins_df["LBank listed"] = coins_df["Code"].apply(
     lambda code: lbank_symbol_from_code(code) in lbank_pairs
 )
 
-display_df = coins_df.copy()
-display_df["Price USD"] = display_df["Price USD"].map(fmt_price)
-display_df["Volume USD"] = display_df["Volume USD"].map(fmt_usd)
-display_df["Volume BTC equivalent"] = display_df[
-    "Volume BTC equivalent"
-].map(lambda value: f"{value:,.2f}")
-display_df["24h Change %"] = display_df["24h Change %"].map(
+# A short, Persian-labelled view for the main screen. Raw fields stay in coins_df
+# so selection and report generation continue to use the original data.
+display_df = coins_df[
+    [
+        "Name", "Code", "Price USD", "24h Change %",
+        "Volume USD", "Volume BTC equivalent", "LBank listed",
+    ]
+].copy()
+display_df = display_df.rename(columns={
+    "Name": "نام ارز",
+    "Code": "نماد",
+    "Price USD": "قیمت (دلار)",
+    "24h Change %": "تغییر ۲۴ساعته",
+    "Volume USD": "حجم ۲۴ساعته (دلار)",
+    "Volume BTC equivalent": "حجم معادل BTC",
+    "LBank listed": "در LBank",
+})
+display_df["قیمت (دلار)"] = display_df["قیمت (دلار)"].map(fmt_price)
+display_df["حجم ۲۴ساعته (دلار)"] = display_df["حجم ۲۴ساعته (دلار)"].map(fmt_usd)
+display_df["حجم معادل BTC"] = display_df["حجم معادل BTC"].map(
+    lambda value: f"{value:,.2f}"
+)
+display_df["تغییر ۲۴ساعته"] = display_df["تغییر ۲۴ساعته"].map(
     lambda value: f"{value:+.2f}%" if value is not None else "—"
 )
+display_df["در LBank"] = display_df["در LBank"].map(
+    lambda listed: "بله" if listed else "خیر"
+)
 
-st.subheader("۱. فهرست LiveCoinWatch")
-st.caption("روی ردیف یک ارز کلیک کن تا همان ارز تحلیل شود.")
+st.subheader("۱. انتخاب ارز")
+st.caption("روی ردیف ارز کلیک کن یا از فهرست انتخاب کن. فهرست بر اساس تغییر ۲۴ساعته مرتب شده است.")
 
 event = st.dataframe(
     display_df,
     use_container_width=True,
     hide_index=True,
-    height=430,
+    height=360,
     on_select="rerun",
     selection_mode="single-row",
     key="lcw_coin_selector",
@@ -1376,6 +1401,10 @@ else:
 
 st.divider()
 st.subheader(f"۲. مقایسه قیمت {selected_code}")
+st.caption(
+    "این بخش قیمت‌های عمومی گزارش‌شده از چند صرافی را کنار هم می‌گذارد. "
+    "اختلاف‌ها ممکن است ناشی از زمان به‌روزرسانی، بازار یا نقدشوندگی باشند."
+)
 
 selected_lbank_pair = lbank_symbol_from_code(selected_code)
 selected_lbank_pair = (
@@ -1406,10 +1435,10 @@ if compare_errors:
 # -------------------- Multi-timeframe technical analysis --------------------
 
 st.divider()
-st.subheader("۳. تحلیل تکنیکال چندتایم‌فریمی")
+st.subheader("۳. تحلیل تکنیکال")
 st.caption(
-    "سیگنال‌ها از کندل‌های بسته‌شده محاسبه می‌شوند. "
-    "SMA200 در تایم‌فریم روزانه فقط با وجود تاریخچه کافی قابل استفاده است."
+    "۱۵ دقیقه برای حرکت کوتاه‌مدت، ۴ ساعت برای روند میان‌مدت و روزانه برای تصویر بزرگ‌تر است. "
+    "سیگنال‌ها از کندل‌های بسته‌شده محاسبه می‌شوند؛ هیچ شاخصی نتیجه را تضمین نمی‌کند."
 )
 
 if not selected_lbank_pair:
@@ -1687,7 +1716,11 @@ else:
 # -------------------- Existing order book analysis --------------------
 
 st.divider()
-st.subheader("۴. تحلیل دفتر سفارش LBank")
+st.subheader("۴. دفتر سفارش و معاملات اخیر LBank")
+st.caption(
+    "دفتر سفارش، سفارش‌های خرید و فروشِ در انتظار را نشان می‌دهد؛ "
+    "معاملات اخیر، خریدوفروش‌های ثبت‌شده را خلاصه می‌کند. این دو داده یکسان نیستند."
+)
 
 if not selected_lbank_pair:
     st.warning(
@@ -1718,13 +1751,30 @@ except Exception as exc:
     )
 
 metrics = st.columns(4)
-metrics[0].metric("بهترین خرید", fmt_price(book_stats["best_bid"]))
-metrics[1].metric("بهترین فروش", fmt_price(book_stats["best_ask"]))
-metrics[2].metric("فاصله خرید و فروش", f"{book_stats['spread_pct']:.4f}%")
+metrics[0].metric(
+    "بهترین خرید", fmt_price(book_stats["best_bid"]),
+    help="بالاترین قیمت خریدِ موجود در دفتر سفارش.",
+)
+metrics[1].metric(
+    "بهترین فروش", fmt_price(book_stats["best_ask"]),
+    help="پایین‌ترین قیمت فروشِ موجود در دفتر سفارش.",
+)
+metrics[2].metric(
+    "فاصله خرید و فروش", f"{book_stats['spread_pct']:.4f}%",
+    help="فاصله نسبی بهترین قیمت فروش و خرید؛ فاصله کمتر معمولاً اجرای معامله را کم‌هزینه‌تر می‌کند، اما کافی نیست.",
+)
 metrics[3].metric(
     "عدم‌تعادل دفتر سفارش",
     f"{book_stats['imbalance'] * 100:+.2f}%",
+    help="مقایسه ارزش سفارش‌های خرید و فروشِ قابل‌مشاهده؛ سفارش‌ها ممکن است لغو شوند.",
 )
+
+if book_stats["imbalance"] > 0:
+    st.info("در لحظه دریافت داده، ارزش سفارش‌های خریدِ قابل‌مشاهده بیشتر است؛ این به‌تنهایی به معنی رشد قیمت نیست.")
+elif book_stats["imbalance"] < 0:
+    st.info("در لحظه دریافت داده، ارزش سفارش‌های فروشِ قابل‌مشاهده بیشتر است؛ این به‌تنهایی به معنی افت قیمت نیست.")
+else:
+    st.info("در لحظه دریافت داده، عدم‌تعادل دفتر سفارش نزدیک به صفر است.")
 
 flows = st.columns(4)
 flows[0].metric("حجم خرید اخیر", fmt_usd(trade_stats["buy_usd"]))
