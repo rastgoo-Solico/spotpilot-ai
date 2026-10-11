@@ -1,5 +1,6 @@
 
 import statistics
+import time
 import requests
 import pandas as pd
 import streamlit as st
@@ -10,6 +11,12 @@ LBANK_URL = "https://api.lbank.info/v2"
 OTHER_EXCHANGES = ["binance", "bybit", "okx", "kucoin", "kraken"]
 QUOTE = "USDT"
 
+TIMEFRAMES = {
+    "15 دقیقه": {"type": "minute15", "seconds": 15 * 60},
+    "4 ساعت": {"type": "hour4", "seconds": 4 * 60 * 60},
+    "روزانه": {"type": "day1", "seconds": 24 * 60 * 60},
+}
+
 st.set_page_config(page_title="SpotPilot AI", page_icon="📊", layout="wide")
 
 
@@ -17,7 +24,8 @@ st.set_page_config(page_title="SpotPilot AI", page_icon="📊", layout="wide")
 
 def number(value, default=0.0):
     try:
-        return float(value) if value is not None else default
+        result = float(value) if value is not None else default
+        return result if pd.notna(result) else default
     except (TypeError, ValueError):
         return default
 
@@ -27,7 +35,7 @@ def fmt_price(value):
         return "—"
     try:
         value = float(value)
-        if value <= 0:
+        if not pd.notna(value) or value <= 0:
             return "—"
         if value >= 1000:
             return f"{value:,.2f}"
@@ -98,7 +106,6 @@ def fetch_lcw_market(min_btc_volume):
 
     all_coins = []
 
-    # Maximum 100 records per request; fetch up to 2,000 as before.
     for offset in range(0, 2000, 100):
         batch = lcw_post(
             "coins/list",
@@ -152,7 +159,8 @@ def fetch_lcw_market(min_btc_volume):
     rows.sort(
         key=lambda row: (
             row["24h Change %"]
-            if row["24h Change %"] is not None else float("-inf")
+            if row["24h Change %"] is not None
+            else float("-inf")
         ),
         reverse=True,
     )
@@ -198,7 +206,7 @@ def fetch_lbank_pairs():
 
     if not pairs:
         raise RuntimeError(
-            "پاسخ LBank دریافت شد اما جفت‌ارزهای USDT قابل شناسایی نبودند."
+            "جفت‌ارزهای USDT قابل شناسایی نبودند."
         )
 
     return sorted(pairs)
@@ -221,7 +229,7 @@ def fetch_lbank_book(pair):
     asks = data.get("asks") or []
 
     if not bids or not asks:
-        raise RuntimeError(f"دفتر سفارش برای {pair} خالی است.")
+        raise RuntimeError(f"دفتر سفارش {pair} خالی است.")
 
     return {
         "bids": bids,
@@ -255,7 +263,6 @@ def fetch_lbank_trades(pair):
 
         maker = trade.get("isBuyerMaker")
 
-        # A buyer-maker trade means the aggressive/taker side was selling.
         if maker is True or str(maker).lower() == "true":
             side = "sell"
         elif maker is False or str(maker).lower() == "false":
@@ -299,6 +306,316 @@ def fetch_lbank_ticker(pair):
         return number(data[0].get("price"))
 
     return 0.0
+
+
+# -------------------- LBank candles and indicators --------------------
+
+@st.cache_data(ttl=30, show_spinner=False)
+def fetch_lbank_klines(pair, timeframe, size=300):
+    """
+    دریافت کندل‌های عمومی LBank.
+    ردیف‌ها: timestamp, open, high, low, close, volume
+    آخرین کندل باز از محاسبه سیگنال حذف می‌شود.
+    """
+    if timeframe not in TIMEFRAMES:
+        raise ValueError("تایم‌فریم پشتیبانی نمی‌شود.")
+
+    tf = TIMEFRAMES[timeframe]
+    now_seconds = int(time.time())
+
+    payload = get_json(
+        f"{LBANK_URL}/kline.do",
+        params={
+            "symbol": pair,
+            "type": tf["type"],
+            "size": min(max(int(size), 1), 2000),
+            "time": now_seconds,
+        },
+        timeout=25,
+    )
+
+    if not is_success(payload):
+        raise RuntimeError(
+            f"LBank kline API error: {payload.get('msg', payload)}"
+        )
+
+    raw = payload.get("data") or []
+
+    if not isinstance(raw, list) or not raw:
+        raise RuntimeError(f"کندلی برای {pair} دریافت نشد.")
+
+    rows = []
+
+    for candle in raw:
+        if not isinstance(candle, (list, tuple)) or len(candle) < 6:
+            continue
+
+        rows.append({
+            "timestamp": number(candle[0]),
+            "Open": number(candle[1]),
+            "High": number(candle[2]),
+            "Low": number(candle[3]),
+            "Close": number(candle[4]),
+            "Volume": number(candle[5]),
+        })
+
+    df = pd.DataFrame(rows)
+
+    if df.empty:
+        raise RuntimeError("ساختار داده‌های کندل قابل استفاده نیست.")
+
+    df = (
+        df.drop_duplicates(subset=["timestamp"])
+        .sort_values("timestamp")
+        .reset_index(drop=True)
+    )
+
+    # timestamp API is in seconds. Keep only fully closed candles.
+    cutoff = now_seconds - tf["seconds"]
+    df = df[df["timestamp"] <= cutoff].copy()
+    df.reset_index(drop=True, inplace=True)
+
+    if len(df) < 30:
+        raise RuntimeError(
+            f"تعداد کندل‌های بسته‌شده کافی نیست: {len(df)}"
+        )
+
+    df["Time"] = pd.to_datetime(
+        df["timestamp"], unit="s", utc=True
+    )
+
+    return df
+
+
+def calculate_atr(df, period=1):
+    high = df["High"]
+    low = df["Low"]
+    close = df["Close"]
+    prev_close = close.shift(1)
+
+    true_range = pd.concat(
+        [
+            high - low,
+            (high - prev_close).abs(),
+            (low - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+
+    # Wilder-style smoothing.
+    atr = true_range.ewm(
+        alpha=1 / max(int(period), 1),
+        adjust=False,
+        min_periods=max(int(period), 1),
+    ).mean()
+
+    return atr
+
+
+def calculate_ut_bot(df, atr_period=1, key_value=2.0):
+    """
+    UT Bot ATR trailing stop, evaluated on closed candles.
+    ATR period and multiplier can be changed in the sidebar.
+    """
+    out = df.copy()
+    close = out["Close"]
+    atr = calculate_atr(out, atr_period)
+    loss = atr * float(key_value)
+
+    stops = [float("nan")] * len(out)
+    buy_signal = [False] * len(out)
+    sell_signal = [False] * len(out)
+
+    for i in range(len(out)):
+        src = number(close.iloc[i])
+        nloss = number(loss.iloc[i], float("nan"))
+
+        if pd.isna(nloss) or nloss <= 0:
+            continue
+
+        if i == 0 or pd.isna(stops[i - 1]):
+            stops[i] = src - nloss
+            continue
+
+        prev_src = number(close.iloc[i - 1])
+        prev_stop = stops[i - 1]
+
+        if src > prev_stop and prev_src > prev_stop:
+            stops[i] = max(prev_stop, src - nloss)
+        elif src < prev_stop and prev_src < prev_stop:
+            stops[i] = min(prev_stop, src + nloss)
+        elif src > prev_stop:
+            stops[i] = src - nloss
+        else:
+            stops[i] = src + nloss
+
+        # Crossover / crossunder of close against trailing stop.
+        buy_signal[i] = src > stops[i] and prev_src <= prev_stop
+        sell_signal[i] = src < stops[i] and prev_src >= prev_stop
+
+    out["ATR"] = atr
+    out["UT Stop"] = stops
+    out["UT Buy"] = buy_signal
+    out["UT Sell"] = sell_signal
+
+    return out
+
+
+def add_market_indicators(df, atr_period=1, key_value=2.0):
+    out = calculate_ut_bot(df, atr_period, key_value)
+
+    for period in (14, 50, 200):
+        out[f"SMA {period}"] = out["Close"].rolling(
+            window=period, min_periods=period
+        ).mean()
+
+    # Approximate structure breaks based on prior 20-candle extremes.
+    lookback = 20
+    previous_high = out["High"].shift(1).rolling(lookback).max()
+    previous_low = out["Low"].shift(1).rolling(lookback).min()
+
+    out["Prior Structure High"] = previous_high
+    out["Prior Structure Low"] = previous_low
+    out["BOS Up"] = out["Close"] > previous_high
+    out["BOS Down"] = out["Close"] < previous_low
+
+    # A simple trend-state approximation used to flag possible CHoCH.
+    # This is not a full pivot-based reproduction of the Pine indicator.
+    trend = []
+    state = 0
+
+    for i in range(len(out)):
+        up = bool(out["BOS Up"].iloc[i]) if pd.notna(previous_high.iloc[i]) else False
+        down = bool(out["BOS Down"].iloc[i]) if pd.notna(previous_low.iloc[i]) else False
+
+        if up and state < 0:
+            trend.append("CHoCH صعودی")
+            state = 1
+        elif down and state > 0:
+            trend.append("CHoCH نزولی")
+            state = -1
+        elif up:
+            trend.append("BOS صعودی")
+            state = 1
+        elif down:
+            trend.append("BOS نزولی")
+            state = -1
+        else:
+            trend.append("بدون شکست ساختار")
+
+    out["Structure"] = trend
+    return out
+
+
+def latest_signal_summary(df):
+    if df.empty:
+        raise ValueError("داده‌ای برای تحلیل وجود ندارد.")
+
+    last = df.iloc[-1]
+    close = number(last["Close"])
+    atr = number(last["ATR"])
+    ut_stop = number(last["UT Stop"], float("nan"))
+
+    if close <= 0 or atr <= 0 or pd.isna(ut_stop):
+        status = "داده ناکافی"
+    else:
+        ma50 = number(last.get("SMA 50"), float("nan"))
+        ma200 = number(last.get("SMA 200"), float("nan"))
+
+        if bool(last["UT Buy"]):
+            status = "سیگنال خرید UT"
+        elif bool(last["UT Sell"]):
+            status = "سیگنال فروش UT"
+        elif close > ut_stop:
+            status = "قیمت بالای حد UT"
+        else:
+            status = "قیمت زیر حد UT"
+
+        if pd.notna(ma50) and pd.notna(ma200):
+            if close > ma50 > ma200:
+                status += " | روند MA صعودی"
+            elif close < ma50 < ma200:
+                status += " | روند MA نزولی"
+
+    return {
+        "status": status,
+        "close": close,
+        "atr": atr,
+        "ut_stop": ut_stop,
+        "buy_signal": bool(last["UT Buy"]),
+        "sell_signal": bool(last["UT Sell"]),
+        "structure": str(last["Structure"]),
+        "time": last["Time"],
+    }
+
+
+def make_atr_trade_plan(df, key_value=2.0):
+    """
+    Indicative levels only:
+    stop distance = ATR * multiplier
+    targets = 1.5R and 2R.
+    """
+    summary = latest_signal_summary(df)
+    close = summary["close"]
+    atr = summary["atr"]
+
+    if close <= 0 or atr <= 0:
+        return {"status": "WAIT", "reason": "داده کافی برای محاسبه ATR وجود ندارد."}
+
+    last = df.iloc[-1]
+    ma50 = number(last.get("SMA 50"), float("nan"))
+    ma200 = number(last.get("SMA 200"), float("nan"))
+
+    bullish_ma = pd.notna(ma50) and pd.notna(ma200) and close > ma50 > ma200
+    bearish_ma = pd.notna(ma50) and pd.notna(ma200) and close < ma50 < ma200
+
+    if summary["buy_signal"] and not summary["sell_signal"]:
+        direction = "LONG"
+    elif summary["sell_signal"] and not summary["buy_signal"]:
+        direction = "SHORT"
+    elif bullish_ma and close > summary["ut_stop"]:
+        direction = "LONG WATCH"
+    elif bearish_ma and close < summary["ut_stop"]:
+        direction = "SHORT WATCH"
+    else:
+        return {
+            "status": "WAIT",
+            "reason": "سیگنال UT و تأیید روند هم‌جهت نیستند؛ فعلاً ورود تأیید نشده است.",
+            "close": close,
+            "atr": atr,
+        }
+
+    risk = atr * float(key_value)
+    if risk <= 0:
+        return {"status": "WAIT", "reason": "ریسک محاسباتی معتبر نیست."}
+
+    if direction.startswith("LONG"):
+        stop = close - risk
+        target1 = close + 1.5 * risk
+        target2 = close + 2.0 * risk
+    else:
+        stop = close + risk
+        target1 = close - 1.5 * risk
+        target2 = close - 2.0 * risk
+
+    is_confirmed_signal = direction in ("LONG", "SHORT")
+
+    return {
+        "status": direction,
+        "reason": (
+            "سیگنال UT روی آخرین کندل بسته‌شده ثبت شده است."
+            if is_confirmed_signal
+            else "این فقط واچ‌لیست روند است؛ سیگنال جدید UT ثبت نشده است."
+        ),
+        "close": close,
+        "atr": atr,
+        "stop": stop,
+        "target1": target1,
+        "target2": target2,
+        "rr1": 1.5,
+        "rr2": 2.0,
+        "direction": direction,
+    }
 
 
 # -------------------- Other exchanges: comparison only --------------------
@@ -349,7 +666,6 @@ def compare_exchange_prices(code, lbank_pair=None):
     rows = []
     errors = []
 
-    # LBank price is obtained directly, without CCXT.
     if lbank_pair:
         try:
             price = fetch_lbank_ticker(lbank_pair)
@@ -398,7 +714,7 @@ def compare_exchange_prices(code, lbank_pair=None):
     return rows, errors
 
 
-# -------------------- Analysis --------------------
+# -------------------- Order book analysis --------------------
 
 def analyze_book(book):
     bids = [
@@ -447,25 +763,33 @@ def analyze_book(book):
     wall_threshold = max(median_value * 3, percentile_90)
 
     bid_walls = [
-        {"price": price, "quantity": qty, "value": price * qty,
-         "classification": "Large order"}
+        {
+            "price": price,
+            "quantity": qty,
+            "value": price * qty,
+            "classification": "Large order",
+        }
         for price, qty in bids
         if price * qty >= wall_threshold
     ]
 
     ask_walls = [
-        {"price": price, "quantity": qty, "value": price * qty,
-         "classification": "Large order"}
+        {
+            "price": price,
+            "quantity": qty,
+            "value": price * qty,
+            "classification": "Large order",
+        }
         for price, qty in asks
         if price * qty >= wall_threshold
     ]
 
-    # If no large level passes the threshold, expose the largest real levels
-    # as candidate support/resistance, not as confirmed walls.
     if not bid_walls:
         bid_walls = [
-            {"price": p, "quantity": q, "value": p * q,
-             "classification": "Largest visible bid level"}
+            {
+                "price": p, "quantity": q, "value": p * q,
+                "classification": "Largest visible bid level",
+            }
             for p, q in sorted(
                 bids, key=lambda level: level[0] * level[1], reverse=True
             )[:5]
@@ -473,8 +797,10 @@ def analyze_book(book):
 
     if not ask_walls:
         ask_walls = [
-            {"price": p, "quantity": q, "value": p * q,
-             "classification": "Largest visible ask level"}
+            {
+                "price": p, "quantity": q, "value": p * q,
+                "classification": "Largest visible ask level",
+            }
             for p, q in sorted(
                 asks, key=lambda level: level[0] * level[1], reverse=True
             )[:5]
@@ -628,8 +954,8 @@ def calculate_trade_plan(book_stats, trade_stats):
 
 st.title("📊 SpotPilot AI")
 st.caption(
-    "LiveCoinWatch screening • Cross-exchange price comparison • "
-    "LBank public order book • No auto-trading"
+    "LiveCoinWatch screening • Cross-exchange prices • "
+    "LBank order book and candles • No auto-trading"
 )
 
 with st.sidebar:
@@ -642,6 +968,26 @@ with st.sidebar:
         step=100.0,
     )
 
+    st.divider()
+    st.header("تنظیمات UT Bot")
+
+    atr_period = st.number_input(
+        "دوره ATR",
+        min_value=1,
+        max_value=100,
+        value=1,
+        step=1,
+        help="مقدار پیش‌فرض ۱ مطابق ورودی c در اسکریپت ارسالی است.",
+    )
+
+    ut_multiplier = st.number_input(
+        "ضریب ATR (Key Value)",
+        min_value=0.1,
+        max_value=20.0,
+        value=2.0,
+        step=0.1,
+    )
+
     refresh = st.button("🔄 به‌روزرسانی داده‌ها", use_container_width=True)
 
 if refresh:
@@ -650,14 +996,13 @@ if refresh:
     fetch_lbank_book.clear()
     fetch_lbank_trades.clear()
     fetch_lbank_ticker.clear()
+    fetch_lbank_klines.clear()
     get_other_exchange_symbols.clear()
     fetch_other_exchange_ticker.clear()
     st.rerun()
 
 if not get_lcw_key():
-    st.error(
-        "LIVECOINWATCH_API_KEY در Streamlit Secrets تنظیم نشده است."
-    )
+    st.error("LIVECOINWATCH_API_KEY در Streamlit Secrets تنظیم نشده است.")
     st.stop()
 
 try:
@@ -673,9 +1018,7 @@ m2.metric("ارزهای دریافت‌شده پیش از فیلتر", fetched_c
 m3.metric("ارزهای باقی‌مانده پس از فیلتر", len(coins))
 
 if not coins:
-    st.warning(
-        "با فیلتر فعلی ارزی باقی نمانده است. مقدار حداقل حجم را بررسی کن."
-    )
+    st.warning("با فیلتر فعلی ارزی باقی نمانده است. حداقل حجم را بررسی کن.")
     st.stop()
 
 try:
@@ -683,7 +1026,7 @@ try:
     lbank_status = f"{len(lbank_pairs)} جفت‌ارز USDT شناسایی شد"
 except Exception as exc:
     lbank_pairs = set()
-    lbank_status = f"دریافت فهرست جفت‌ارزهای LBank ناموفق بود: {exc}"
+    lbank_status = f"دریافت جفت‌ارزهای LBank ناموفق بود: {exc}"
 
 st.caption(f"وضعیت بازار LBank: {lbank_status}")
 
@@ -753,14 +1096,184 @@ if compare_errors:
     with st.expander("جزئیات خطاهای مقایسه قیمت"):
         st.code("\n".join(compare_errors))
 
+# -------------------- Multi-timeframe technical analysis --------------------
+
 st.divider()
-st.subheader("۳. تحلیل دفتر سفارش LBank")
+st.subheader("۳. تحلیل تکنیکال چندتایم‌فریمی")
+st.caption(
+    "سیگنال‌ها از کندل‌های بسته‌شده محاسبه می‌شوند. "
+    "SMA200 در تایم‌فریم روزانه فقط با وجود تاریخچه کافی قابل استفاده است."
+)
+
+if not selected_lbank_pair:
+    st.warning(
+        f"{selected_code} در فهرست جفت‌ارزهای USDT در LBank پیدا نشد. "
+        "تحلیل تکنیکال LBank برای این ارز در دسترس نیست."
+    )
+else:
+    st.write(f"جفت‌ارز تحلیل: **{selected_lbank_pair}**")
+
+    tf_tabs = st.tabs(["۱۵ دقیقه", "۴ ساعت", "روزانه"])
+    tf_names = ["15 دقیقه", "4 ساعت", "روزانه"]
+    timeframe_results = {}
+
+    for tab, tf_name in zip(tf_tabs, tf_names):
+        with tab:
+            try:
+                with st.spinner(f"دریافت کندل‌های {tf_name}..."):
+                    candles = fetch_lbank_klines(
+                        selected_lbank_pair,
+                        tf_name,
+                        300,
+                    )
+                    indicators = add_market_indicators(
+                        candles,
+                        int(atr_period),
+                        float(ut_multiplier),
+                    )
+                    summary = latest_signal_summary(indicators)
+                    plan = make_atr_trade_plan(
+                        indicators,
+                        float(ut_multiplier),
+                    )
+
+                timeframe_results[tf_name] = {
+                    "candles": candles,
+                    "indicators": indicators,
+                    "summary": summary,
+                    "plan": plan,
+                }
+
+                if summary["buy_signal"]:
+                    st.success("سیگنال UT Bot خرید روی آخرین کندل بسته‌شده")
+                elif summary["sell_signal"]:
+                    st.error("سیگنال UT Bot فروش روی آخرین کندل بسته‌شده")
+                else:
+                    st.info("روی آخرین کندل بسته‌شده سیگنال تازه UT ثبت نشده است.")
+
+                a, b, c, d = st.columns(4)
+                a.metric("آخرین قیمت بسته‌شده", fmt_price(summary["close"]))
+                b.metric("ATR", fmt_price(summary["atr"]))
+                c.metric("حد متحرک UT", fmt_price(summary["ut_stop"]))
+                d.metric("وضعیت", plan["status"])
+
+                st.caption(
+                    f"زمان آخرین کندل بسته‌شده (UTC): "
+                    f"{summary['time'].strftime('%Y-%m-%d %H:%M')}"
+                )
+
+                last = indicators.iloc[-1]
+                ma1, ma2, ma3 = st.columns(3)
+                ma1.metric("SMA 14", fmt_price(last.get("SMA 14")))
+                ma2.metric("SMA 50", fmt_price(last.get("SMA 50")))
+                ma3.metric("SMA 200", fmt_price(last.get("SMA 200")))
+
+                st.write(f"**ساختار بازار:** {summary['structure']}")
+
+                if "stop" in plan:
+                    p1, p2, p3, p4 = st.columns(4)
+                    p1.metric("قیمت مبنای سناریو", fmt_price(plan["close"]))
+                    p2.metric("حد ضرر تحلیلی", fmt_price(plan["stop"]))
+                    p3.metric("هدف ۱ (۱٫۵R)", fmt_price(plan["target1"]))
+                    p4.metric("هدف ۲ (۲R)", fmt_price(plan["target2"]))
+                    st.write(plan["reason"])
+                else:
+                    st.warning(plan["reason"])
+
+                chart_df = indicators.tail(150).set_index("Time")
+                chart_cols = ["Close", "UT Stop", "SMA 14", "SMA 50", "SMA 200"]
+                chart_df = chart_df[chart_cols]
+                st.line_chart(chart_df, use_container_width=True)
+
+                signal_table = indicators.tail(12)[
+                    [
+                        "Time", "Open", "High", "Low", "Close", "Volume",
+                        "ATR", "UT Stop", "UT Buy", "UT Sell", "Structure",
+                    ]
+                ].copy()
+
+                signal_table["Time"] = signal_table["Time"].dt.strftime(
+                    "%Y-%m-%d %H:%M UTC"
+                )
+
+                for col in ["Open", "High", "Low", "Close", "ATR", "UT Stop"]:
+                    signal_table[col] = signal_table[col].map(fmt_price)
+
+                st.caption("آخرین کندل‌های بسته‌شده")
+                st.dataframe(
+                    signal_table,
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+            except Exception as exc:
+                st.error(
+                    f"تحلیل تایم‌فریم {tf_name} ناموفق بود: "
+                    f"{type(exc).__name__}: {str(exc)[:300]}"
+                )
+
+    # Cross-timeframe overview.
+    if timeframe_results:
+        st.markdown("#### خلاصه هم‌جهتی تایم‌فریم‌ها")
+        overview = []
+
+        for tf_name in tf_names:
+            result = timeframe_results.get(tf_name)
+            if not result:
+                continue
+
+            summary = result["summary"]
+            plan = result["plan"]
+            overview.append({
+                "تایم‌فریم": tf_name,
+                "قیمت بسته‌شده": fmt_price(summary["close"]),
+                "سیگنال UT": (
+                    "خرید" if summary["buy_signal"]
+                    else "فروش" if summary["sell_signal"]
+                    else "بدون سیگنال تازه"
+                ),
+                "ساختار": summary["structure"],
+                "سناریو": plan["status"],
+            })
+
+        st.dataframe(
+            pd.DataFrame(overview),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        buy_count = sum(
+            1 for result in timeframe_results.values()
+            if result["summary"]["buy_signal"]
+        )
+        sell_count = sum(
+            1 for result in timeframe_results.values()
+            if result["summary"]["sell_signal"]
+        )
+
+        if buy_count >= 2:
+            st.success(
+                f"هم‌جهتی اولیه: سیگنال خرید UT در {buy_count} تایم‌فریم ثبت شده است. "
+                "پیش از هر تصمیم، روند، نقدشوندگی و حد ضرر را بررسی کن."
+            )
+        elif sell_count >= 2:
+            st.warning(
+                f"هم‌جهتی نزولی: سیگنال فروش UT در {sell_count} تایم‌فریم ثبت شده است."
+            )
+        else:
+            st.info(
+                "هنوز دست‌کم دو تایم‌فریم سیگنال هم‌جهت تازه ندارند."
+            )
+
+# -------------------- Existing order book analysis --------------------
+
+st.divider()
+st.subheader("۴. تحلیل دفتر سفارش LBank")
 
 if not selected_lbank_pair:
     st.warning(
         f"{selected_code} در فهرست جفت‌ارزهای USDT دریافتی از LBank پیدا نشد. "
-        "ارز از LiveCoinWatch حذف نشده، اما تحلیل دفتر سفارش LBank برای "
-        "این جفت‌ارز در دسترس نیست."
+        "تحلیل دفتر سفارش برای این جفت‌ارز در دسترس نیست."
     )
     st.stop()
 
@@ -769,9 +1282,7 @@ st.write(f"جفت‌ارز LBank: **{selected_lbank_pair}**")
 try:
     with st.spinner("دریافت دفتر سفارش عمومی LBank..."):
         book = fetch_lbank_book(selected_lbank_pair)
-
-    book_stats = analyze_book(book)
-
+        book_stats = analyze_book(book)
 except Exception as exc:
     st.error(f"دریافت یا تحلیل دفتر سفارش ناموفق بود: {exc}")
     st.stop()
@@ -779,9 +1290,7 @@ except Exception as exc:
 try:
     with st.spinner("دریافت معاملات اخیر LBank..."):
         trades = fetch_lbank_trades(selected_lbank_pair)
-
-    trade_stats = analyze_trades(trades)
-
+        trade_stats = analyze_trades(trades)
 except Exception as exc:
     trade_stats = analyze_trades([])
     st.warning(
@@ -833,7 +1342,7 @@ with ask_col:
     st.dataframe(ask_df, use_container_width=True, hide_index=True)
 
 st.divider()
-st.subheader("۴. سناریوی احتمالی ورود و خروج")
+st.subheader("۵. سناریوی احتمالی ورود و خروج بر اساس دفتر سفارش")
 
 plan = calculate_trade_plan(book_stats, trade_stats)
 
@@ -863,8 +1372,9 @@ else:
     )
 
 st.warning(
-    "این تحلیل احتمالی است، نه تضمین سود یا توصیه مالی قطعی. "
-    "سفارش‌های بزرگ ممکن است لغو شوند و قیمت در زمان اجرا تغییر کند. "
-    "کارمزد، لغزش قیمت و ریسک اجرای معامله جداگانه باید بررسی شوند. "
-    "این برنامه هیچ معامله‌ای ثبت نمی‌کند."
+    "این برنامه از داده‌های عمومی بازار استفاده می‌کند و معامله‌ای ثبت نمی‌کند. "
+    "سیگنال‌ها، سطوح ATR و سطوح دفتر سفارش تخمینی هستند و سود را تضمین نمی‌کنند. "
+    "BOS/CHoCH در این نسخه تقریبی است؛ حجم دفتر سفارش، معاملات اخیر و "
+    "حجم کندل‌ها شاخص‌های متفاوتی هستند. کارمزد، لغزش قیمت، نقدشوندگی و "
+    "احتمال لغو سفارش‌های بزرگ را پیش از هر تصمیم در نظر بگیر."
 )
