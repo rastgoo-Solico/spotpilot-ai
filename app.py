@@ -416,4 +416,4 @@ st.markdown(
 st.markdown(
     '[داده‌ها و API از LiveCoinWatch](https://www.livecoinwatch.com/tools/api)'
 )
-```
+
