@@ -9,206 +9,62 @@ st.set_page_config(
     layout="wide",
 )
 
-st.title("📊 SpotPilot AI")
-st.caption(
-    "Spot Market Scanner | Multi-Exchange Analysis | "
-    "No Automatic Trading"
-)
+st.title("SpotPilot AI")
+st.caption("Spot market scanner | Demo data — not live")
 
 st.warning(
-    "DEMO MODE — داده‌های این نسخه آزمایشی هستند، "
-    "قیمت و حجم زنده نیستند و سیگنال‌ها برای معامله واقعی مناسب نیستند."
+    "نسخه آزمایشی: اعداد زیر ساختگی‌اند و نباید "
+    "برای تصمیم‌گیری معاملاتی استفاده شوند."
 )
 
-# -----------------------------
-# Sidebar settings
-# -----------------------------
-st.sidebar.header("Scanner Settings")
-
 min_volume_btc = st.sidebar.number_input(
-    "Minimum 24h aggregate spot volume (BTC)",
+    "حداقل حجم اسپات ۲۴ ساعته (BTC)",
     min_value=1.0,
     value=1000.0,
     step=100.0,
 )
 
-selected_exchanges = st.sidebar.multiselect(
-    "Exchanges to analyze",
-    ["Binance", "OKX", "Bybit", "Coinbase"],
-    default=["Binance", "OKX", "Bybit", "Coinbase"],
-)
-
-st.sidebar.caption(
-    "Exchange coverage depends on available market data."
-)
-
-# -----------------------------
-# Clearly simulated demo data
-# Replace with verified API data later.
-# -----------------------------
+# Sample data ONLY. Replace with verified live API data.
 tokens = pd.DataFrame([
-    {
-        "Token": "BTC",
-        "Price USD": 68000.0,
-        "24h Volume BTC": 18000.0,
-        "Change 24h %": 2.4,
-        "Order Flow": 0.68,
-        "Liquidity Score": 82,
-        "Whale Activity": "Accumulation candidate",
-    },
-    {
-        "Token": "ETH",
-        "Price USD": 3200.0,
-        "24h Volume BTC": 9500.0,
-        "Change 24h %": 1.2,
-        "Order Flow": 0.31,
-        "Liquidity Score": 76,
-        "Whale Activity": "Mixed",
-    },
-    {
-        "Token": "SOL",
-        "Price USD": 155.0,
-        "24h Volume BTC": 2400.0,
-        "Change 24h %": -1.8,
-        "Order Flow": -0.44,
-        "Liquidity Score": 63,
-        "Whale Activity": "Distribution candidate",
-    },
-    {
-        "Token": "XRP",
-        "Price USD": 0.62,
-        "24h Volume BTC": 780.0,
-        "Change 24h %": -0.4,
-        "Order Flow": -0.12,
-        "Liquidity Score": 45,
-        "Whale Activity": "Insufficient evidence",
-    },
+    {"Token": "BTC", "Volume BTC": 18000, "Change 24h %": 2.4},
+    {"Token": "ETH", "Volume BTC": 9500, "Change 24h %": 1.2},
+    {"Token": "SOL", "Volume BTC": 2400, "Change 24h %": -1.8},
+    {"Token": "XRP", "Volume BTC": 780, "Change 24h %": 5.7},
+    {"Token": "DEMO-A", "Volume BTC": 1500, "Change 24h %": 8.6},
 ])
 
-# Demo data only: not a real trading signal.
+# First: apply the aggregate volume threshold.
 eligible = tokens[
-    tokens["24h Volume BTC"] >= min_volume_btc
+    tokens["Volume BTC"] >= min_volume_btc
 ].copy()
 
-def demo_signal(row):
-    if (
-        row["Order Flow"] > 0.5
-        and row["Change 24h %"] > 0
-        and row["Liquidity Score"] >= 70
-    ):
-        return "BUY WATCH (DEMO)"
+# Then: rank eligible tokens by 24h percentage gain, descending.
+eligible = eligible.sort_values(
+    by="Change 24h %",
+    ascending=False,
+).reset_index(drop=True)
 
-    if (
-        row["Order Flow"] < -0.3
-        and row["Change 24h %"] < 0
-    ):
-        return "SELL WATCH (DEMO)"
+eligible.insert(0, "Rank", range(1, len(eligible) + 1))
 
-    return "NO TRADE (DEMO)"
+st.subheader("توکن‌های واجد شرایط — مرتب‌شده بر اساس بیشترین رشد")
 
-eligible["Demo Signal"] = eligible.apply(
-    demo_signal, axis=1
-)
-
-# -----------------------------
-# Overview
-# -----------------------------
-c1, c2, c3, c4 = st.columns(4)
-
-c1.metric("Eligible Tokens", len(eligible))
-c2.metric("Volume Threshold", f"{min_volume_btc:,.0f} BTC")
-c3.metric("Exchanges Selected", len(selected_exchanges))
-c4.metric("Trading Mode", "Disabled")
-
-st.divider()
-
-# -----------------------------
-# Scanner results
-# -----------------------------
-st.subheader("🔎 Eligible Spot Tokens")
-
-if eligible.empty:
-    st.info("No demo tokens meet the selected volume threshold.")
-else:
-    st.dataframe(
-        eligible[
-            [
-                "Token",
-                "Price USD",
-                "24h Volume BTC",
-                "Change 24h %",
-                "Order Flow",
-                "Liquidity Score",
-                "Whale Activity",
-                "Demo Signal",
-            ]
-        ],
-        use_container_width=True,
-        hide_index=True,
-    )
-
-# -----------------------------
-# Volume chart
-# -----------------------------
-st.subheader("📈 24h Aggregate Volume — Demo Data")
-
-fig = px.bar(
+st.dataframe(
     eligible,
-    x="Token",
-    y="24h Volume BTC",
-    title="Simulated Volume by Token",
+    use_container_width=True,
+    hide_index=True,
 )
 
-fig.add_hline(
-    y=min_volume_btc,
-    line_dash="dash",
-    annotation_text="Minimum volume threshold",
-)
-
-st.plotly_chart(fig, use_container_width=True)
-
-# -----------------------------
-# Multi-exchange analysis placeholder
-# -----------------------------
-st.subheader("🌐 Multi-Exchange Analysis")
-
-if selected_exchanges:
-    st.write("Selected exchanges:", ", ".join(selected_exchanges))
-    st.info(
-        "Live order books, trade feeds, spreads and exchange-specific "
-        "liquidity will be added in the next development stage."
+if not eligible.empty:
+    fig = px.bar(
+        eligible,
+        x="Token",
+        y="Change 24h %",
+        title="24h Percentage Change — Descending",
     )
-else:
-    st.warning("Select at least one exchange.")
+    fig.update_layout(xaxis={"categoryorder": "total descending"})
+    st.plotly_chart(fig, use_container_width=True)
 
-# -----------------------------
-# Whale and liquidity sections
-# -----------------------------
-left, right = st.columns(2)
-
-with left:
-    st.subheader("🐋 Whale Activity")
-    st.write(
-        "Next stage: verified large trades, tagged-wallet transfers, "
-        "and exchange inflow/outflow data."
-    )
-    st.caption(
-        "A large transfer alone does not prove buying or selling."
-    )
-
-with right:
-    st.subheader("💧 Liquidity Analysis")
-    st.write(
-        "Next stage: order-book depth, bid/ask imbalance, "
-        "liquidity clusters and potential sweep zones."
-    )
-    st.caption(
-        "Visible order books cannot reveal every hidden order or stop."
-    )
-
-st.divider()
-
-st.caption(
-    "SpotPilot AI — Research dashboard. "
-    "Demo values are illustrative, not investment advice."
+st.info(
+    "مرحله بعد: اتصال API واقعی LiveCoinWatch، "
+    "اعتبارسنجی حجم تجمیعی اسپات و تحلیل چند صرافی."
 )
