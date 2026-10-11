@@ -1782,36 +1782,44 @@ flows[1].metric("حجم فروش اخیر", fmt_usd(trade_stats["sell_usd"]))
 flows[2].metric("جریان خالص", fmt_usd(trade_stats["net_flow"]))
 flows[3].metric("تعداد معاملات", trade_stats["total_count"])
 
-bid_col, ask_col = st.columns(2)
+with st.expander("جزئیات دفتر سفارش: سطوح خرید و فروش"):
+    st.caption(
+        "این سطوح از سفارش‌های قابل‌مشاهده استخراج شده‌اند و حمایت/مقاومت قطعی نیستند. "
+        "سفارش‌ها می‌توانند تغییر کنند یا پیش از اجرا لغو شوند."
+    )
+    bid_col, ask_col = st.columns(2)
 
-with bid_col:
-    st.markdown("**سطوح خرید و حمایت احتمالی**")
-    bid_df = pd.DataFrame(book_stats["bid_walls"]).rename(columns={
-        "price": "قیمت",
-        "quantity": "مقدار",
-        "value": "ارزش تقریبی USDT",
-        "classification": "نوع سطح",
-    })
-    bid_df["قیمت"] = bid_df["قیمت"].map(fmt_price)
-    bid_df["مقدار"] = bid_df["مقدار"].map(lambda value: f"{value:,.6f}")
-    bid_df["ارزش تقریبی USDT"] = bid_df["ارزش تقریبی USDT"].map(fmt_usd)
-    st.dataframe(bid_df, use_container_width=True, hide_index=True)
+    with bid_col:
+        st.markdown("**سطوح خرید و حمایت احتمالی**")
+        bid_df = pd.DataFrame(book_stats["bid_walls"]).rename(columns={
+            "price": "قیمت",
+            "quantity": "مقدار",
+            "value": "ارزش تقریبی USDT",
+            "classification": "نوع سطح",
+        })
+        bid_df["قیمت"] = bid_df["قیمت"].map(fmt_price)
+        bid_df["مقدار"] = bid_df["مقدار"].map(lambda value: f"{value:,.6f}")
+        bid_df["ارزش تقریبی USDT"] = bid_df["ارزش تقریبی USDT"].map(fmt_usd)
+        st.dataframe(bid_df, use_container_width=True, hide_index=True)
 
-with ask_col:
-    st.markdown("**سطوح فروش و مقاومت احتمالی**")
-    ask_df = pd.DataFrame(book_stats["ask_walls"]).rename(columns={
-        "price": "قیمت",
-        "quantity": "مقدار",
-        "value": "ارزش تقریبی USDT",
-        "classification": "نوع سطح",
-    })
-    ask_df["قیمت"] = ask_df["قیمت"].map(fmt_price)
-    ask_df["مقدار"] = ask_df["مقدار"].map(lambda value: f"{value:,.6f}")
-    ask_df["ارزش تقریبی USDT"] = ask_df["ارزش تقریبی USDT"].map(fmt_usd)
-    st.dataframe(ask_df, use_container_width=True, hide_index=True)
+    with ask_col:
+        st.markdown("**سطوح فروش و مقاومت احتمالی**")
+        ask_df = pd.DataFrame(book_stats["ask_walls"]).rename(columns={
+            "price": "قیمت",
+            "quantity": "مقدار",
+            "value": "ارزش تقریبی USDT",
+            "classification": "نوع سطح",
+        })
+        ask_df["قیمت"] = ask_df["قیمت"].map(fmt_price)
+        ask_df["مقدار"] = ask_df["مقدار"].map(lambda value: f"{value:,.6f}")
+        ask_df["ارزش تقریبی USDT"] = ask_df["ارزش تقریبی USDT"].map(fmt_usd)
+        st.dataframe(ask_df, use_container_width=True, hide_index=True)
 
 st.divider()
-st.subheader("۵. سناریوی احتمالی ورود و خروج بر اساس دفتر سفارش")
+st.subheader("۵. سناریوی احتمالی ورود و خروج")
+st.caption(
+    "این سناریو یک محاسبه تقریبی بر پایه دفتر سفارش است، نه سفارش واقعی یا توصیه خریدوفروش."
+)
 
 plan = calculate_trade_plan(book_stats, trade_stats)
 
