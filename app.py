@@ -1,10 +1,24 @@
 
 import statistics
 import time
+import io
+import os
+import html
 import requests
 import pandas as pd
 import streamlit as st
 import ccxt
+
+from datetime import datetime, timezone
+from reportlab.lib import colors
+from reportlab.lib.enums import TA_RIGHT, TA_LEFT, TA_CENTER
+from reportlab.lib.pagesizes import A4, landscape
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import mm
+from reportlab.platypus import (
+    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak,
+    Image as ReportLabImage, LongTable, KeepTogether,
+)
 
 LCW_URL = "https://api.livecoinwatch.com"
 LBANK_URL = "https://api.lbank.info/v2"
@@ -18,6 +32,275 @@ TIMEFRAMES = {
 }
 
 st.set_page_config(page_title="SpotPilot AI", page_icon="📊", layout="wide")
+
+
+# -------------------- PDF export helpers --------------------
+def _pdf_rtl(value):
+    """Shape Persian/Arabic text for correct display in the exported PDF."""
+    text_value = "" if value is None else str(value)
+    if any("\u0600" <= ch <= "\u06ff" for ch in text_value):
+        try:
+            import arabic_reshaper
+            from bidi.algorithm import get_display
+            return get_display(arabic_reshaper.reshape(text_value))
+        except Exception:
+            return text_value
+    return text_value
+
+
+def _pdf_font_name():
+    candidates = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSansArabic-Regular.ttf",
+        "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
+    ]
+    try:
+        import matplotlib
+        from matplotlib import font_manager
+        candidates.append(font_manager.findfont("DejaVu Sans"))
+    except Exception:
+        pass
+    for path in candidates:
+        if os.path.isfile(path):
+            try:
+                from reportlab.pdfbase import pdfmetrics
+                from reportlab.pdfbase.ttfonts import TTFont
+                if "SpotPilotUnicode" not in pdfmetrics.getRegisteredFontNames():
+                    pdfmetrics.registerFont(TTFont("SpotPilotUnicode", path))
+                return "SpotPilotUnicode"
+            except Exception:
+                continue
+    return "Helvetica"
+
+
+def build_pdf_report(report_data):
+    """Build a paginated PDF containing the visible report, tables and charts."""
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+
+    font_name = _pdf_font_name()
+    buffer = io.BytesIO()
+    page_size = landscape(A4)
+
+    def draw_footer(canvas, doc):
+        canvas.saveState()
+        canvas.setFont(font_name, 8)
+        canvas.setFillColor(colors.grey)
+        canvas.drawString(14 * mm, 8 * mm, "SpotPilot AI | Public market data | No auto-trading")
+        canvas.drawRightString(page_size[0] - 14 * mm, 8 * mm, f"{doc.page}")
+        canvas.restoreState()
+
+    doc = SimpleDocTemplate(
+        buffer, pagesize=page_size,
+        rightMargin=13 * mm, leftMargin=13 * mm,
+        topMargin=13 * mm, bottomMargin=15 * mm,
+        title="SpotPilot AI - Market Analysis Report",
+        author="SpotPilot AI",
+    )
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle(
+        "SpotPilotTitle", parent=styles["Title"], fontName=font_name,
+        fontSize=18, leading=23, alignment=TA_RIGHT, spaceAfter=5 * mm,
+    )
+    h_style = ParagraphStyle(
+        "SpotPilotHeading", parent=styles["Heading2"], fontName=font_name,
+        fontSize=12, leading=16, alignment=TA_RIGHT, spaceBefore=4 * mm,
+        spaceAfter=2 * mm,
+    )
+    body_style = ParagraphStyle(
+        "SpotPilotBody", parent=styles["BodyText"], fontName=font_name,
+        fontSize=8.5, leading=12, alignment=TA_RIGHT, wordWrap="CJK",
+    )
+    cell_style = ParagraphStyle(
+        "SpotPilotCell", parent=body_style, fontSize=7, leading=9,
+        spaceAfter=0, spaceBefore=0,
+    )
+    header_style = ParagraphStyle(
+        "SpotPilotHeader", parent=cell_style, textColor=colors.white,
+        fontName=font_name, alignment=TA_CENTER,
+    )
+    story = []
+    generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    story.append(Paragraph(_pdf_rtl("گزارش کامل SpotPilot AI"), title_style))
+    story.append(Paragraph(_pdf_rtl(f"زمان تولید گزارش: {generated_at}"), body_style))
+    story.append(Paragraph(_pdf_rtl(
+        f"ارز انتخاب‌شده: {report_data.get('selected_code', '—')} | "
+        f"جفت‌ارز LBank: {report_data.get('selected_pair') or 'در دسترس نیست'}"
+    ), body_style))
+    story.append(Spacer(1, 3 * mm))
+
+    def add_paragraph(text):
+        story.append(Paragraph(_pdf_rtl(text), body_style))
+        story.append(Spacer(1, 1.5 * mm))
+
+    def add_heading(text):
+        story.append(Paragraph(_pdf_rtl(text), h_style))
+
+    def add_table(df, max_rows=None, col_widths=None):
+        if df is None:
+            return
+        try:
+            frame = df.copy()
+            if frame.empty:
+                add_paragraph("داده‌ای برای نمایش وجود ندارد.")
+                return
+            if max_rows is not None:
+                frame = frame.head(max_rows)
+            headers = [Paragraph(_pdf_rtl(html.escape(str(c))), header_style) for c in frame.columns]
+            rows = [headers]
+            for row in frame.itertuples(index=False, name=None):
+                cells = []
+                for value in row:
+                    if pd.isna(value):
+                        value = "—"
+                    lines = str(value).splitlines() or [str(value)]
+                    safe = "<br/>".join(_pdf_rtl(html.escape(line)) for line in lines)
+                    cells.append(Paragraph(safe, cell_style))
+                rows.append(cells)
+            available_width = page_size[0] - doc.leftMargin - doc.rightMargin
+            if col_widths is None:
+                ncols = max(1, len(frame.columns))
+                col_widths = [available_width / ncols] * ncols
+            else:
+                total = sum(col_widths)
+                col_widths = [available_width * w / total for w in col_widths]
+            table_cls = LongTable if len(rows) > 35 else Table
+            table = table_cls(rows, colWidths=col_widths, repeatRows=1, hAlign="LEFT")
+            table.setStyle(TableStyle([
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#263746")),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#c7ced4")),
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 3),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 3),
+                ("TOPPADDING", (0, 0), (-1, -1), 3),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f3f6f8")]),
+            ]))
+            story.append(table)
+            story.append(Spacer(1, 3 * mm))
+        except Exception as exc:
+            add_paragraph(f"ساخت جدول {type(exc).__name__}: {exc}")
+
+    add_heading("خلاصه بازار")
+    add_paragraph(
+        f"قیمت BTC/USD: {report_data.get('btc_usd', '—')} | "
+        f"تعداد ارزهای دریافت‌شده: {report_data.get('fetched_count', '—')} | "
+        f"تعداد ارزهای پس از فیلتر: {report_data.get('coin_count', '—')}"
+    )
+    add_paragraph(f"وضعیت LBank: {report_data.get('lbank_status', '—')}")
+
+    add_heading("۱. فهرست ارزهای LiveCoinWatch")
+    add_paragraph("فهرست زیر شامل همه ردیف‌های باقی‌مانده پس از اعمال فیلتر حجم فعلی است.")
+    add_table(report_data.get("coins_df"), col_widths=[1.0, 1.1, 1.25, 1.25, 1.15, 1.1, 0.9])
+
+    add_heading("۲. مقایسه قیمت صرافی‌ها")
+    add_table(report_data.get("comparison_df"), col_widths=[1.2, 1.3, 1.1, 1.3])
+    errors = report_data.get("compare_errors") or []
+    if errors:
+        add_paragraph("خطاهای دریافت مقایسه: " + " | ".join(str(e) for e in errors))
+
+    add_heading("۳. تحلیل تکنیکال چندتایم‌فریمی")
+    tf_results = report_data.get("timeframe_results") or {}
+    if not tf_results:
+        add_paragraph("نتیجه‌ای از تحلیل تایم‌فریم‌ها در دسترس نیست.")
+    for tf_name in ["15 دقیقه", "4 ساعت", "روزانه"]:
+        result = tf_results.get(tf_name)
+        if not result:
+            continue
+        summary = result.get("summary", {})
+        plan = result.get("plan", {})
+        add_heading(f"تایم‌فریم {tf_name}")
+        add_paragraph(
+            f"زمان آخرین کندل بسته‌شده (UTC): {summary.get('time', '—')} | "
+            f"قیمت بسته‌شده: {summary.get('close', '—')} | ATR: {summary.get('atr', '—')} | "
+            f"حد متحرک UT: {summary.get('ut_stop', '—')}"
+        )
+        add_paragraph(
+            f"سیگنال: {'خرید' if summary.get('buy_signal') else 'فروش' if summary.get('sell_signal') else 'بدون سیگنال تازه'} | "
+            f"ساختار بازار: {summary.get('structure', '—')} | سناریو: {plan.get('status', '—')}"
+        )
+        if "stop" in plan:
+            add_paragraph(
+                f"قیمت مبنا: {plan.get('close', '—')} | حد ضرر: {plan.get('stop', '—')} | "
+                f"هدف ۱: {plan.get('target1', '—')} | هدف ۲: {plan.get('target2', '—')} | "
+                f"توضیح: {plan.get('reason', '—')}"
+            )
+        else:
+            add_paragraph(f"توضیح سناریو: {plan.get('reason', '—')}")
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+            indicators = result.get("indicators")
+            if indicators is not None and not indicators.empty:
+                chart = indicators.tail(150).copy()
+                fig, ax = plt.subplots(figsize=(10, 3.1))
+                for column in ["Close", "UT Stop", "SMA 14", "SMA 50", "SMA 200"]:
+                    if column in chart.columns:
+                        ax.plot(chart["Time"], chart[column], label=column, linewidth=1.0)
+                ax.set_title(f"{report_data.get('selected_code', '')} / {tf_name}")
+                ax.grid(True, alpha=0.25)
+                ax.legend(loc="best", ncol=5, fontsize=7)
+                fig.autofmt_xdate()
+                fig.tight_layout()
+                image_buffer = io.BytesIO()
+                fig.savefig(image_buffer, format="png", dpi=120)
+                plt.close(fig)
+                image_buffer.seek(0)
+                story.append(ReportLabImage(image_buffer, width=245 * mm, height=76 * mm))
+                story.append(Spacer(1, 2 * mm))
+        except Exception as exc:
+            add_paragraph(f"نمودار این تایم‌فریم در PDF ساخته نشد: {type(exc).__name__}")
+
+        indicators = result.get("indicators")
+        if indicators is not None and not indicators.empty:
+            export_cols = [c for c in ["Time", "Open", "High", "Low", "Close", "Volume", "ATR", "UT Stop", "UT Buy", "UT Sell", "Structure"] if c in indicators.columns]
+            candles_table = indicators.tail(150)[export_cols].copy()
+            if "Time" in candles_table.columns:
+                candles_table["Time"] = pd.to_datetime(candles_table["Time"], utc=True, errors="coerce").dt.strftime("%Y-%m-%d %H:%M UTC")
+            add_paragraph("داده‌های کندل و اندیکاتور مربوط به نمودار (حداکثر ۱۵۰ ردیف آخر):")
+            add_table(candles_table, col_widths=[1.5] + [1.0] * (len(export_cols) - 1))
+
+    add_heading("۴. دفتر سفارش و جریان معاملات LBank")
+    add_paragraph(
+        f"بهترین خرید: {report_data.get('best_bid', '—')} | بهترین فروش: {report_data.get('best_ask', '—')} | "
+        f"فاصله خرید و فروش: {report_data.get('spread_pct', '—')} | عدم‌تعادل دفتر سفارش: {report_data.get('imbalance', '—')}"
+    )
+    add_paragraph(
+        f"حجم خرید اخیر: {report_data.get('buy_usd', '—')} | حجم فروش اخیر: {report_data.get('sell_usd', '—')} | "
+        f"جریان خالص: {report_data.get('net_flow', '—')} | تعداد معاملات: {report_data.get('trade_count', '—')}"
+    )
+    add_heading("سطوح خرید و حمایت احتمالی")
+    add_table(report_data.get("bid_df"), col_widths=[1.0, 1.0, 1.5, 1.2])
+    add_heading("سطوح فروش و مقاومت احتمالی")
+    add_table(report_data.get("ask_df"), col_widths=[1.0, 1.0, 1.5, 1.2])
+
+    add_heading("۵. سناریوی احتمالی ورود و خروج")
+    order_plan = report_data.get("order_plan") or {}
+    add_paragraph(f"وضعیت: {order_plan.get('status', '—')} | توضیح: {order_plan.get('reason', '—')}")
+    if "entry" in order_plan:
+        add_paragraph(
+            f"ورود احتمالی: {order_plan.get('entry', '—')} | هدف خروج: {order_plan.get('target', '—')} | "
+            f"حد ابطال سناریو: {order_plan.get('stop', '—')} | نسبت پاداش به ریسک: {order_plan.get('rr', '—')}"
+        )
+        support = order_plan.get("support") or {}
+        resistance = order_plan.get("resistance") or {}
+        add_paragraph(
+            f"سطح خرید مبنا: {support.get('price', '—')} (ارزش {support.get('value', '—')}) | "
+            f"سطح فروش مبنا: {resistance.get('price', '—')} (ارزش {resistance.get('value', '—')})"
+        )
+    add_heading("محدودیت‌ها و هشدار")
+    add_paragraph(
+        "این گزارش از داده‌های عمومی بازار استفاده می‌کند و هیچ معامله‌ای ثبت نمی‌کند. "
+        "سیگنال‌ها و سطوح تحلیلی تخمینی هستند و سود را تضمین نمی‌کنند. "
+        "BOS/CHoCH در این نسخه تقریبی است. کارمزد، لغزش قیمت، نقدشوندگی و احتمال لغو سفارش‌های بزرگ را در نظر بگیرید."
+    )
+
+    doc.build(story, onFirstPage=draw_footer, onLaterPages=draw_footer)
+    buffer.seek(0)
+    return buffer.getvalue()
 
 
 # -------------------- Common helpers --------------------
@@ -980,6 +1263,7 @@ st.caption(
 )
 
 with st.sidebar:
+    pdf_download_placeholder = st.empty()
     st.header("فیلترهای بازار")
 
     min_btc_volume = st.number_input(
@@ -1103,6 +1387,7 @@ with st.spinner("مقایسه قیمت بازارهای عمومی..."):
         selected_lbank_pair,
     )
 
+comp_df = pd.DataFrame(comparison) if comparison else pd.DataFrame()
 if comparison:
     comp_df = pd.DataFrame(comparison)
     comp_df["Last price"] = comp_df["Last price"].map(fmt_price)
@@ -1399,3 +1684,44 @@ st.warning(
     "حجم کندل‌ها شاخص‌های متفاوتی هستند. کارمزد، لغزش قیمت، نقدشوندگی و "
     "احتمال لغو سفارش‌های بزرگ را پیش از هر تصمیم در نظر بگیر."
 )
+
+# -------------------- Download complete PDF report --------------------
+try:
+    pdf_report_data = {
+        "selected_code": selected_code,
+        "selected_pair": selected_lbank_pair,
+        "btc_usd": fmt_usd(btc_usd),
+        "fetched_count": fetched_count,
+        "coin_count": len(coins),
+        "lbank_status": lbank_status,
+        "coins_df": display_df,
+        "comparison_df": comp_df,
+        "compare_errors": compare_errors,
+        "timeframe_results": locals().get("timeframe_results", {}),
+        "best_bid": fmt_price(book_stats.get("best_bid")),
+        "best_ask": fmt_price(book_stats.get("best_ask")),
+        "spread_pct": f"{book_stats.get('spread_pct', 0):.4f}%",
+        "imbalance": f"{book_stats.get('imbalance', 0) * 100:+.2f}%",
+        "buy_usd": fmt_usd(trade_stats.get("buy_usd", 0)),
+        "sell_usd": fmt_usd(trade_stats.get("sell_usd", 0)),
+        "net_flow": fmt_usd(trade_stats.get("net_flow", 0)),
+        "trade_count": trade_stats.get("total_count", 0),
+        "bid_df": bid_df,
+        "ask_df": ask_df,
+        "order_plan": plan,
+    }
+    pdf_bytes = build_pdf_report(pdf_report_data)
+    safe_code = "".join(ch for ch in str(selected_code) if ch.isalnum() or ch in "-_") or "market"
+    pdf_download_placeholder.download_button(
+        label="📄 دانلود گزارش کامل PDF",
+        data=pdf_bytes,
+        file_name=f"SpotPilot_AI_{safe_code}_report.pdf",
+        mime="application/pdf",
+        use_container_width=True,
+        help="گزارش چندصفحه‌ای شامل جدول‌ها، تحلیل تایم‌فریم‌ها، نمودارها و داده‌های قابل مشاهده را دانلود می‌کند.",
+    )
+except Exception as pdf_exc:
+    pdf_download_placeholder.error(
+        f"ساخت PDF ناموفق بود: {type(pdf_exc).__name__}: {str(pdf_exc)[:250]}"
+    )
+
