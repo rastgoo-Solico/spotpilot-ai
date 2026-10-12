@@ -37,6 +37,57 @@ TIMEFRAMES = {
 
 st.set_page_config(page_title="SpotPilot AI", page_icon="📊", layout="wide")
 
+# -------------------- Persian RTL presentation (UI only) --------------------
+st.markdown(
+    """
+    <style>
+    html, body, .stApp, [data-testid="stAppViewContainer"] {
+        direction: rtl;
+        text-align: right;
+    }
+    .block-container {
+        max-width: 1500px;
+        padding-top: 1.4rem;
+        padding-bottom: 2.5rem;
+    }
+    [data-testid="stSidebar"] * {
+        text-align: right;
+    }
+    .stMarkdown, .stCaption, .stAlert, .stMetric,
+    [data-testid="stWidgetLabel"], [data-testid="stExpander"] {
+        direction: rtl;
+        text-align: right;
+    }
+    [data-testid="stMetricLabel"], [data-testid="stMetricValue"],
+    [data-testid="stMetricDelta"] {
+        justify-content: flex-start;
+        text-align: right;
+    }
+    [data-testid="stDataFrame"], [data-testid="stTable"] {
+        direction: rtl;
+    }
+    .stSelectbox label, .stNumberInput label, .stSlider label {
+        text-align: right;
+    }
+    .stMarkdown ul, .stMarkdown ol {
+        padding-right: 1.5rem;
+        padding-left: 0;
+    }
+    .stButton, .stDownloadButton {
+        direction: rtl;
+    }
+    .stTabs [data-baseweb="tab-list"] {
+        direction: rtl;
+    }
+    code, pre, .stCode {
+        direction: ltr;
+        text-align: left;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 
 # -------------------- PDF export helpers --------------------
 def _pdf_rtl(value):
@@ -1672,25 +1723,23 @@ st.caption(
     "اگر داده واقعی یک نماد در دسترس نباشد، مقدار آن خالی می‌ماند."
 )
 
-event = st.dataframe(
-    display_df,
-    use_container_width=True,
-    hide_index=True,
-    height=360,
-    on_select="rerun",
-    selection_mode="single-row",
-    key="lcw_coin_selector",
+selected_code = st.selectbox(
+    "ارز موردنظر برای بررسی",
+    coins_df["Code"].tolist(),
 )
+selected_coin = coins_df[coins_df["Code"] == selected_code].iloc[0]
 
-if event.selection.rows:
-    selected_coin = coins_df.iloc[event.selection.rows[0]]
-    selected_code = selected_coin["Code"]
-else:
-    selected_code = st.selectbox(
-        "انتخاب ارز برای تحلیل",
-        coins_df["Code"].tolist(),
+with st.expander("فهرست کامل ارزهای فیلترشده و داده‌های بازار", expanded=False):
+    st.caption(
+        "چهار نماد ثابت همچنان در ابتدای فهرست هستند: BTC/USDT، XAUT/USDT، "
+        "SOL/USDT و ETH/USDT. ترتیب، فیلتر حجم و داده‌های خام تغییری نکرده‌اند."
     )
-    selected_coin = coins_df[coins_df["Code"] == selected_code].iloc[0]
+    st.dataframe(
+        display_df,
+        use_container_width=True,
+        hide_index=True,
+        height=360,
+    )
 
 st.divider()
 st.subheader("۲. اولویت رمزارزها برای بررسی خرید")
@@ -1725,7 +1774,10 @@ try:
         display_ranking["امتیاز مدل"] = display_ranking["امتیاز مدل"].map(
             lambda value: str(value) if value is not None and pd.notna(value) else "—"
         )
-        st.dataframe(display_ranking, use_container_width=True, hide_index=True)
+        st.caption("در صفحه اصلی فقط سه گزینه نخست نمایش داده می‌شوند؛ محاسبه و ترتیب کامل رتبه‌بندی بدون تغییر باقی می‌ماند.")
+        st.dataframe(display_ranking.head(3), use_container_width=True, hide_index=True)
+        with st.expander("مشاهده رتبه‌بندی کامل همه گزینه‌ها", expanded=False):
+            st.dataframe(display_ranking, use_container_width=True, hide_index=True)
         with st.expander("چرا این رتبه‌بندی را داده؟"):
             for item in crypto_ranking:
                 st.markdown(f"**{item['Code']} — {item['Priority']}**")
@@ -1736,573 +1788,575 @@ try:
 except Exception as exc:
     st.warning(f"رتبه‌بندی رمزارزها کامل نشد: {type(exc).__name__}: {str(exc)[:180]}")
 
-st.divider()
-st.subheader(f"۳. مقایسه قیمت {selected_code}")
-st.caption(
-    "این بخش قیمت‌های عمومی گزارش‌شده از چند صرافی را کنار هم می‌گذارد. "
-    "اختلاف‌ها ممکن است ناشی از زمان به‌روزرسانی، بازار یا نقدشوندگی باشند."
-)
-
-selected_lbank_pair = lbank_symbol_from_code(selected_code)
-selected_lbank_pair = (
-    selected_lbank_pair if selected_lbank_pair in lbank_pairs else None
-)
-
-with st.spinner("مقایسه قیمت بازارهای عمومی..."):
-    comparison, compare_errors = compare_exchange_prices(
-        selected_code,
-        selected_lbank_pair,
+with st.expander("تحلیل حرفه‌ای بازار | مقایسه قیمت، BTC، نمودار و نقدینگی", expanded=False):
+    st.divider()
+    st.subheader(f"۳. مقایسه قیمت {selected_code}")
+    st.caption(
+        "این بخش قیمت‌های عمومی گزارش‌شده از چند صرافی را کنار هم می‌گذارد. "
+        "اختلاف‌ها ممکن است ناشی از زمان به‌روزرسانی، بازار یا نقدشوندگی باشند."
     )
-
-comp_df = pd.DataFrame(comparison) if comparison else pd.DataFrame()
-if comparison:
-    comp_df = pd.DataFrame(comparison)
-    comp_df["Last price"] = comp_df["Last price"].map(fmt_price)
-    comp_df["Difference from median %"] = comp_df[
-        "Difference from median %"
-    ].map(lambda value: f"{value:+.3f}%")
-    st.dataframe(comp_df, use_container_width=True, hide_index=True)
-else:
-    st.warning("قیمت قابل استفاده‌ای از صرافی‌های بررسی‌شده دریافت نشد.")
-
-if compare_errors:
-    with st.expander("جزئیات خطاهای مقایسه قیمت"):
-        st.code("\n".join(compare_errors))
-
-# -------------------- Multi-timeframe technical analysis --------------------
-
-st.divider()
-st.subheader("۴. ارزش نسبت به بیت‌کوین (BTC Pair)")
-st.caption(
-    "این بخش بررسی می‌کند خودِ ارز در برابر BTC قوی‌تر شده یا ضعیف‌تر؛ "
-    "ممکن است قیمت دلاری بالا برود اما نسبت آن به بیت‌کوین افت کند."
-)
-try:
-    with st.spinner("بررسی نسبت واقعی ارز به BTC در LBank..."):
-        btc_relative = get_btc_relative_metrics(selected_code, lbank_pairs)
-    rb1, rb2, rb3 = st.columns(3)
-    rb1.metric(
-        f"{selected_code} برحسب BTC",
-        f"{btc_relative['btc_value']:.8f} BTC" if btc_relative["btc_value"] is not None else "—",
+    
+    selected_lbank_pair = lbank_symbol_from_code(selected_code)
+    selected_lbank_pair = (
+        selected_lbank_pair if selected_lbank_pair in lbank_pairs else None
     )
-    rb2.metric(
-        "تغییر نسبت در آخرین ۲۴ ساعت بسته‌شده",
-        f"{btc_relative['change_pct']:+.2f}%" if btc_relative["change_pct"] is not None else "—",
+    
+    with st.spinner("مقایسه قیمت بازارهای عمومی..."):
+        comparison, compare_errors = compare_exchange_prices(
+            selected_code,
+            selected_lbank_pair,
+        )
+    
+    comp_df = pd.DataFrame(comparison) if comparison else pd.DataFrame()
+    if comparison:
+        comp_df = pd.DataFrame(comparison)
+        comp_df["Last price"] = comp_df["Last price"].map(fmt_price)
+        comp_df["Difference from median %"] = comp_df[
+            "Difference from median %"
+        ].map(lambda value: f"{value:+.3f}%")
+        st.dataframe(comp_df, use_container_width=True, hide_index=True)
+    else:
+        st.warning("قیمت قابل استفاده‌ای از صرافی‌های بررسی‌شده دریافت نشد.")
+    
+    if compare_errors:
+        with st.expander("جزئیات خطاهای مقایسه قیمت"):
+            st.code("\n".join(compare_errors))
+    
+    # -------------------- Multi-timeframe technical analysis --------------------
+    
+    st.divider()
+    st.subheader("۴. ارزش نسبت به بیت‌کوین (BTC Pair)")
+    st.caption(
+        "این بخش بررسی می‌کند خودِ ارز در برابر BTC قوی‌تر شده یا ضعیف‌تر؛ "
+        "ممکن است قیمت دلاری بالا برود اما نسبت آن به بیت‌کوین افت کند."
     )
-    rb3.metric("منبع/بازار", btc_relative["source_pair"])
-    st.caption(btc_relative["method"])
-    if btc_relative["change_pct"] is not None:
-        if btc_relative["change_pct"] > 0:
-            st.success(f"در بازه محاسبه‌شده، {selected_code} نسبت به BTC عملکرد بهتری داشته است.")
-        elif btc_relative["change_pct"] < 0:
-            st.warning(f"در بازه محاسبه‌شده، {selected_code} نسبت به BTC ضعیف‌تر شده است.")
-        else:
-            st.info("عملکرد نسبت به BTC در بازه محاسبه‌شده تقریباً بدون تغییر بوده است.")
-except Exception as exc:
-    st.warning(f"تحلیل نسبت به BTC انجام نشد؛ داده واقعی کافی نیست: {type(exc).__name__}: {str(exc)[:180]}")
-
-if selected_code in ("BTC", "XAUT"):
-    st.markdown("#### نسبت بیت‌کوین به طلا (BTC/XAUT)")
     try:
-        btc_xau = get_btc_xau_metrics(lbank_pairs)
-        if btc_xau["current"] is None:
-            st.info(btc_xau["method"])
-        else:
-            q1, q2, q3 = st.columns(3)
-            q1.metric("BTC/XAUT مصنوعی", f"{btc_xau['current']:.4f} XAUT برای هر BTC")
-            q2.metric("تغییر یک‌روزه", f"{btc_xau['change_1d']:+.2f}%")
-            q3.metric("تغییر هفت‌روزه", f"{btc_xau['change_7d']:+.2f}%")
-            st.caption(btc_xau["method"])
-            if btc_xau["change_7d"] >= 2 and btc_xau["change_1d"] > 0:
-                st.success("قدرت نسبی فعلاً به نفع بیت‌کوین است: با هر BTC طلای بیشتری می‌توان خرید. این به‌تنهایی سیگنال ورود نیست.")
-            elif btc_xau["change_7d"] <= -2 and btc_xau["change_1d"] < 0:
-                st.warning("قدرت نسبی فعلاً به نفع طلا (XAUT) است: ارزش BTC نسبت به طلا افت کرده است.")
+        with st.spinner("بررسی نسبت واقعی ارز به BTC در LBank..."):
+            btc_relative = get_btc_relative_metrics(selected_code, lbank_pairs)
+        rb1, rb2, rb3 = st.columns(3)
+        rb1.metric(
+            f"{selected_code} برحسب BTC",
+            f"{btc_relative['btc_value']:.8f} BTC" if btc_relative["btc_value"] is not None else "—",
+        )
+        rb2.metric(
+            "تغییر نسبت در آخرین ۲۴ ساعت بسته‌شده",
+            f"{btc_relative['change_pct']:+.2f}%" if btc_relative["change_pct"] is not None else "—",
+        )
+        rb3.metric("منبع/بازار", btc_relative["source_pair"])
+        st.caption(btc_relative["method"])
+        if btc_relative["change_pct"] is not None:
+            if btc_relative["change_pct"] > 0:
+                st.success(f"در بازه محاسبه‌شده، {selected_code} نسبت به BTC عملکرد بهتری داشته است.")
+            elif btc_relative["change_pct"] < 0:
+                st.warning(f"در بازه محاسبه‌شده، {selected_code} نسبت به BTC ضعیف‌تر شده است.")
             else:
-                st.info("برتری نسبی روشن نیست؛ برای تصمیم، روند ۴ساعته/روزانه و نقاط ورود را هم تأیید کن.")
+                st.info("عملکرد نسبت به BTC در بازه محاسبه‌شده تقریباً بدون تغییر بوده است.")
     except Exception as exc:
-        st.warning(f"محاسبه BTC/XAUT انجام نشد: {type(exc).__name__}: {str(exc)[:160]}")
-
-st.divider()
-st.subheader("۵. تحلیل تکنیکال")
-st.caption(
-    "۱۵ دقیقه برای حرکت کوتاه‌مدت، ۴ ساعت برای روند میان‌مدت و روزانه برای تصویر بزرگ‌تر است. "
-    "سیگنال‌ها از کندل‌های بسته‌شده محاسبه می‌شوند؛ هیچ شاخصی نتیجه را تضمین نمی‌کند."
-)
-
-if not selected_lbank_pair:
-    st.warning(
-        f"{selected_code} در فهرست جفت‌ارزهای USDT در LBank پیدا نشد. "
-        "تحلیل تکنیکال LBank برای این ارز در دسترس نیست."
+        st.warning(f"تحلیل نسبت به BTC انجام نشد؛ داده واقعی کافی نیست: {type(exc).__name__}: {str(exc)[:180]}")
+    
+    if selected_code in ("BTC", "XAUT"):
+        st.markdown("#### نسبت بیت‌کوین به طلا (BTC/XAUT)")
+        try:
+            btc_xau = get_btc_xau_metrics(lbank_pairs)
+            if btc_xau["current"] is None:
+                st.info(btc_xau["method"])
+            else:
+                q1, q2, q3 = st.columns(3)
+                q1.metric("BTC/XAUT مصنوعی", f"{btc_xau['current']:.4f} XAUT برای هر BTC")
+                q2.metric("تغییر یک‌روزه", f"{btc_xau['change_1d']:+.2f}%")
+                q3.metric("تغییر هفت‌روزه", f"{btc_xau['change_7d']:+.2f}%")
+                st.caption(btc_xau["method"])
+                if btc_xau["change_7d"] >= 2 and btc_xau["change_1d"] > 0:
+                    st.success("قدرت نسبی فعلاً به نفع بیت‌کوین است: با هر BTC طلای بیشتری می‌توان خرید. این به‌تنهایی سیگنال ورود نیست.")
+                elif btc_xau["change_7d"] <= -2 and btc_xau["change_1d"] < 0:
+                    st.warning("قدرت نسبی فعلاً به نفع طلا (XAUT) است: ارزش BTC نسبت به طلا افت کرده است.")
+                else:
+                    st.info("برتری نسبی روشن نیست؛ برای تصمیم، روند ۴ساعته/روزانه و نقاط ورود را هم تأیید کن.")
+        except Exception as exc:
+            st.warning(f"محاسبه BTC/XAUT انجام نشد: {type(exc).__name__}: {str(exc)[:160]}")
+    
+    st.divider()
+    st.subheader("۵. تحلیل تکنیکال")
+    st.caption(
+        "۱۵ دقیقه برای حرکت کوتاه‌مدت، ۴ ساعت برای روند میان‌مدت و روزانه برای تصویر بزرگ‌تر است. "
+        "سیگنال‌ها از کندل‌های بسته‌شده محاسبه می‌شوند؛ هیچ شاخصی نتیجه را تضمین نمی‌کند."
     )
-else:
-    st.write(f"جفت‌ارز تحلیل: **{selected_lbank_pair}**")
-
-    tf_tabs = st.tabs(["۱۵ دقیقه", "۴ ساعت", "روزانه"])
-    tf_names = ["15 دقیقه", "4 ساعت", "روزانه"]
-    timeframe_results = {}
-
-    for tab, tf_name in zip(tf_tabs, tf_names):
-        with tab:
-            try:
-                with st.spinner(f"دریافت کندل‌های {tf_name}..."):
-                    candles = fetch_lbank_klines(
-                        selected_lbank_pair,
-                        tf_name,
-                        300,
-                    )
-                    indicators = add_market_indicators(
-                        candles,
-                        int(atr_period),
-                        float(ut_multiplier),
-                    )
-                    summary = latest_signal_summary(indicators)
-                    plan = make_atr_trade_plan(
-                        indicators,
-                        float(ut_multiplier),
-                    )
-
-                timeframe_results[tf_name] = {
-                    "candles": candles,
-                    "indicators": indicators,
-                    "summary": summary,
-                    "plan": plan,
-                }
-
-                if summary["buy_signal"]:
-                    st.success("سیگنال UT Bot خرید روی آخرین کندل بسته‌شده")
-                elif summary["sell_signal"]:
-                    st.error("سیگنال UT Bot فروش روی آخرین کندل بسته‌شده")
-                else:
-                    st.info("روی آخرین کندل بسته‌شده سیگنال تازه UT ثبت نشده است.")
-
-                a, b, c, d = st.columns(4)
-                a.metric("آخرین قیمت بسته‌شده", fmt_price(summary["close"]))
-                b.metric("ATR", fmt_price(summary["atr"]))
-                c.metric("حد متحرک UT", fmt_price(summary["ut_stop"]))
-                d.metric("وضعیت", plan["status"])
-
-                st.caption(
-                    f"زمان آخرین کندل بسته‌شده (UTC): "
-                    f"{summary['time'].strftime('%Y-%m-%d %H:%M')}"
-                )
-
-                last = indicators.iloc[-1]
-                st.markdown("#### میانگین‌های متحرک؛ قیمت نسبت به روند کجاست؟")
-                st.caption(
-                    "میانگین متحرک قیمت را هموار می‌کند. درصد کنار هر عدد نشان می‌دهد "
-                    "قیمت آخرین کندل چند درصد بالاتر یا پایین‌تر از آن میانگین است. "
-                    "عدد ۱۴، ۵۰ یا ۲۰۰ یعنی تعداد کندل‌ها، نه تعداد روزها؛ پس معنی آن با تایم‌فریم تغییر می‌کند."
-                )
-                ma_cols = st.columns(3)
-                ma_explanations = {
-                    14: "کوتاه‌مدت؛ سریع‌تر به تغییرات قیمت واکنش نشان می‌دهد.",
-                    50: "میان‌مدت؛ برای دیدن جهت کلی‌تر حرکت قیمت.",
-                    200: "بلندمدت؛ برای بررسی روند بزرگ‌تر، به تاریخچه کافی نیاز دارد.",
-                }
-                ma_values = {}
-                for col, period in zip(ma_cols, (14, 50, 200)):
-                    ma_value = number(last.get(f"SMA {period}"), float("nan"))
-                    ma_values[period] = ma_value
-                    if pd.isna(ma_value) or ma_value <= 0:
-                        col.metric(f"SMA {period}", "داده کافی نیست")
-                        col.caption(ma_explanations[period])
-                    else:
-                        distance_pct = (summary["close"] / ma_value - 1) * 100
-                        col.metric(
-                            f"SMA {period}",
-                            fmt_price(ma_value),
-                            delta=f"{distance_pct:+.2f}% قیمت نسبت به میانگین",
-                            help=ma_explanations[period],
+    
+    if not selected_lbank_pair:
+        st.warning(
+            f"{selected_code} در فهرست جفت‌ارزهای USDT در LBank پیدا نشد. "
+            "تحلیل تکنیکال LBank برای این ارز در دسترس نیست."
+        )
+    else:
+        st.write(f"جفت‌ارز تحلیل: **{selected_lbank_pair}**")
+    
+        tf_tabs = st.tabs(["۱۵ دقیقه", "۴ ساعت", "روزانه"])
+        tf_names = ["15 دقیقه", "4 ساعت", "روزانه"]
+        timeframe_results = {}
+    
+        for tab, tf_name in zip(tf_tabs, tf_names):
+            with tab:
+                try:
+                    with st.spinner(f"دریافت کندل‌های {tf_name}..."):
+                        candles = fetch_lbank_klines(
+                            selected_lbank_pair,
+                            tf_name,
+                            300,
                         )
-                        col.caption(ma_explanations[period])
-
-                valid_ma = {
-                    period: value for period, value in ma_values.items()
-                    if pd.notna(value) and value > 0
-                }
-                if 50 in valid_ma and 200 in valid_ma:
-                    if summary["close"] > valid_ma[50] > valid_ma[200]:
-                        st.success("برداشت ساده: قیمت بالاتر از میانگین‌های ۵۰ و ۲۰۰ است؛ وضعیت روند فعلاً متمایل به صعودی است.")
-                    elif summary["close"] < valid_ma[50] < valid_ma[200]:
-                        st.warning("برداشت ساده: قیمت پایین‌تر از میانگین‌های ۵۰ و ۲۰۰ است؛ وضعیت روند فعلاً متمایل به نزولی است.")
+                        indicators = add_market_indicators(
+                            candles,
+                            int(atr_period),
+                            float(ut_multiplier),
+                        )
+                        summary = latest_signal_summary(indicators)
+                        plan = make_atr_trade_plan(
+                            indicators,
+                            float(ut_multiplier),
+                        )
+    
+                    timeframe_results[tf_name] = {
+                        "candles": candles,
+                        "indicators": indicators,
+                        "summary": summary,
+                        "plan": plan,
+                    }
+    
+                    if summary["buy_signal"]:
+                        st.success("سیگنال UT Bot خرید روی آخرین کندل بسته‌شده")
+                    elif summary["sell_signal"]:
+                        st.error("سیگنال UT Bot فروش روی آخرین کندل بسته‌شده")
                     else:
-                        st.info("برداشت ساده: میانگین‌ها هم‌جهت نیستند؛ روند یک‌دست نیست یا بازار در حال تغییر جهت است.")
-                else:
-                    st.info("برای برداشت روند میان‌مدت و بلندمدت، ابتدا باید داده کافی برای SMA 50 و SMA 200 دریافت شود.")
-
-                with st.expander("راهنمای خیلی کوتاه میانگین‌های متحرک"):
-                    st.markdown(
-                        "- **قیمت بالاتر از میانگین:** نشانه‌ای از قدرت نسبی قیمت است، نه تضمین رشد.\n"
-                        "- **قیمت پایین‌تر از میانگین:** نشانه‌ای از ضعف نسبی قیمت است، نه پیش‌بینی قطعی ریزش.\n"
-                        "- **SMA 14:** سریع‌تر واکنش نشان می‌دهد، اما نویز بیشتری هم دارد.\n"
-                        "- **SMA 50:** برای دیدن روند میان‌مدت کاربرد دارد.\n"
-                        "- **SMA 200:** دید بلندمدت می‌دهد و به تاریخچه بیشتری نیاز دارد.\n"
-                        "- میانگین‌ها عقب‌نگرند؛ بهتر است همراه با ساختار قیمت، حجم و مدیریت ریسک بررسی شوند."
+                        st.info("روی آخرین کندل بسته‌شده سیگنال تازه UT ثبت نشده است.")
+    
+                    a, b, c, d = st.columns(4)
+                    a.metric("آخرین قیمت بسته‌شده", fmt_price(summary["close"]))
+                    b.metric("ATR", fmt_price(summary["atr"]))
+                    c.metric("حد متحرک UT", fmt_price(summary["ut_stop"]))
+                    d.metric("وضعیت", plan["status"])
+    
+                    st.caption(
+                        f"زمان آخرین کندل بسته‌شده (UTC): "
+                        f"{summary['time'].strftime('%Y-%m-%d %H:%M')}"
                     )
-
-                st.write(f"**ساختار بازار:** {summary['structure']}")
-
-                if "stop" in plan:
-                    p1, p2, p3, p4 = st.columns(4)
-                    p1.metric("قیمت مبنای سناریو", fmt_price(plan["close"]))
-                    p2.metric("حد ضرر تحلیلی", fmt_price(plan["stop"]))
-                    p3.metric("هدف ۱ (۱٫۵R)", fmt_price(plan["target1"]))
-                    p4.metric("هدف ۲ (۲R)", fmt_price(plan["target2"]))
-                    st.write(plan["reason"])
-                else:
-                    st.warning(plan["reason"])
-
-                st.markdown("#### نمودار قیمت و میانگین‌ها")
-                chart_df = indicators.tail(150).copy()
-                fig = go.Figure()
-                fig.add_trace(go.Candlestick(
-                    x=chart_df["Time"],
-                    open=chart_df["Open"],
-                    high=chart_df["High"],
-                    low=chart_df["Low"],
-                    close=chart_df["Close"],
-                    name="قیمت",
-                    increasing_line_color="#16a34a",
-                    decreasing_line_color="#dc2626",
-                ))
-                ma_styles = {
-                    14: ("#2563eb", "SMA 14 — کوتاه‌مدت"),
-                    50: ("#f59e0b", "SMA 50 — میان‌مدت"),
-                    200: ("#9333ea", "SMA 200 — بلندمدت"),
-                }
-                for period, (line_color, line_name) in ma_styles.items():
-                    column_name = f"SMA {period}"
-                    if column_name in chart_df.columns and chart_df[column_name].notna().any():
+    
+                    last = indicators.iloc[-1]
+                    st.markdown("#### میانگین‌های متحرک؛ قیمت نسبت به روند کجاست؟")
+                    st.caption(
+                        "میانگین متحرک قیمت را هموار می‌کند. درصد کنار هر عدد نشان می‌دهد "
+                        "قیمت آخرین کندل چند درصد بالاتر یا پایین‌تر از آن میانگین است. "
+                        "عدد ۱۴، ۵۰ یا ۲۰۰ یعنی تعداد کندل‌ها، نه تعداد روزها؛ پس معنی آن با تایم‌فریم تغییر می‌کند."
+                    )
+                    ma_cols = st.columns(3)
+                    ma_explanations = {
+                        14: "کوتاه‌مدت؛ سریع‌تر به تغییرات قیمت واکنش نشان می‌دهد.",
+                        50: "میان‌مدت؛ برای دیدن جهت کلی‌تر حرکت قیمت.",
+                        200: "بلندمدت؛ برای بررسی روند بزرگ‌تر، به تاریخچه کافی نیاز دارد.",
+                    }
+                    ma_values = {}
+                    for col, period in zip(ma_cols, (14, 50, 200)):
+                        ma_value = number(last.get(f"SMA {period}"), float("nan"))
+                        ma_values[period] = ma_value
+                        if pd.isna(ma_value) or ma_value <= 0:
+                            col.metric(f"SMA {period}", "داده کافی نیست")
+                            col.caption(ma_explanations[period])
+                        else:
+                            distance_pct = (summary["close"] / ma_value - 1) * 100
+                            col.metric(
+                                f"SMA {period}",
+                                fmt_price(ma_value),
+                                delta=f"{distance_pct:+.2f}% قیمت نسبت به میانگین",
+                                help=ma_explanations[period],
+                            )
+                            col.caption(ma_explanations[period])
+    
+                    valid_ma = {
+                        period: value for period, value in ma_values.items()
+                        if pd.notna(value) and value > 0
+                    }
+                    if 50 in valid_ma and 200 in valid_ma:
+                        if summary["close"] > valid_ma[50] > valid_ma[200]:
+                            st.success("برداشت ساده: قیمت بالاتر از میانگین‌های ۵۰ و ۲۰۰ است؛ وضعیت روند فعلاً متمایل به صعودی است.")
+                        elif summary["close"] < valid_ma[50] < valid_ma[200]:
+                            st.warning("برداشت ساده: قیمت پایین‌تر از میانگین‌های ۵۰ و ۲۰۰ است؛ وضعیت روند فعلاً متمایل به نزولی است.")
+                        else:
+                            st.info("برداشت ساده: میانگین‌ها هم‌جهت نیستند؛ روند یک‌دست نیست یا بازار در حال تغییر جهت است.")
+                    else:
+                        st.info("برای برداشت روند میان‌مدت و بلندمدت، ابتدا باید داده کافی برای SMA 50 و SMA 200 دریافت شود.")
+    
+                    with st.expander("راهنمای خیلی کوتاه میانگین‌های متحرک"):
+                        st.markdown(
+                            "- **قیمت بالاتر از میانگین:** نشانه‌ای از قدرت نسبی قیمت است، نه تضمین رشد.\n"
+                            "- **قیمت پایین‌تر از میانگین:** نشانه‌ای از ضعف نسبی قیمت است، نه پیش‌بینی قطعی ریزش.\n"
+                            "- **SMA 14:** سریع‌تر واکنش نشان می‌دهد، اما نویز بیشتری هم دارد.\n"
+                            "- **SMA 50:** برای دیدن روند میان‌مدت کاربرد دارد.\n"
+                            "- **SMA 200:** دید بلندمدت می‌دهد و به تاریخچه بیشتری نیاز دارد.\n"
+                            "- میانگین‌ها عقب‌نگرند؛ بهتر است همراه با ساختار قیمت، حجم و مدیریت ریسک بررسی شوند."
+                        )
+    
+                    st.write(f"**ساختار بازار:** {summary['structure']}")
+    
+                    if "stop" in plan:
+                        p1, p2, p3, p4 = st.columns(4)
+                        p1.metric("قیمت مبنای سناریو", fmt_price(plan["close"]))
+                        p2.metric("حد ضرر تحلیلی", fmt_price(plan["stop"]))
+                        p3.metric("هدف ۱ (۱٫۵R)", fmt_price(plan["target1"]))
+                        p4.metric("هدف ۲ (۲R)", fmt_price(plan["target2"]))
+                        st.write(plan["reason"])
+                    else:
+                        st.warning(plan["reason"])
+    
+                    st.markdown("#### نمودار قیمت و میانگین‌ها")
+                    chart_df = indicators.tail(150).copy()
+                    fig = go.Figure()
+                    fig.add_trace(go.Candlestick(
+                        x=chart_df["Time"],
+                        open=chart_df["Open"],
+                        high=chart_df["High"],
+                        low=chart_df["Low"],
+                        close=chart_df["Close"],
+                        name="قیمت",
+                        increasing_line_color="#16a34a",
+                        decreasing_line_color="#dc2626",
+                    ))
+                    ma_styles = {
+                        14: ("#2563eb", "SMA 14 — کوتاه‌مدت"),
+                        50: ("#f59e0b", "SMA 50 — میان‌مدت"),
+                        200: ("#9333ea", "SMA 200 — بلندمدت"),
+                    }
+                    for period, (line_color, line_name) in ma_styles.items():
+                        column_name = f"SMA {period}"
+                        if column_name in chart_df.columns and chart_df[column_name].notna().any():
+                            fig.add_trace(go.Scatter(
+                                x=chart_df["Time"],
+                                y=chart_df[column_name],
+                                mode="lines",
+                                name=line_name,
+                                line={"color": line_color, "width": 2},
+                                connectgaps=False,
+                            ))
+                    if "UT Stop" in chart_df.columns:
                         fig.add_trace(go.Scatter(
                             x=chart_df["Time"],
-                            y=chart_df[column_name],
+                            y=chart_df["UT Stop"],
                             mode="lines",
-                            name=line_name,
-                            line={"color": line_color, "width": 2},
-                            connectgaps=False,
+                            name="حد متحرک UT",
+                            line={"color": "#64748b", "width": 1.5, "dash": "dash"},
                         ))
-                if "UT Stop" in chart_df.columns:
-                    fig.add_trace(go.Scatter(
-                        x=chart_df["Time"],
-                        y=chart_df["UT Stop"],
-                        mode="lines",
-                        name="حد متحرک UT",
-                        line={"color": "#64748b", "width": 1.5, "dash": "dash"},
-                    ))
-                buy_points = chart_df[chart_df["UT Buy"].astype(bool)]
-                sell_points = chart_df[chart_df["UT Sell"].astype(bool)]
-                if not buy_points.empty:
-                    fig.add_trace(go.Scatter(
-                        x=buy_points["Time"], y=buy_points["Low"] * 0.998,
-                        mode="markers", name="علامت خرید UT",
-                        marker={"symbol": "triangle-up", "size": 10, "color": "#16a34a"},
-                    ))
-                if not sell_points.empty:
-                    fig.add_trace(go.Scatter(
-                        x=sell_points["Time"], y=sell_points["High"] * 1.002,
-                        mode="markers", name="علامت فروش UT",
-                        marker={"symbol": "triangle-down", "size": 10, "color": "#dc2626"},
-                    ))
-                fig.update_layout(
-                    height=520,
-                    margin={"l": 12, "r": 12, "t": 28, "b": 12},
-                    hovermode="x unified",
-                    xaxis_title="زمان (UTC)",
-                    yaxis_title="قیمت",
-                    legend={"orientation": "h", "yanchor": "bottom", "y": 1.02, "xanchor": "left", "x": 0},
-                    xaxis={"rangeslider": {"visible": False}, "showgrid": True},
-                    yaxis={"side": "right", "showgrid": True},
-                    template="plotly_white",
-                )
-                st.plotly_chart(
-                    fig,
-                    use_container_width=True,
-                    config={"displaylogo": False, "scrollZoom": True},
-                )
-
-                signal_table = indicators.tail(12)[
-                    [
-                        "Time", "Open", "High", "Low", "Close", "Volume",
-                        "ATR", "UT Stop", "UT Buy", "UT Sell", "Structure",
-                    ]
-                ].copy()
-
-                signal_table["Time"] = signal_table["Time"].dt.strftime(
-                    "%Y-%m-%d %H:%M UTC"
-                )
-
-                for col in ["Open", "High", "Low", "Close", "ATR", "UT Stop"]:
-                    signal_table[col] = signal_table[col].map(fmt_price)
-
-                with st.expander("جزئیات کندل‌های اخیر (برای بررسی پیشرفته)"):
-                    st.caption("۱۲ کندل بسته‌شدهٔ اخیر؛ زمان‌ها بر اساس UTC هستند.")
-                    st.dataframe(
-                        signal_table,
-                        use_container_width=True,
-                        hide_index=True,
+                    buy_points = chart_df[chart_df["UT Buy"].astype(bool)]
+                    sell_points = chart_df[chart_df["UT Sell"].astype(bool)]
+                    if not buy_points.empty:
+                        fig.add_trace(go.Scatter(
+                            x=buy_points["Time"], y=buy_points["Low"] * 0.998,
+                            mode="markers", name="علامت خرید UT",
+                            marker={"symbol": "triangle-up", "size": 10, "color": "#16a34a"},
+                        ))
+                    if not sell_points.empty:
+                        fig.add_trace(go.Scatter(
+                            x=sell_points["Time"], y=sell_points["High"] * 1.002,
+                            mode="markers", name="علامت فروش UT",
+                            marker={"symbol": "triangle-down", "size": 10, "color": "#dc2626"},
+                        ))
+                    fig.update_layout(
+                        height=520,
+                        margin={"l": 12, "r": 12, "t": 28, "b": 12},
+                        hovermode="x unified",
+                        xaxis_title="زمان (UTC)",
+                        yaxis_title="قیمت",
+                        legend={"orientation": "h", "yanchor": "bottom", "y": 1.02, "xanchor": "left", "x": 0},
+                        xaxis={"rangeslider": {"visible": False}, "showgrid": True},
+                        yaxis={"side": "right", "showgrid": True},
+                        template="plotly_white",
                     )
-
-            except Exception as exc:
-                st.error(
-                    f"تحلیل تایم‌فریم {tf_name} ناموفق بود: "
-                    f"{type(exc).__name__}: {str(exc)[:300]}"
+                    st.plotly_chart(
+                        fig,
+                        use_container_width=True,
+                        config={"displaylogo": False, "scrollZoom": True},
+                    )
+    
+                    signal_table = indicators.tail(12)[
+                        [
+                            "Time", "Open", "High", "Low", "Close", "Volume",
+                            "ATR", "UT Stop", "UT Buy", "UT Sell", "Structure",
+                        ]
+                    ].copy()
+    
+                    signal_table["Time"] = signal_table["Time"].dt.strftime(
+                        "%Y-%m-%d %H:%M UTC"
+                    )
+    
+                    for col in ["Open", "High", "Low", "Close", "ATR", "UT Stop"]:
+                        signal_table[col] = signal_table[col].map(fmt_price)
+    
+                    with st.expander("جزئیات کندل‌های اخیر (برای بررسی پیشرفته)"):
+                        st.caption("۱۲ کندل بسته‌شدهٔ اخیر؛ زمان‌ها بر اساس UTC هستند.")
+                        st.dataframe(
+                            signal_table,
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+    
+                except Exception as exc:
+                    st.error(
+                        f"تحلیل تایم‌فریم {tf_name} ناموفق بود: "
+                        f"{type(exc).__name__}: {str(exc)[:300]}"
+                    )
+    
+        # Cross-timeframe overview.
+        if timeframe_results:
+            st.markdown("#### خلاصه هم‌جهتی تایم‌فریم‌ها")
+            overview = []
+    
+            for tf_name in tf_names:
+                result = timeframe_results.get(tf_name)
+                if not result:
+                    continue
+    
+                summary = result["summary"]
+                plan = result["plan"]
+                overview.append({
+                    "تایم‌فریم": tf_name,
+                    "قیمت بسته‌شده": fmt_price(summary["close"]),
+                    "سیگنال UT": (
+                        "خرید" if summary["buy_signal"]
+                        else "فروش" if summary["sell_signal"]
+                        else "بدون سیگنال تازه"
+                    ),
+                    "ساختار": summary["structure"],
+                    "سناریو": plan["status"],
+                })
+    
+            st.dataframe(
+                pd.DataFrame(overview),
+                use_container_width=True,
+                hide_index=True,
+            )
+    
+            buy_count = sum(
+                1 for result in timeframe_results.values()
+                if result["summary"]["buy_signal"]
+            )
+            sell_count = sum(
+                1 for result in timeframe_results.values()
+                if result["summary"]["sell_signal"]
+            )
+    
+            if buy_count >= 2:
+                st.success(
+                    f"هم‌جهتی اولیه: سیگنال خرید UT در {buy_count} تایم‌فریم ثبت شده است. "
+                    "پیش از هر تصمیم، روند، نقدشوندگی و حد ضرر را بررسی کن."
                 )
-
-    # Cross-timeframe overview.
-    if timeframe_results:
-        st.markdown("#### خلاصه هم‌جهتی تایم‌فریم‌ها")
-        overview = []
-
-        for tf_name in tf_names:
-            result = timeframe_results.get(tf_name)
-            if not result:
-                continue
-
-            summary = result["summary"]
-            plan = result["plan"]
-            overview.append({
-                "تایم‌فریم": tf_name,
-                "قیمت بسته‌شده": fmt_price(summary["close"]),
-                "سیگنال UT": (
-                    "خرید" if summary["buy_signal"]
-                    else "فروش" if summary["sell_signal"]
-                    else "بدون سیگنال تازه"
-                ),
-                "ساختار": summary["structure"],
-                "سناریو": plan["status"],
-            })
-
-        st.dataframe(
-            pd.DataFrame(overview),
-            use_container_width=True,
-            hide_index=True,
-        )
-
-        buy_count = sum(
-            1 for result in timeframe_results.values()
-            if result["summary"]["buy_signal"]
-        )
-        sell_count = sum(
-            1 for result in timeframe_results.values()
-            if result["summary"]["sell_signal"]
-        )
-
-        if buy_count >= 2:
-            st.success(
-                f"هم‌جهتی اولیه: سیگنال خرید UT در {buy_count} تایم‌فریم ثبت شده است. "
-                "پیش از هر تصمیم، روند، نقدشوندگی و حد ضرر را بررسی کن."
-            )
-        elif sell_count >= 2:
-            st.warning(
-                f"هم‌جهتی نزولی: سیگنال فروش UT در {sell_count} تایم‌فریم ثبت شده است."
-            )
-        else:
-            st.info(
-                "هنوز دست‌کم دو تایم‌فریم سیگنال هم‌جهت تازه ندارند."
-            )
-
-# -------------------- Order book and liquidation liquidity --------------------
-
-st.divider()
-st.subheader("۶. نقدینگی و معاملات اخیر LBank")
-st.caption(
-    "دفتر سفارش LBank نقدینگیِ سفارش‌های قابل‌مشاهده همین صرافی را نشان می‌دهد. "
-    "نقشه لیکوییدیشن رایگان، معاملات لیکوییدشده واقعی را از چند بازار فیوچرز جمع می‌کند؛ "
-    "این داده با سفارش‌های اسپات یا برآورد موقعیت‌های هنوز لیکوییدنشده فرق دارد."
-)
-with st.expander("نقشه رایگان لیکوییدیشن BTC (بدون کلید API)", expanded=False):
-    st.markdown(
-        "این نقشه از API عمومی SmartMoneyAPI استفاده می‌کند؛ طبق مستندات ارائه‌دهنده، "
-        "بدون کلید و رایگان است اما محدودیت درخواست بر اساس IP دارد. "
-        "برای نقشه تخمینی سطوح احتمالی (نه لیکوییدیشن‌های انجام‌شده)، "
-        "[LiqMap رایگان و متن‌باز را باز کن](https://liqmap.smithblock.ai/). "
-        f"همچنین [نقشه CoinGlass]({COINGLASS_HEATMAP_URL}) برای مشاهده دستی در دسترس است."
-    )
-    try:
-        heatmap, heatmap_error = fetch_free_liquidation_heatmap("BTC", 240, 50)
-        if heatmap:
-            totals = heatmap.get("totals") or {}
-            sides = heatmap.get("by_side") or {}
-            m1, m2, m3 = st.columns(3)
-            m1.metric("مجموع لیکوییدیشن ثبت‌شده", fmt_usd(number(totals.get("total_notional"))))
-            m2.metric("لیکوییدیشن پوزیشن‌های لانگ", fmt_usd(number(sides.get("long", totals.get("long_liq_notional")))))
-            m3.metric("لیکوییدیشن پوزیشن‌های شورت", fmt_usd(number(sides.get("short", totals.get("short_liq_notional")))))
-            if heatmap.get("z"):
-                fig_liq = go.Figure(data=go.Heatmap(
-                    x=heatmap["x"], y=heatmap["y"], z=heatmap["z"],
-                    colorscale="Turbo", colorbar={"title": "لیکوییدیشن ثبت‌شده"},
-                    hovertemplate="زمان: %{x}<br>قیمت: %{y:,.2f}<br>مقدار: %{z:,.0f}<extra></extra>",
-                ))
-                fig_liq.update_layout(
-                    title="BTC — لیکوییدیشن‌های واقعی ثبت‌شده در ۴ ساعت اخیر",
-                    xaxis_title="زمان (UTC)", yaxis_title="قیمت (USDT)", height=500,
+            elif sell_count >= 2:
+                st.warning(
+                    f"هم‌جهتی نزولی: سیگنال فروش UT در {sell_count} تایم‌فریم ثبت شده است."
                 )
-                st.plotly_chart(fig_liq, use_container_width=True)
-            clusters = heatmap.get("clusters") or []
-            if clusters:
-                cluster_rows = []
-                for cluster in clusters[:12]:
-                    cluster_rows.append({
-                        "قیمت": fmt_price(number(cluster.get("price"))),
-                        "مبلغ لیکوییدشده": fmt_usd(number(cluster.get("notional"))),
-                        "لانگ": fmt_usd(number(cluster.get("long_notional"))),
-                        "شورت": fmt_usd(number(cluster.get("short_notional"))),
-                        "تعداد": int(number(cluster.get("count"))),
-                    })
-                st.dataframe(pd.DataFrame(cluster_rows), use_container_width=True, hide_index=True)
-            elif heatmap.get("note"):
-                st.info(str(heatmap["note"]))
-            long_total = number(sides.get("long", totals.get("long_liq_notional")))
-            short_total = number(sides.get("short", totals.get("short_liq_notional")))
-            if long_total > 0 or short_total > 0:
-                if short_total >= long_total * 1.25 and short_total > 0:
-                    st.info("تفسیر گذشته‌نگر: لیکوییدیشن شورت‌ها بیشتر بوده؛ در این بازه خریدهای اجباریِ بستن شورت غالب بوده‌اند. این ثابت نمی‌کند که قیمت بعداً به نقدینگی بالاتر می‌رود.")
-                elif long_total >= short_total * 1.25 and long_total > 0:
-                    st.info("تفسیر گذشته‌نگر: لیکوییدیشن لانگ‌ها بیشتر بوده؛ در این بازه فروش‌های اجباریِ بستن لانگ غالب بوده‌اند. این ثابت نمی‌کند که قیمت بعداً به نقدینگی پایین‌تر می‌رود.")
-                else:
-                    st.info("تفسیر گذشته‌نگر: لیکوییدیشن لانگ و شورت نسبتاً نزدیک‌اند؛ از این داده به‌تنهایی جهت بعدی قابل استنتاج نیست.")
-            st.caption(
-                "این داده‌ها لیکوییدیشن‌هایی هستند که واقعاً در جریان زنده صرافی‌ها ثبت شده‌اند؛ "
-                "آن‌ها محل تجمع سفارش‌های آینده یا پیش‌بینی قیمت نیستند. برای سطح‌های تخمینیِ هنوز مصرف‌نشده، "
-                "نقشه LiqMap را جداگانه بررسی کن. بازارهای منبع شامل Binance، OKX، Bybit، Bitget و BitMEX هستند "
-                "و لزوماً مختص LBank نیستند."
-            )
-        else:
-            st.info(f"نقشه رایگان فعلاً در دسترس نیست: {heatmap_error}")
-    except Exception as exc:
-        st.warning(
-            "دریافت نقشه رایگان ناموفق بود؛ ممکن است API موقتاً در دسترس نباشد یا محدودیت IP فعال شده باشد. "
-            f"جزئیات: {type(exc).__name__}: {str(exc)[:180]}"
-        )
-
-if not selected_lbank_pair:
-    st.warning(
-        f"{selected_code} در فهرست جفت‌ارزهای USDT دریافتی از LBank پیدا نشد. "
-        "تحلیل دفتر سفارش برای این جفت‌ارز در دسترس نیست."
-    )
-    st.stop()
-
-st.write(f"جفت‌ارز LBank: **{selected_lbank_pair}**")
-
-try:
-    with st.spinner("دریافت دفتر سفارش عمومی LBank..."):
-        book = fetch_lbank_book(selected_lbank_pair)
-        book_stats = analyze_book(book)
-except Exception as exc:
-    st.error(f"دریافت یا تحلیل دفتر سفارش ناموفق بود: {exc}")
-    st.stop()
-
-try:
-    with st.spinner("دریافت معاملات اخیر LBank..."):
-        trades = fetch_lbank_trades(selected_lbank_pair)
-        trade_stats = analyze_trades(trades)
-except Exception as exc:
-    trade_stats = analyze_trades([])
-    st.warning(
-        "دفتر سفارش دریافت شد، اما معاملات اخیر قابل دریافت نبودند. "
-        f"جزئیات: {type(exc).__name__}: {str(exc)[:250]}"
-    )
-
-metrics = st.columns(4)
-metrics[0].metric(
-    "بهترین خرید", fmt_price(book_stats["best_bid"]),
-    help="بالاترین قیمت خریدِ موجود در دفتر سفارش.",
-)
-metrics[1].metric(
-    "بهترین فروش", fmt_price(book_stats["best_ask"]),
-    help="پایین‌ترین قیمت فروشِ موجود در دفتر سفارش.",
-)
-metrics[2].metric(
-    "فاصله خرید و فروش", f"{book_stats['spread_pct']:.4f}%",
-    help="فاصله نسبی بهترین قیمت فروش و خرید؛ فاصله کمتر معمولاً اجرای معامله را کم‌هزینه‌تر می‌کند، اما کافی نیست.",
-)
-metrics[3].metric(
-    "عدم‌تعادل دفتر سفارش",
-    f"{book_stats['imbalance'] * 100:+.2f}%",
-    help="مقایسه ارزش سفارش‌های خرید و فروشِ قابل‌مشاهده؛ سفارش‌ها ممکن است لغو شوند.",
-)
-
-if book_stats["imbalance"] > 0:
-    st.info("در لحظه دریافت داده، ارزش سفارش‌های خریدِ قابل‌مشاهده بیشتر است؛ این به‌تنهایی به معنی رشد قیمت نیست.")
-elif book_stats["imbalance"] < 0:
-    st.info("در لحظه دریافت داده، ارزش سفارش‌های فروشِ قابل‌مشاهده بیشتر است؛ این به‌تنهایی به معنی افت قیمت نیست.")
-else:
-    st.info("در لحظه دریافت داده، عدم‌تعادل دفتر سفارش نزدیک به صفر است.")
-
-# Plain-language liquidity interpretation: visible order-book walls, not future liquidation estimates.
-mid_price = number(book_stats.get("mid"))
-near_bids = [w for w in book_stats.get("bid_walls", []) if number(w.get("price")) < mid_price]
-near_asks = [w for w in book_stats.get("ask_walls", []) if number(w.get("price")) > mid_price]
-nearest_bid = max(near_bids, key=lambda w: number(w.get("price"))) if near_bids else None
-nearest_ask = min(near_asks, key=lambda w: number(w.get("price"))) if near_asks else None
-st.markdown("#### جمع‌بندی ساده نقدینگی")
-st.caption("به زبان ساده: این بخش فقط سفارش‌های بزرگی را می‌سنجد که همین حالا در دفتر سفارش LBank دیده می‌شوند؛ نمی‌تواند با قطعیت پیش‌بینی کند قیمت کدام سمت می‌رود.")
-if nearest_bid and nearest_ask:
-    bid_distance = (mid_price - number(nearest_bid["price"])) / mid_price * 100
-    ask_distance = (number(nearest_ask["price"]) - mid_price) / mid_price * 100
-    liq_a, liq_b = st.columns(2)
-    liq_a.metric("سطح زیر قیمت (خریداران)", fmt_price(nearest_bid["price"]), delta=f"{bid_distance:.2f}% پایین‌تر")
-    liq_b.metric("سطح بالای قیمت (فروشندگان)", fmt_price(nearest_ask["price"]), delta=f"{ask_distance:.2f}% بالاتر")
-    bid_value = number(nearest_bid.get("value"))
-    ask_value = number(nearest_ask.get("value"))
-    if ask_distance <= bid_distance * 0.85 and ask_value >= bid_value:
-        st.success(f"**اولویت بررسی: سطح بالایی {fmt_price(nearest_ask['price'])}.** هم نزدیک‌تر است و هم دیوار فروش آن دست‌کم به‌اندازه دیوار خرید زیر قیمت است. این فقط سطحی است که باید زیر نظر بگیریم، نه پیش‌بینی قطعی رشد.")
-    elif bid_distance <= ask_distance * 0.85 and bid_value >= ask_value:
-        st.warning(f"**اولویت بررسی: سطح پایینی {fmt_price(nearest_bid['price'])}.** هم نزدیک‌تر است و هم دیوار خرید آن دست‌کم به‌اندازه دیوار فروش بالای قیمت است. این به معنی قطعی بودن افت قیمت نیست.")
-    else:
-        st.info("**نتیجه: هنوز برنده مشخصی نداریم.** دو سطح از نظر فاصله و اندازه اختلاف واضحی ندارند؛ فعلاً فقط صبر کن و دنبال تأیید کندل بمان.")
-    st.markdown("**وقتی قیمت به سطح رسید:**")
-    st.markdown(
-        f"- **اگر به سطح پایین {fmt_price(nearest_bid['price'])} رسید:** فقط وقتی خرید را بررسی کن که قیمت دوباره بالای سطح برگردد و کندل بسته‌شده آن را تأیید کند؛ اگر زیر سطح ماند، خرید نکن.\n"
-        f"- **اگر به سطح بالا {fmt_price(nearest_ask['price'])} رسید:** اگر قیمت پس زده شد، خرید تازه نکن؛ اگر شکست و بالای آن تثبیت شد، با تصور مقاومت قطعی نفروش.\n"
-        "- **اگر تأیید نگرفتی:** معامله نکن. این راهنما برای بازار اسپات است؛ سیگنال فروش الزاماً به معنی شورت نیست."
-    )
-    st.caption("این سطح‌ها دیوارهای سفارش‌اند، نه نقاط دقیق لیکوییدیشن پوزیشن‌ها. سفارش‌های بزرگ ممکن است قبل از اجرا لغو شوند.")
-else:
-    st.info("داده کافی برای مقایسه یک سطح خرید و یک سطح فروش وجود ندارد؛ از روی اطلاعات ناقص جهت تعیین نمی‌کنیم.")
-    st.write("**رفتار پیشنهادی: فعلاً صبر کن.** پس از ظاهر شدن سطح معتبر و بسته‌شدن کندل تأییدی، نقطه ورود را دوباره بررسی کن.")
-
-flows = st.columns(4)
-flows[0].metric("حجم خرید اخیر", fmt_usd(trade_stats["buy_usd"]))
-flows[1].metric("حجم فروش اخیر", fmt_usd(trade_stats["sell_usd"]))
-flows[2].metric("جریان خالص", fmt_usd(trade_stats["net_flow"]))
-flows[3].metric("تعداد معاملات", trade_stats["total_count"])
-
-with st.expander("جزئیات دفتر سفارش: سطوح خرید و فروش"):
+            else:
+                st.info(
+                    "هنوز دست‌کم دو تایم‌فریم سیگنال هم‌جهت تازه ندارند."
+                )
+    
+    # -------------------- Order book and liquidation liquidity --------------------
+    
+    st.divider()
+    st.subheader("۶. نقدینگی و معاملات اخیر LBank")
     st.caption(
-        "این سطوح از سفارش‌های قابل‌مشاهده استخراج شده‌اند و حمایت/مقاومت قطعی نیستند. "
-        "سفارش‌ها می‌توانند تغییر کنند یا پیش از اجرا لغو شوند."
+        "دفتر سفارش LBank نقدینگیِ سفارش‌های قابل‌مشاهده همین صرافی را نشان می‌دهد. "
+        "نقشه لیکوییدیشن رایگان، معاملات لیکوییدشده واقعی را از چند بازار فیوچرز جمع می‌کند؛ "
+        "این داده با سفارش‌های اسپات یا برآورد موقعیت‌های هنوز لیکوییدنشده فرق دارد."
     )
-    bid_col, ask_col = st.columns(2)
-
-    with bid_col:
-        st.markdown("**سطوح خرید و حمایت احتمالی**")
-        bid_df = pd.DataFrame(book_stats["bid_walls"]).rename(columns={
-            "price": "قیمت",
-            "quantity": "مقدار",
-            "value": "ارزش تقریبی USDT",
-            "classification": "نوع سطح",
-        })
-        bid_df["قیمت"] = bid_df["قیمت"].map(fmt_price)
-        bid_df["مقدار"] = bid_df["مقدار"].map(lambda value: f"{value:,.6f}")
-        bid_df["ارزش تقریبی USDT"] = bid_df["ارزش تقریبی USDT"].map(fmt_usd)
-        st.dataframe(bid_df, use_container_width=True, hide_index=True)
-
-    with ask_col:
-        st.markdown("**سطوح فروش و مقاومت احتمالی**")
-        ask_df = pd.DataFrame(book_stats["ask_walls"]).rename(columns={
-            "price": "قیمت",
-            "quantity": "مقدار",
-            "value": "ارزش تقریبی USDT",
-            "classification": "نوع سطح",
-        })
-        ask_df["قیمت"] = ask_df["قیمت"].map(fmt_price)
-        ask_df["مقدار"] = ask_df["مقدار"].map(lambda value: f"{value:,.6f}")
-        ask_df["ارزش تقریبی USDT"] = ask_df["ارزش تقریبی USDT"].map(fmt_usd)
-        st.dataframe(ask_df, use_container_width=True, hide_index=True)
-
+    with st.expander("نقشه رایگان لیکوییدیشن BTC (بدون کلید API)", expanded=False):
+        st.markdown(
+            "این نقشه از API عمومی SmartMoneyAPI استفاده می‌کند؛ طبق مستندات ارائه‌دهنده، "
+            "بدون کلید و رایگان است اما محدودیت درخواست بر اساس IP دارد. "
+            "برای نقشه تخمینی سطوح احتمالی (نه لیکوییدیشن‌های انجام‌شده)، "
+            "[LiqMap رایگان و متن‌باز را باز کن](https://liqmap.smithblock.ai/). "
+            f"همچنین [نقشه CoinGlass]({COINGLASS_HEATMAP_URL}) برای مشاهده دستی در دسترس است."
+        )
+        try:
+            heatmap, heatmap_error = fetch_free_liquidation_heatmap("BTC", 240, 50)
+            if heatmap:
+                totals = heatmap.get("totals") or {}
+                sides = heatmap.get("by_side") or {}
+                m1, m2, m3 = st.columns(3)
+                m1.metric("مجموع لیکوییدیشن ثبت‌شده", fmt_usd(number(totals.get("total_notional"))))
+                m2.metric("لیکوییدیشن پوزیشن‌های لانگ", fmt_usd(number(sides.get("long", totals.get("long_liq_notional")))))
+                m3.metric("لیکوییدیشن پوزیشن‌های شورت", fmt_usd(number(sides.get("short", totals.get("short_liq_notional")))))
+                if heatmap.get("z"):
+                    fig_liq = go.Figure(data=go.Heatmap(
+                        x=heatmap["x"], y=heatmap["y"], z=heatmap["z"],
+                        colorscale="Turbo", colorbar={"title": "لیکوییدیشن ثبت‌شده"},
+                        hovertemplate="زمان: %{x}<br>قیمت: %{y:,.2f}<br>مقدار: %{z:,.0f}<extra></extra>",
+                    ))
+                    fig_liq.update_layout(
+                        title="BTC — لیکوییدیشن‌های واقعی ثبت‌شده در ۴ ساعت اخیر",
+                        xaxis_title="زمان (UTC)", yaxis_title="قیمت (USDT)", height=500,
+                    )
+                    st.plotly_chart(fig_liq, use_container_width=True)
+                clusters = heatmap.get("clusters") or []
+                if clusters:
+                    cluster_rows = []
+                    for cluster in clusters[:12]:
+                        cluster_rows.append({
+                            "قیمت": fmt_price(number(cluster.get("price"))),
+                            "مبلغ لیکوییدشده": fmt_usd(number(cluster.get("notional"))),
+                            "لانگ": fmt_usd(number(cluster.get("long_notional"))),
+                            "شورت": fmt_usd(number(cluster.get("short_notional"))),
+                            "تعداد": int(number(cluster.get("count"))),
+                        })
+                    st.dataframe(pd.DataFrame(cluster_rows), use_container_width=True, hide_index=True)
+                elif heatmap.get("note"):
+                    st.info(str(heatmap["note"]))
+                long_total = number(sides.get("long", totals.get("long_liq_notional")))
+                short_total = number(sides.get("short", totals.get("short_liq_notional")))
+                if long_total > 0 or short_total > 0:
+                    if short_total >= long_total * 1.25 and short_total > 0:
+                        st.info("تفسیر گذشته‌نگر: لیکوییدیشن شورت‌ها بیشتر بوده؛ در این بازه خریدهای اجباریِ بستن شورت غالب بوده‌اند. این ثابت نمی‌کند که قیمت بعداً به نقدینگی بالاتر می‌رود.")
+                    elif long_total >= short_total * 1.25 and long_total > 0:
+                        st.info("تفسیر گذشته‌نگر: لیکوییدیشن لانگ‌ها بیشتر بوده؛ در این بازه فروش‌های اجباریِ بستن لانگ غالب بوده‌اند. این ثابت نمی‌کند که قیمت بعداً به نقدینگی پایین‌تر می‌رود.")
+                    else:
+                        st.info("تفسیر گذشته‌نگر: لیکوییدیشن لانگ و شورت نسبتاً نزدیک‌اند؛ از این داده به‌تنهایی جهت بعدی قابل استنتاج نیست.")
+                st.caption(
+                    "این داده‌ها لیکوییدیشن‌هایی هستند که واقعاً در جریان زنده صرافی‌ها ثبت شده‌اند؛ "
+                    "آن‌ها محل تجمع سفارش‌های آینده یا پیش‌بینی قیمت نیستند. برای سطح‌های تخمینیِ هنوز مصرف‌نشده، "
+                    "نقشه LiqMap را جداگانه بررسی کن. بازارهای منبع شامل Binance، OKX، Bybit، Bitget و BitMEX هستند "
+                    "و لزوماً مختص LBank نیستند."
+                )
+            else:
+                st.info(f"نقشه رایگان فعلاً در دسترس نیست: {heatmap_error}")
+        except Exception as exc:
+            st.warning(
+                "دریافت نقشه رایگان ناموفق بود؛ ممکن است API موقتاً در دسترس نباشد یا محدودیت IP فعال شده باشد. "
+                f"جزئیات: {type(exc).__name__}: {str(exc)[:180]}"
+            )
+    
+    if not selected_lbank_pair:
+        st.warning(
+            f"{selected_code} در فهرست جفت‌ارزهای USDT دریافتی از LBank پیدا نشد. "
+            "تحلیل دفتر سفارش برای این جفت‌ارز در دسترس نیست."
+        )
+        st.stop()
+    
+    st.write(f"جفت‌ارز LBank: **{selected_lbank_pair}**")
+    
+    try:
+        with st.spinner("دریافت دفتر سفارش عمومی LBank..."):
+            book = fetch_lbank_book(selected_lbank_pair)
+            book_stats = analyze_book(book)
+    except Exception as exc:
+        st.error(f"دریافت یا تحلیل دفتر سفارش ناموفق بود: {exc}")
+        st.stop()
+    
+    try:
+        with st.spinner("دریافت معاملات اخیر LBank..."):
+            trades = fetch_lbank_trades(selected_lbank_pair)
+            trade_stats = analyze_trades(trades)
+    except Exception as exc:
+        trade_stats = analyze_trades([])
+        st.warning(
+            "دفتر سفارش دریافت شد، اما معاملات اخیر قابل دریافت نبودند. "
+            f"جزئیات: {type(exc).__name__}: {str(exc)[:250]}"
+        )
+    
+    metrics = st.columns(4)
+    metrics[0].metric(
+        "بهترین خرید", fmt_price(book_stats["best_bid"]),
+        help="بالاترین قیمت خریدِ موجود در دفتر سفارش.",
+    )
+    metrics[1].metric(
+        "بهترین فروش", fmt_price(book_stats["best_ask"]),
+        help="پایین‌ترین قیمت فروشِ موجود در دفتر سفارش.",
+    )
+    metrics[2].metric(
+        "فاصله خرید و فروش", f"{book_stats['spread_pct']:.4f}%",
+        help="فاصله نسبی بهترین قیمت فروش و خرید؛ فاصله کمتر معمولاً اجرای معامله را کم‌هزینه‌تر می‌کند، اما کافی نیست.",
+    )
+    metrics[3].metric(
+        "عدم‌تعادل دفتر سفارش",
+        f"{book_stats['imbalance'] * 100:+.2f}%",
+        help="مقایسه ارزش سفارش‌های خرید و فروشِ قابل‌مشاهده؛ سفارش‌ها ممکن است لغو شوند.",
+    )
+    
+    if book_stats["imbalance"] > 0:
+        st.info("در لحظه دریافت داده، ارزش سفارش‌های خریدِ قابل‌مشاهده بیشتر است؛ این به‌تنهایی به معنی رشد قیمت نیست.")
+    elif book_stats["imbalance"] < 0:
+        st.info("در لحظه دریافت داده، ارزش سفارش‌های فروشِ قابل‌مشاهده بیشتر است؛ این به‌تنهایی به معنی افت قیمت نیست.")
+    else:
+        st.info("در لحظه دریافت داده، عدم‌تعادل دفتر سفارش نزدیک به صفر است.")
+    
+    # Plain-language liquidity interpretation: visible order-book walls, not future liquidation estimates.
+    mid_price = number(book_stats.get("mid"))
+    near_bids = [w for w in book_stats.get("bid_walls", []) if number(w.get("price")) < mid_price]
+    near_asks = [w for w in book_stats.get("ask_walls", []) if number(w.get("price")) > mid_price]
+    nearest_bid = max(near_bids, key=lambda w: number(w.get("price"))) if near_bids else None
+    nearest_ask = min(near_asks, key=lambda w: number(w.get("price"))) if near_asks else None
+    st.markdown("#### جمع‌بندی ساده نقدینگی")
+    st.caption("به زبان ساده: این بخش فقط سفارش‌های بزرگی را می‌سنجد که همین حالا در دفتر سفارش LBank دیده می‌شوند؛ نمی‌تواند با قطعیت پیش‌بینی کند قیمت کدام سمت می‌رود.")
+    if nearest_bid and nearest_ask:
+        bid_distance = (mid_price - number(nearest_bid["price"])) / mid_price * 100
+        ask_distance = (number(nearest_ask["price"]) - mid_price) / mid_price * 100
+        liq_a, liq_b = st.columns(2)
+        liq_a.metric("سطح زیر قیمت (خریداران)", fmt_price(nearest_bid["price"]), delta=f"{bid_distance:.2f}% پایین‌تر")
+        liq_b.metric("سطح بالای قیمت (فروشندگان)", fmt_price(nearest_ask["price"]), delta=f"{ask_distance:.2f}% بالاتر")
+        bid_value = number(nearest_bid.get("value"))
+        ask_value = number(nearest_ask.get("value"))
+        if ask_distance <= bid_distance * 0.85 and ask_value >= bid_value:
+            st.success(f"**اولویت بررسی: سطح بالایی {fmt_price(nearest_ask['price'])}.** هم نزدیک‌تر است و هم دیوار فروش آن دست‌کم به‌اندازه دیوار خرید زیر قیمت است. این فقط سطحی است که باید زیر نظر بگیریم، نه پیش‌بینی قطعی رشد.")
+        elif bid_distance <= ask_distance * 0.85 and bid_value >= ask_value:
+            st.warning(f"**اولویت بررسی: سطح پایینی {fmt_price(nearest_bid['price'])}.** هم نزدیک‌تر است و هم دیوار خرید آن دست‌کم به‌اندازه دیوار فروش بالای قیمت است. این به معنی قطعی بودن افت قیمت نیست.")
+        else:
+            st.info("**نتیجه: هنوز برنده مشخصی نداریم.** دو سطح از نظر فاصله و اندازه اختلاف واضحی ندارند؛ فعلاً فقط صبر کن و دنبال تأیید کندل بمان.")
+        st.markdown("**وقتی قیمت به سطح رسید:**")
+        st.markdown(
+            f"- **اگر به سطح پایین {fmt_price(nearest_bid['price'])} رسید:** فقط وقتی خرید را بررسی کن که قیمت دوباره بالای سطح برگردد و کندل بسته‌شده آن را تأیید کند؛ اگر زیر سطح ماند، خرید نکن.\n"
+            f"- **اگر به سطح بالا {fmt_price(nearest_ask['price'])} رسید:** اگر قیمت پس زده شد، خرید تازه نکن؛ اگر شکست و بالای آن تثبیت شد، با تصور مقاومت قطعی نفروش.\n"
+            "- **اگر تأیید نگرفتی:** معامله نکن. این راهنما برای بازار اسپات است؛ سیگنال فروش الزاماً به معنی شورت نیست."
+        )
+        st.caption("این سطح‌ها دیوارهای سفارش‌اند، نه نقاط دقیق لیکوییدیشن پوزیشن‌ها. سفارش‌های بزرگ ممکن است قبل از اجرا لغو شوند.")
+    else:
+        st.info("داده کافی برای مقایسه یک سطح خرید و یک سطح فروش وجود ندارد؛ از روی اطلاعات ناقص جهت تعیین نمی‌کنیم.")
+        st.write("**رفتار پیشنهادی: فعلاً صبر کن.** پس از ظاهر شدن سطح معتبر و بسته‌شدن کندل تأییدی، نقطه ورود را دوباره بررسی کن.")
+    
+    flows = st.columns(4)
+    flows[0].metric("حجم خرید اخیر", fmt_usd(trade_stats["buy_usd"]))
+    flows[1].metric("حجم فروش اخیر", fmt_usd(trade_stats["sell_usd"]))
+    flows[2].metric("جریان خالص", fmt_usd(trade_stats["net_flow"]))
+    flows[3].metric("تعداد معاملات", trade_stats["total_count"])
+    
+    with st.expander("جزئیات دفتر سفارش: سطوح خرید و فروش"):
+        st.caption(
+            "این سطوح از سفارش‌های قابل‌مشاهده استخراج شده‌اند و حمایت/مقاومت قطعی نیستند. "
+            "سفارش‌ها می‌توانند تغییر کنند یا پیش از اجرا لغو شوند."
+        )
+        bid_col, ask_col = st.columns(2)
+    
+        with bid_col:
+            st.markdown("**سطوح خرید و حمایت احتمالی**")
+            bid_df = pd.DataFrame(book_stats["bid_walls"]).rename(columns={
+                "price": "قیمت",
+                "quantity": "مقدار",
+                "value": "ارزش تقریبی USDT",
+                "classification": "نوع سطح",
+            })
+            bid_df["قیمت"] = bid_df["قیمت"].map(fmt_price)
+            bid_df["مقدار"] = bid_df["مقدار"].map(lambda value: f"{value:,.6f}")
+            bid_df["ارزش تقریبی USDT"] = bid_df["ارزش تقریبی USDT"].map(fmt_usd)
+            st.dataframe(bid_df, use_container_width=True, hide_index=True)
+    
+        with ask_col:
+            st.markdown("**سطوح فروش و مقاومت احتمالی**")
+            ask_df = pd.DataFrame(book_stats["ask_walls"]).rename(columns={
+                "price": "قیمت",
+                "quantity": "مقدار",
+                "value": "ارزش تقریبی USDT",
+                "classification": "نوع سطح",
+            })
+            ask_df["قیمت"] = ask_df["قیمت"].map(fmt_price)
+            ask_df["مقدار"] = ask_df["مقدار"].map(lambda value: f"{value:,.6f}")
+            ask_df["ارزش تقریبی USDT"] = ask_df["ارزش تقریبی USDT"].map(fmt_usd)
+            st.dataframe(ask_df, use_container_width=True, hide_index=True)
+    
+    
 st.divider()
-st.subheader("۷. سناریوی احتمالی ورود و خروج")
+st.subheader("۳. برنامه احتمالی ورود و خروج")
 st.caption(
     "این سناریو یک محاسبه تقریبی بر پایه دفتر سفارش است، نه سفارش واقعی یا توصیه خریدوفروش."
 )
@@ -2335,7 +2389,7 @@ else:
     )
 
 st.divider()
-st.subheader("۸. جمع‌بندی تصمیم: طلا، رمزارز یا ترکیب؟")
+st.subheader("۴. جمع‌بندی: طلا، رمزارز یا ترکیب؟")
 st.caption("قاعده‌ای شفاف بر پایه نسبت BTC/XAUT و روند واقعی ۴ساعته/روزانه BTC و XAUT؛ این پیشنهاد خودکار است، شخصی‌سازی مالی نیست و هیچ سفارشی ثبت نمی‌کند.")
 try:
     allocation_ratio = get_btc_xau_metrics(lbank_pairs)
@@ -2424,4 +2478,3 @@ except Exception as pdf_exc:
     pdf_download_placeholder.error(
         f"ساخت PDF ناموفق بود: {type(pdf_exc).__name__}: {str(pdf_exc)[:250]}"
     )
-
