@@ -56,7 +56,7 @@ st.markdown(
     }
 
     :root {
-        --spotpilot-persian-font: "BNazanin", "B Nazanin", Tahoma, Arial, sans-serif;
+        --spotpilot-persian-font: "BNazanin", "B Nazanin", "Geeza Pro", "Noto Naskh Arabic", Tahoma, Arial, sans-serif;
     }
 
     html, body, .stApp,
