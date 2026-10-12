@@ -23,6 +23,7 @@ from reportlab.platypus import (
 
 LCW_URL = "https://api.livecoinwatch.com"
 LBANK_URL = "https://api.lbank.info/v2"
+CRYPTOMETER_URL = "https://api.cryptometer.io"
 OTHER_EXCHANGES = ["binance", "bybit", "okx", "kucoin", "kraken"]
 QUOTE = "USDT"
 PINNED_CODES = ("BTC", "XAUT", "SOL", "ETH")
@@ -45,18 +46,9 @@ st.set_page_config(page_title="SpotPilot AI", page_icon="📊", layout="wide")
 st.markdown(
     """
     <style>
-    @font-face {
-        font-family: "BNazanin";
-        src:
-            url("https://cdn.jsdelivr.net/gh/peymanx/persian-fonts@main/B_Nazanin/BNazanin.woff") format("woff"),
-            url("https://raw.githubusercontent.com/peymanx/persian-fonts/main/B_Nazanin/BNazanin.woff") format("woff");
-        font-style: normal;
-        font-weight: 400;
-        font-display: swap;
-    }
-
+    /* System fonts only: no external font downloads; browser handles Persian shaping. */
     :root {
-        --spotpilot-persian-font: "BNazanin", "B Nazanin", "Geeza Pro", "Noto Naskh Arabic", Tahoma, Arial, sans-serif;
+        --spotpilot-persian-font: Tahoma, Arial, sans-serif;
     }
 
     html, body, .stApp,
@@ -516,6 +508,41 @@ def get_lcw_key():
         return str(st.secrets["LIVECOINWATCH_API_KEY"]).strip()
     except Exception:
         return ""
+
+
+def get_cryptometer_key():
+    """Read the CryptoMeter key from Streamlit Secrets or the environment."""
+    try:
+        secret = str(st.secrets.get("CRYPTOMETER_API_KEY", "")).strip()
+        if secret:
+            return secret
+    except Exception:
+        pass
+    return os.environ.get("CRYPTOMETER_API_KEY", "").strip()
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_cryptometer_endpoint(endpoint, api_key):
+    """Fetch a documented CryptoMeter endpoint; never log or display the API key."""
+    if endpoint not in {"trend-indicator-v3", "merged-orderbook"}:
+        raise ValueError("CryptoMeter endpoint is not enabled in the free-data integration.")
+    response = requests.get(
+        f"{CRYPTOMETER_URL}/{endpoint}/",
+        params={"api_key": api_key},
+        headers={"accept": "application/json"},
+        timeout=15,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, dict):
+        raise RuntimeError("CryptoMeter پاسخ نامعتبر برگرداند.")
+    if str(payload.get("success", "")).lower() not in {"true", "1"}:
+        message = payload.get("message") or payload.get("error_message") or payload.get("error") or "خطای نامشخص API"
+        raise RuntimeError(f"CryptoMeter: {str(message)[:180]}")
+    data = payload.get("data")
+    if data is None:
+        raise RuntimeError("CryptoMeter در پاسخ، داده‌ای برنگرداند.")
+    return data
 
 
 def get_json(url, params=None, timeout=20):
@@ -1748,6 +1775,7 @@ if refresh:
     fetch_lbank_trades.clear()
     fetch_lbank_ticker.clear()
     fetch_lbank_klines.clear()
+    fetch_cryptometer_endpoint.clear()
     get_other_exchange_symbols.clear()
     fetch_other_exchange_ticker.clear()
     st.rerun()
@@ -2276,6 +2304,92 @@ st.caption(
     "نقشه لیکوییدیشن رایگان، معاملات لیکوییدشده واقعی را از چند بازار فیوچرز جمع می‌کند؛ "
     "این داده با سفارش‌های اسپات یا برآورد موقعیت‌های هنوز لیکوییدنشده فرق دارد."
 )
+
+with st.expander("جریان نقدینگی و فشار خرید/فروش — CryptoMeter.io", expanded=False):
+    st.markdown(
+        "این بخش داده‌های تجمیعی CryptoMeter را کنار دفتر سفارش LBank قرار می‌دهد. "
+        "برای جلوگیری از درخواست‌های تکراری، داده‌ها تا ۵ دقیقه cache می‌شوند. "
+        "کلید API را فقط در Streamlit Secrets نگه دار."
+    )
+    cryptometer_key = get_cryptometer_key()
+    if not cryptometer_key:
+        st.info(
+            "برای فعال‌کردن این بخش، یک کلید رایگان از "
+            "[مدیریت API در CryptoMeter.io](https://www.cryptometer.io/api-manage) بگیر "
+            "و در Streamlit → App settings → Secrets مقدار CRYPTOMETER_API_KEY را تنظیم کن."
+        )
+        st.code('CRYPTOMETER_API_KEY = "کلید-شما"', language="toml")
+    else:
+        try:
+            with st.spinner("دریافت داده‌های تجمیعی CryptoMeter..."):
+                trend_data = fetch_cryptometer_endpoint("trend-indicator-v3", cryptometer_key)
+                book_data = fetch_cryptometer_endpoint("merged-orderbook", cryptometer_key)
+
+            trend_rows = trend_data if isinstance(trend_data, list) else [trend_data]
+            trend_rows = [row for row in trend_rows if isinstance(row, dict)]
+            trend = trend_rows[-1] if trend_rows else {}
+
+            if trend:
+                buy_pressure = number(trend.get("buy_pressure"), None)
+                sell_pressure = number(trend.get("sell_pressure"), None)
+                trend_score = number(trend.get("trend_score"), None)
+                tc1, tc2, tc3 = st.columns(3)
+                tc1.metric("امتیاز روند تجمیعی", f"{trend_score:.2f}" if trend_score is not None else "—")
+                tc2.metric("فشار خرید", f"{buy_pressure:.2f}%" if buy_pressure is not None else "—")
+                tc3.metric("فشار فروش", f"{sell_pressure:.2f}%" if sell_pressure is not None else "—")
+                if trend.get("timestamp"):
+                    st.caption(f"زمان ثبت داده CryptoMeter: {trend['timestamp']}")
+                if buy_pressure is not None and sell_pressure is not None:
+                    if buy_pressure > sell_pressure:
+                        st.info("در شاخص تجمیعی CryptoMeter فشار خرید اندکی بیشتر گزارش شده است؛ این شاخص به‌تنهایی سیگنال ورود نیست.")
+                    elif sell_pressure > buy_pressure:
+                        st.info("در شاخص تجمیعی CryptoMeter فشار فروش اندکی بیشتر گزارش شده است؛ این شاخص به‌تنهایی سیگنال خروج نیست.")
+                    else:
+                        st.info("فشار خرید و فروش در شاخص تجمیعی CryptoMeter برابر گزارش شده است.")
+            else:
+                st.warning("CryptoMeter در حال حاضر داده‌ای برای شاخص روند برنگرداند.")
+
+            order_rows = book_data if isinstance(book_data, list) else []
+            normalized_rows = []
+            for row in order_rows:
+                if not isinstance(row, dict):
+                    continue
+                symbol = str(row.get("symbol", "")).upper()
+                bids = number(row.get("bids"), None)
+                asks = number(row.get("asks"), None)
+                if not symbol or bids is None or asks is None:
+                    continue
+                total = bids + asks
+                imbalance_pct = ((bids - asks) / total * 100) if total > 0 else None
+                normalized_rows.append({
+                    "رمزارز": symbol,
+                    "ارزش سفارش‌های خرید (BTC)": bids,
+                    "ارزش سفارش‌های فروش (BTC)": asks,
+                    "عدم‌تعادل خرید/فروش (%)": round(imbalance_pct, 2) if imbalance_pct is not None else None,
+                })
+            if normalized_rows:
+                book_df = pd.DataFrame(normalized_rows)
+                book_df = book_df.sort_values(
+                    "ارزش سفارش‌های خرید (BTC)", ascending=False
+                ).head(15)
+                st.markdown("**دفتر سفارش تجمیعی چند صرافی**")
+                st.caption(
+                    "مقادیر bids/asks طبق مستندات CryptoMeter بر حسب BTC هستند و داده تجمیعی چند صرافی‌اند؛ "
+                    "این جدول نه مختص LBank است و نه جریان خالص معاملات اجراشده."
+                )
+                st.dataframe(book_df, use_container_width=True, hide_index=True)
+            else:
+                st.warning("CryptoMeter در حال حاضر داده‌ای برای دفتر سفارش تجمیعی برنگرداند.")
+            st.caption(
+                "محدودیت منبع: endpointهای volume-flow و liquidity-lens در مستندات فعلی CryptoMeter پولی علامت‌گذاری شده‌اند؛ "
+                "این نسخه فقط endpointهای بدون برچسب Paid را فراخوانی می‌کند تا ناخواسته هزینه ایجاد نشود."
+            )
+        except Exception as exc:
+            st.warning(
+                "دریافت داده CryptoMeter ناموفق بود؛ کلید، سهمیه ماهانه یا دسترس‌پذیری سرویس را بررسی کن. "
+                f"جزئیات: {type(exc).__name__}: {str(exc)[:180]}"
+            )
+
 with st.expander("نقشه رایگان لیکوییدیشن BTC (بدون کلید API)", expanded=False):
     st.markdown(
         "این نقشه از API عمومی SmartMoneyAPI استفاده می‌کند؛ طبق مستندات ارائه‌دهنده، "
