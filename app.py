@@ -1695,61 +1695,65 @@ def analyze_book(book):
         if total_usd > 0 else 0
     )
 
-    level_values = [price * qty for price, qty in bids + asks]
-    median_value = statistics.median(level_values)
-    sorted_values = sorted(level_values)
-    percentile_90 = sorted_values[
-        min(len(sorted_values) - 1, int(len(sorted_values) * 0.90))
-    ]
+    # Aggregate nearby price levels into 0.10% price bands. A single top-of-book
+    # quote is not a liquidity zone: concentration is measured by summed notional.
+    band_width = max(mid * 0.001, 1e-12)
 
-    wall_threshold = max(median_value * 3, percentile_90)
+    def aggregate_zones(levels, side):
+        buckets = {}
+        for price, qty in levels:
+            bucket = math.floor(price / band_width)
+            zone = buckets.setdefault(bucket, {
+                "low": bucket * band_width,
+                "high": (bucket + 1) * band_width,
+                "quantity": 0.0,
+                "value": 0.0,
+                "weighted_price": 0.0,
+            })
+            notional = price * qty
+            zone["quantity"] += qty
+            zone["value"] += notional
+            zone["weighted_price"] += price * notional
 
-    bid_walls = [
-        {
-            "price": price,
-            "quantity": qty,
-            "value": price * qty,
-            "classification": "Large order",
-        }
-        for price, qty in bids
-        if price * qty >= wall_threshold
-    ]
+        zones = []
+        for zone in buckets.values():
+            if zone["value"] <= 0:
+                continue
+            zones.append({
+                "price": zone["weighted_price"] / zone["value"],
+                "zone_low": zone["low"],
+                "zone_high": zone["high"],
+                "quantity": zone["quantity"],
+                "value": zone["value"],
+                "side": side,
+            })
 
-    ask_walls = [
-        {
-            "price": price,
-            "quantity": qty,
-            "value": price * qty,
-            "classification": "Large order",
-        }
-        for price, qty in asks
-        if price * qty >= wall_threshold
-    ]
+        side_values = [zone["value"] for zone in zones]
+        if side_values:
+            median_zone_value = statistics.median(side_values)
+            sorted_zone_values = sorted(side_values)
+            percentile_90_zone = sorted_zone_values[
+                min(len(sorted_zone_values) - 1, int(len(sorted_zone_values) * 0.90))
+            ]
+            threshold = max(median_zone_value * 2.5, percentile_90_zone)
+        else:
+            threshold = 0.0
 
-    if not bid_walls:
-        bid_walls = [
-            {
-                "price": p, "quantity": q, "value": p * q,
-                "classification": "Largest visible bid level",
-            }
-            for p, q in sorted(
-                bids, key=lambda level: level[0] * level[1], reverse=True
-            )[:5]
-        ]
+        for zone in zones:
+            zone["significant"] = zone["value"] >= threshold if threshold else False
+            zone["classification"] = (
+                "تراکم بالا در بازه ۰٫۱۰٪"
+                if zone["significant"]
+                else "ناحیه نسبی دفتر سفارش"
+            )
 
-    if not ask_walls:
-        ask_walls = [
-            {
-                "price": p, "quantity": q, "value": p * q,
-                "classification": "Largest visible ask level",
-            }
-            for p, q in sorted(
-                asks, key=lambda level: level[0] * level[1], reverse=True
-            )[:5]
-        ]
+        # Show the largest visible concentrations first, not the closest prices.
+        zones.sort(key=lambda zone: zone["value"], reverse=True)
+        return zones[:8], threshold
 
-    bid_walls.sort(key=lambda wall: wall["price"], reverse=True)
-    ask_walls.sort(key=lambda wall: wall["price"])
+    bid_walls, bid_wall_threshold = aggregate_zones(bids, "bid")
+    ask_walls, ask_wall_threshold = aggregate_zones(asks, "ask")
+    wall_threshold = max(bid_wall_threshold, ask_wall_threshold)
 
     return {
         "bids": bids,
@@ -1825,8 +1829,10 @@ def calculate_trade_plan(book_stats, trade_stats):
             "reason": "برای تعیین سطوح، دفتر سفارش داده کافی ندارد.",
         }
 
-    support = max(bids, key=lambda wall: wall["price"])
-    resistance = min(asks, key=lambda wall: wall["price"])
+    # The planning levels should represent the largest visible concentration zones,
+    # not simply the nearest qualifying order-book prices.
+    support = max(bids, key=lambda wall: wall.get("value", 0))
+    resistance = max(asks, key=lambda wall: wall.get("value", 0))
 
     entry = support["price"] * 1.001
     target = resistance["price"] * 0.999
@@ -2818,26 +2824,25 @@ elif book_stats["imbalance"] < 0:
 else:
     st.info("در لحظه دریافت داده، عدم‌تعادل دفتر سفارش نزدیک به صفر است.")
 
-# Plain-language liquidity interpretation: visible order-book walls, not future liquidation estimates.
+# Liquidity zones are aggregated price bands, not best bid/ask quotes.
 mid_price = number(book_stats.get("mid"))
-# Only call a level a wall when it passes the significance threshold. The fallback
-# rows are useful in the detailed table but may simply be ordinary top-of-book levels.
-near_bids = [
-    w for w in book_stats.get("bid_walls", [])
-    if number(w.get("price")) < mid_price and w.get("classification") == "Large order"
+bid_zones = [
+    zone for zone in book_stats.get("bid_walls", [])
+    if number(zone.get("price")) < mid_price
 ]
-near_asks = [
-    w for w in book_stats.get("ask_walls", [])
-    if number(w.get("price")) > mid_price and w.get("classification") == "Large order"
+ask_zones = [
+    zone for zone in book_stats.get("ask_walls", [])
+    if number(zone.get("price")) > mid_price
 ]
-nearest_bid = max(near_bids, key=lambda w: number(w.get("price"))) if near_bids else None
-nearest_ask = min(near_asks, key=lambda w: number(w.get("price"))) if near_asks else None
+strongest_bid = max(bid_zones, key=lambda zone: number(zone.get("value")), default=None)
+strongest_ask = max(ask_zones, key=lambda zone: number(zone.get("value")), default=None)
 st.markdown("#### جمع‌بندی ساده نقدینگی")
 st.caption(
-    f"مرجع فاصله، قیمت میانی بهترین خرید و فروش LBank است: {fmt_price(mid_price)}. "
-    "در این جمع‌بندی فقط سفارش‌هایی دیوار محسوب می‌شوند که از آستانه آماری اندازه سفارش عبور کنند؛ "
-    "سطوح عادی دفتر سفارش در جدول جزئیات می‌مانند. این تحلیل پیش‌بینی قطعی جهت قیمت نیست."
+    f"قیمت مرجع: {fmt_price(mid_price)}. سفارش‌های نزدیک در بازه‌های ۰٫۱۰٪ قیمت تجمیع شده‌اند "
+    "و ناحیه‌ها بر اساس ارزش کل سفارش‌ها رتبه‌بندی می‌شوند؛ بنابراین قوی‌ترین ناحیه الزاماً نزدیک‌ترین ناحیه نیست. "
+    "این داده‌ها فقط نقدینگی قابل‌مشاهده LBank را پوشش می‌دهند و حرکت برای شکار آن را تضمین نمی‌کنند."
 )
+
 def format_wall_distance(distance):
     if distance < 0.0001:
         return "<0.0001%"
@@ -2847,33 +2852,42 @@ def format_wall_distance(distance):
         return f"{distance:.3f}%"
     return f"{distance:.2f}%"
 
-if nearest_bid and nearest_ask:
-    bid_distance = (mid_price - number(nearest_bid["price"])) / mid_price * 100
-    ask_distance = (number(nearest_ask["price"]) - mid_price) / mid_price * 100
+if strongest_bid and strongest_ask:
+    bid_distance = (mid_price - number(strongest_bid["price"])) / mid_price * 100
+    ask_distance = (number(strongest_ask["price"]) - mid_price) / mid_price * 100
     liq_a, liq_b = st.columns(2)
-    liq_a.metric("دیوار خرید زیر قیمت", fmt_price(nearest_bid["price"]), delta=f"{format_wall_distance(bid_distance)} پایین‌تر")
-    liq_b.metric("دیوار فروش بالای قیمت", fmt_price(nearest_ask["price"]), delta=f"{format_wall_distance(ask_distance)} بالاتر")
-    bid_value = number(nearest_bid.get("value"))
-    ask_value = number(nearest_ask.get("value"))
-    if ask_distance <= bid_distance * 0.85 and ask_value >= bid_value:
-        st.success(f"**اولویت بررسی: سطح بالایی {fmt_price(nearest_ask['price'])}.** هم نزدیک‌تر است و هم دیوار فروش آن دست‌کم به‌اندازه دیوار خرید زیر قیمت است. این فقط سطحی است که باید زیر نظر بگیریم، نه پیش‌بینی قطعی رشد.")
-    elif bid_distance <= ask_distance * 0.85 and bid_value >= ask_value:
-        st.warning(f"**اولویت بررسی: سطح پایینی {fmt_price(nearest_bid['price'])}.** هم نزدیک‌تر است و هم دیوار خرید آن دست‌کم به‌اندازه دیوار فروش بالای قیمت است. این به معنی قطعی بودن افت قیمت نیست.")
+    liq_a.metric(
+        "قوی‌ترین ناحیه خرید زیر قیمت", fmt_price(strongest_bid["price"]),
+        delta=f"{format_wall_distance(bid_distance)} پایین‌تر",
+        help="قیمت میانگین وزنی ناحیه ۰٫۱۰٪ با بیشترین ارزش تجمیعی سفارش‌های خرید در داده قابل‌مشاهده.",
+    )
+    liq_b.metric(
+        "قوی‌ترین ناحیه فروش بالای قیمت", fmt_price(strongest_ask["price"]),
+        delta=f"{format_wall_distance(ask_distance)} بالاتر",
+        help="قیمت میانگین وزنی ناحیه ۰٫۱۰٪ با بیشترین ارزش تجمیعی سفارش‌های فروش در داده قابل‌مشاهده.",
+    )
+    bid_value = number(strongest_bid.get("value"))
+    ask_value = number(strongest_ask.get("value"))
+    st.write(
+        f"ارزش سفارش‌های تجمیعی: **خرید {fmt_usd(bid_value)}** در برابر "
+        f"**فروش {fmt_usd(ask_value)}**."
+    )
+    if ask_value > bid_value * 1.25:
+        st.info("در داده فعلی، ناحیه فروشِ بالایی ارزش تجمیعی بیشتری دارد؛ قیمت آن را ممکن است آزمایش کند، اما این به‌تنهایی جهت حرکت را پیش‌بینی نمی‌کند.")
+    elif bid_value > ask_value * 1.25:
+        st.info("در داده فعلی، ناحیه خریدِ پایینی ارزش تجمیعی بیشتری دارد؛ قیمت آن را ممکن است آزمایش کند، اما این به‌تنهایی جهت حرکت را پیش‌بینی نمی‌کند.")
     else:
-        st.info("**نتیجه: هنوز برنده مشخصی نداریم.** دو سطح از نظر فاصله و اندازه اختلاف واضحی ندارند؛ فعلاً فقط صبر کن و دنبال تأیید کندل بمان.")
-    st.markdown("**وقتی قیمت به سطح رسید:**")
+        st.info("ارزش دو ناحیه برتری واضحی نشان نمی‌دهد؛ فاصله، واکنش قیمت و تغییر سفارش‌ها را هم بررسی کن.")
+    st.markdown("**هنگام نزدیک‌شدن قیمت به این ناحیه‌ها:**")
     st.markdown(
-        f"- **اگر به سطح پایین {fmt_price(nearest_bid['price'])} رسید:** فقط وقتی خرید را بررسی کن که قیمت دوباره بالای سطح برگردد و کندل بسته‌شده آن را تأیید کند؛ اگر زیر سطح ماند، خرید نکن.\n"
-        f"- **اگر به سطح بالا {fmt_price(nearest_ask['price'])} رسید:** اگر قیمت پس زده شد، خرید تازه نکن؛ اگر شکست و بالای آن تثبیت شد، با تصور مقاومت قطعی نفروش.\n"
-        "- **اگر تأیید نگرفتی:** معامله نکن. این راهنما برای بازار اسپات است؛ سیگنال فروش الزاماً به معنی شورت نیست."
+        f"- **ناحیه خرید {fmt_price(strongest_bid['price'])}:** واکنش و برگشت قیمت را بررسی کن؛ اگر سطح شکسته شد و قیمت زیر آن ماند، آن را حمایت قطعی فرض نکن.\n"
+        f"- **ناحیه فروش {fmt_price(strongest_ask['price'])}:** واکنش یا شکست و تثبیت بالای ناحیه را بررسی کن؛ آن را مقاومت قطعی فرض نکن.\n"
+        "- **بدون تأیید قیمت:** معامله نکن. این تحلیل برای بازار اسپات است و سیگنال فروش به معنی شورت نیست."
     )
-    st.caption("این سطح‌ها دیوارهای سفارش‌اند، نه نقاط دقیق لیکوییدیشن پوزیشن‌ها. سفارش‌های بزرگ ممکن است قبل از اجرا لغو شوند.")
+    st.caption("این ناحیه‌ها بر پایه سفارش‌های قابل‌مشاهده‌اند، نه نقشه کامل لیکوییدیشن. سفارش‌ها ممکن است قبل از اجرا لغو شوند.")
 else:
-    st.info(
-        "در دفتر سفارش فعلی، دیوار خرید و فروشِ معنادار طبق آستانه آماری پیدا نشد. "
-        "بنابراین سطح‌های نزدیکِ بهترین خرید/فروش را به‌اشتباه به‌عنوان دیوار نقدینگی معرفی نمی‌کنیم."
-    )
-    st.write("**نتیجه: فعلاً صبر کن.** دفتر سفارش را دوباره بررسی کن و فقط وقتی سطح معنادار و کندل تأییدی وجود دارد، تصمیم بگیر.")
+    st.info("برای یکی از دو سمت بازار، ناحیه قیمت قابل‌استفاده‌ای در داده فعلی پیدا نشد؛ از بهترین خریدوفروش به‌عنوان جایگزین دیوار نقدینگی استفاده نکن.")
+    st.write("**نتیجه: فعلاً صبر کن** و پس از دریافت دفتر سفارش کامل‌تر، ناحیه‌های تجمیعی را دوباره بررسی کن.")
 
 flows = st.columns(4)
 flows[0].metric("حجم خرید اخیر", fmt_usd(trade_stats["buy_usd"]))
