@@ -71,12 +71,15 @@ def detect_elliott_candidates(frame, left=3, right=3, min_swing_pct=0.35):
     recent = pivots[-9:]
     labels = []
     if len(recent) >= 6:
-        # Most recent six alternating pivots are the start plus five impulse turns.
-        for j, p in enumerate(recent[-6:]):
-            labels.append((p, f"({j})" if j == 0 else f"({j})"))
-    elif len(recent) >= 4:
-        for j, p in enumerate(recent[-4:]):
-            labels.append((p, ["A", "B", "C", "D"][j]))
+        # The first point is the impulse origin; the next five are candidate turns 1–5.
+        selected = recent[-6:]
+        labels.append((selected[0], "شروع"))
+        for j, p in enumerate(selected[1:], start=1):
+            labels.append((p, f"({j})"))
+    elif len(recent) >= 3:
+        # A/B/C is a loose corrective-wave hypothesis, not a validated Elliott pattern.
+        for label, p in zip(("A", "B", "C"), recent[-3:]):
+            labels.append((p, label))
     result = []
     for p, label in labels:
         result.append({**p, "Label": label})
