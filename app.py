@@ -524,7 +524,7 @@ def get_cryptometer_key():
 def fetch_cryptometer_endpoint(endpoint, api_key, endpoint_params=None):
     """Fetch documented free CryptoMeter endpoints; never log or display the API key."""
     allowed_endpoints = {
-        "trend-indicator-v3", "merged-orderbook", "rapid-movements",
+        "trend-indicator-v3", "merged-orderbook", "rapid-movements", "tickerlist",
         "24h-trade-volume-v2", "open-interest", "long-shorts-data",
     }
     if endpoint not in allowed_endpoints:
@@ -2373,6 +2373,7 @@ with st.expander("جریان نقدینگی و فشار خرید/فروش — Cr
                 trend_data = fetch_cryptometer_endpoint("trend-indicator-v3", cryptometer_key)
                 book_data = fetch_cryptometer_endpoint("merged-orderbook", cryptometer_key)
                 movement_data = fetch_cryptometer_endpoint("rapid-movements", cryptometer_key)
+                tickerlist_data = fetch_cryptometer_endpoint("tickerlist", cryptometer_key, {"e": "binance"})
 
             trend_rows = trend_data if isinstance(trend_data, list) else [trend_data]
             trend_rows = [row for row in trend_rows if isinstance(row, dict)]
@@ -2443,9 +2444,84 @@ with st.expander("جریان نقدینگی و فشار خرید/فروش — Cr
                 st.dataframe(movement_df, use_container_width=True, hide_index=True)
             else:
                 st.info("در آخرین پاسخ CryptoMeter حرکت سریع قابل‌نمایشی وجود نداشت.")
+            ticker_rows = tickerlist_data if isinstance(tickerlist_data, list) else []
+            ticker_rows = [row for row in ticker_rows if isinstance(row, dict)]
+            liquid_usdt = [
+                row for row in ticker_rows
+                if str(row.get("pair", "")).upper().endswith("-USDT")
+                and number(row.get("volume_24")) > 0
+            ]
+            if liquid_usdt:
+                st.markdown("**بازار اسپات Binance — تغییرات و حجم ۲۴ساعته**")
+                movers_df = pd.DataFrame([{
+                    "جفت‌ارز": row.get("pair", "—"),
+                    "قیمت": fmt_price(number(row.get("last"), None)),
+                    "تغییر ۱ساعته (%)": number(row.get("change_1h"), None),
+                    "تغییر ۲۴ساعته (%)": number(row.get("change_24h"), None),
+                    "حجم ۲۴ساعته": number(row.get("volume_24"), None),
+                } for row in sorted(liquid_usdt, key=lambda row: number(row.get("volume_24")), reverse=True)[:15]])
+                st.dataframe(movers_df, use_container_width=True, hide_index=True)
+            else:
+                st.info("فهرست تیکرهای Binance داده USDT قابل‌نمایشی برنگرداند.")
+
+            st.markdown("**شاخص‌های تکمیلی رایگان مشتقات برای ارز انتخاب‌شده**")
+            show_derivatives = st.checkbox(
+                "دریافت حجم خرید/فروش، Open Interest و Long/Short",
+                value=False,
+                help="این سه endpoint در مستندات فعلی برچسب Paid ندارند. درخواست‌ها فقط پس از فعال‌کردن این گزینه ارسال می‌شوند و پاسخ‌ها ۱۵ دقیقه cache می‌شوند.",
+                key="cryptometer_free_derivatives",
+            )
+            if show_derivatives:
+                derivatives = {}
+                derivative_errors = []
+                derivative_requests = [
+                    ("حجم خرید/فروش ۲۴ساعته", "24h-trade-volume-v2", {
+                        "pair": f"{selected_code.upper()}-USDT", "e": "binance"
+                    }),
+                    ("Open Interest", "open-interest", {
+                        "market_pair": f"{selected_code.lower()}usdt", "e": "binance_futures"
+                    }),
+                    ("Long/Short", "long-shorts-data", {
+                        "symbol": selected_code.lower(), "e": "binance_futures", "timeframe": "4h"
+                    }),
+                ]
+                for label, endpoint, params in derivative_requests:
+                    try:
+                        derivatives[label] = fetch_cryptometer_endpoint(endpoint, cryptometer_key, params)
+                    except Exception as derivative_exc:
+                        derivative_errors.append(f"{label}: {type(derivative_exc).__name__}: {str(derivative_exc)[:120]}")
+                d1, d2, d3 = st.columns(3)
+                volume_rows = derivatives.get("حجم خرید/فروش ۲۴ساعته")
+                if isinstance(volume_rows, list) and volume_rows and isinstance(volume_rows[0], dict):
+                    vol = volume_rows[0]
+                    buy_vol = number(vol.get("buy"), None)
+                    sell_vol = number(vol.get("sell"), None)
+                    d1.metric("خرید ۲۴ساعته (Binance)", f"{buy_vol:,.2f}" if buy_vol is not None else "—")
+                    d2.metric("فروش ۲۴ساعته (Binance)", f"{sell_vol:,.2f}" if sell_vol is not None else "—")
+                    if buy_vol is not None and sell_vol is not None and buy_vol + sell_vol > 0:
+                        st.caption(f"سهم خرید از حجم خرید+فروش گزارش‌شده: {buy_vol / (buy_vol + sell_vol) * 100:.1f}%")
+                else:
+                    d1.metric("خرید ۲۴ساعته (Binance)", "—")
+                    d2.metric("فروش ۲۴ساعته (Binance)", "—")
+                oi_rows = derivatives.get("Open Interest")
+                oi = oi_rows[0].get("open_interest") if isinstance(oi_rows, list) and oi_rows and isinstance(oi_rows[0], dict) else None
+                d3.metric("Open Interest (Binance Futures)", fmt_usd(number(oi, None)) if oi is not None else "—")
+                ls_rows = derivatives.get("Long/Short")
+                if isinstance(ls_rows, list) and ls_rows and isinstance(ls_rows[0], dict):
+                    ls = ls_rows[-1]
+                    longs = number(ls.get("longs"), None)
+                    shorts = number(ls.get("shorts"), None)
+                    if longs is not None and shorts is not None and longs + shorts > 0:
+                        st.caption(f"Long/Short در ۴ ساعت اخیر (Binance Futures): لانگ {longs:,.0f} در برابر شورت {shorts:,.0f}. این اعداد ممکن است تعداد/مقدار موقعیت باشند، نه ارزش دلاری.")
+                    if ls.get("timestamp"):
+                        st.caption(f"زمان Long/Short: {ls['timestamp']}")
+                for derivative_error in derivative_errors:
+                    st.caption(f"داده تکمیلی در دسترس نبود — {derivative_error}")
+
             st.caption(
-                "این APIهای بدون برچسب Paid در مستندات استفاده می‌شوند. Volume Flow، Liquidity Lens و xTrades API پولی‌اند و در این نسخه فراخوانی نمی‌شوند. "
-                "فشار روند و دفتر سفارش تجمیعی مربوط به کل بازار/چند صرافی‌اند، نه صرفاً LBank."
+                "در این بخش فقط endpointهایی فراخوانی می‌شوند که در مستندات API فعلی با برچسب Paid مشخص نشده‌اند. "
+                "Volume Flow، Liquidity Lens و xTrades API پولی‌اند و عمداً فراخوانی نمی‌شوند. "
+                "فشار روند و دفتر سفارش تجمیعی چندصرافی‌اند؛ داده‌های مشتقات این قسمت از Binance Futures هستند، نه LBank."
             )
         except Exception as exc:
             st.warning(
