@@ -1218,11 +1218,8 @@ def get_btc_xau_metrics(lbank_pairs):
     }
 
 
-def rank_crypto_candidates(
-    coins_df, lbank_pairs, atr_period=1, ut_multiplier=2.0,
-    cryptometer_liquidity=None, cryptometer_whales=None,
-):
-    """Rank LBank-listed candidates using candles, BTC-relative strength and optional CryptoMeter flows."""
+def rank_crypto_candidates(coins_df, lbank_pairs, atr_period=1, ut_multiplier=2.0):
+    """Rank LBank-listed candidates using real LBank candles and BTC-relative strength."""
     excluded = {
         "XAUT", "USDT", "USDC", "FDUSD", "TUSD", "DAI", "USDE",
         "USDD", "USDP", "PYUSD", "EURC", "USD1", "USTC",
@@ -1259,31 +1256,7 @@ def rank_crypto_candidates(
         relative = get_btc_relative_metrics(code, lbank_pairs)
         trend_score = trend.get("score")
         relative_change = relative.get("change_pct")
-        liquidity_row = {}
-        if isinstance(cryptometer_liquidity, dict):
-            liquidity_row = cryptometer_liquidity.get(code, {}) or {}
-        netflow_usd = number(liquidity_row.get("netflow"), None)
-
-        whale_buy_usd = 0.0
-        whale_sell_usd = 0.0
-        whale_count = 0
-        if isinstance(cryptometer_whales, list):
-            for whale in cryptometer_whales:
-                if not isinstance(whale, dict) or str(whale.get("symbol", "")).upper() != code:
-                    continue
-                side = str(whale.get("side", "")).upper()
-                usd_value = number(whale.get("usd_total", whale.get("total")), 0.0)
-                if usd_value <= 0:
-                    continue
-                if side == "BUY":
-                    whale_buy_usd += usd_value
-                    whale_count += 1
-                elif side == "SELL":
-                    whale_sell_usd += usd_value
-                    whale_count += 1
-        whale_net_usd = whale_buy_usd - whale_sell_usd
-
-        if trend_score is None and relative_change is None and netflow_usd is None and whale_count == 0:
+        if trend_score is None and relative_change is None:
             score = None
         else:
             score = int(trend_score or 0)
@@ -1291,18 +1264,6 @@ def rank_crypto_candidates(
                 score += 1 if relative_change > 0 else (-1 if relative_change < 0 else 0)
             if pd.notna(day_change):
                 score += 1 if day_change > 0 else (-1 if day_change < 0 else 0)
-            if netflow_usd is not None:
-                score += 1 if netflow_usd > 0 else (-1 if netflow_usd < 0 else 0)
-            if whale_count >= 2:
-                score += 1 if whale_net_usd > 0 else (-1 if whale_net_usd < 0 else 0)
-
-        flow_notes = []
-        if netflow_usd is not None:
-            flow_notes.append(f"CryptoMeter خالص جریان نقدینگی: {netflow_usd:,.0f} دلار")
-        if whale_count:
-            flow_notes.append(
-                f"معاملات بزرگ: خرید {whale_buy_usd:,.0f} دلار در برابر فروش {whale_sell_usd:,.0f} دلار ({whale_count} معامله)"
-            )
 
         if score is None:
             label = "داده ناکافی"
@@ -1327,11 +1288,8 @@ def rank_crypto_candidates(
             "24h Change %": day_change if pd.notna(day_change) else None,
             "BTC Relative %": relative_change,
             "Volume USD": number(coin.get("Volume USD")),
-            "CryptoMeter Netflow USD": netflow_usd,
-            "Whale Net USD": whale_net_usd if whale_count else None,
             "Reason": reason,
             "Trend notes": trend.get("notes") or [],
-            "Flow notes": flow_notes,
             "Relative method": relative.get("method", ""),
         })
 
@@ -1970,8 +1928,7 @@ try:
         with st.expander("چرا این رتبه‌بندی را داده؟"):
             for item in crypto_ranking:
                 st.markdown(f"**{item['Code']} — {item['Priority']}**")
-                note_parts = (item["Trend notes"] or []) + (item.get("Flow notes") or [])
-                st.caption("؛ ".join(note_parts[:5]) if note_parts else item["Reason"])
+                st.caption("؛ ".join(item["Trend notes"][:5]) if item["Trend notes"] else item["Reason"])
                 st.caption(item["Relative method"])
     else:
         st.warning("از فهرست فعلی، رمزارز قابل بررسی با جفت USDT در LBank پیدا نشد.")
