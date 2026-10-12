@@ -1016,6 +1016,91 @@ def get_btc_xau_metrics(lbank_pairs):
     }
 
 
+def rank_crypto_candidates(coins_df, lbank_pairs, atr_period=1, ut_multiplier=2.0):
+    """Rank a small, liquid, LBank-listed shortlist using real candles and BTC-relative strength."""
+    excluded = {
+        "XAUT", "USDT", "USDC", "FDUSD", "TUSD", "DAI", "USDE",
+        "USDD", "USDP", "PYUSD", "EURC", "USD1", "USTC",
+    }
+    eligible = coins_df[
+        coins_df["LBank listed"]
+        & ~coins_df["Code"].astype(str).str.upper().isin(excluded)
+    ].copy()
+    if eligible.empty:
+        return []
+
+    eligible["Volume USD"] = pd.to_numeric(eligible["Volume USD"], errors="coerce").fillna(0)
+    # Keep the three core benchmarks when listed, then add the most liquid assets.
+    core = ["BTC", "ETH", "SOL"]
+    selected_codes = [
+        code for code in core
+        if code in set(eligible["Code"].astype(str).str.upper())
+    ]
+    by_volume = eligible.sort_values("Volume USD", ascending=False)["Code"].astype(str).str.upper().tolist()
+    for code in by_volume:
+        if code not in selected_codes:
+            selected_codes.append(code)
+        if len(selected_codes) >= 7:
+            break
+
+    rows = []
+    for code in selected_codes[:7]:
+        coin_rows = eligible[eligible["Code"].astype(str).str.upper() == code]
+        if coin_rows.empty:
+            continue
+        coin = coin_rows.iloc[0]
+        day_change = number(coin.get("24h Change %"), float("nan"))
+        trend = get_asset_trend_score(code, lbank_pairs, int(atr_period), float(ut_multiplier))
+        relative = get_btc_relative_metrics(code, lbank_pairs)
+        trend_score = trend.get("score")
+        relative_change = relative.get("change_pct")
+        if trend_score is None and relative_change is None:
+            score = None
+        else:
+            score = int(trend_score or 0)
+            if relative_change is not None:
+                score += 1 if relative_change > 0 else (-1 if relative_change < 0 else 0)
+            if pd.notna(day_change):
+                score += 1 if day_change > 0 else (-1 if day_change < 0 else 0)
+
+        if score is None:
+            label = "داده ناکافی"
+            reason = "برای روند و قدرت نسبی داده کافی نیست"
+        elif score >= 3:
+            label = "اولویت ۱: بررسی خرید"
+            reason = "روند تکنیکال و قدرت نسبی بهتر؛ هنوز منتظر تأیید نقطه ورود"
+        elif score >= 1:
+            label = "اولویت ۲: انتظار برای تأیید"
+            reason = "نشانه‌های مثبت محدود یا ترکیبی؛ خرید فوری تأیید نشده"
+        elif score <= -2:
+            label = "فعلاً اولویت پایین"
+            reason = "روند یا قدرت نسبی ضعیف است"
+        else:
+            label = "خنثی: صبر"
+            reason = "مزیت روشن نسبت به گزینه‌های دیگر دیده نمی‌شود"
+
+        rows.append({
+            "Code": code,
+            "Score": score,
+            "Priority": label,
+            "24h Change %": day_change if pd.notna(day_change) else None,
+            "BTC Relative %": relative_change,
+            "Volume USD": number(coin.get("Volume USD")),
+            "Reason": reason,
+            "Trend notes": trend.get("notes") or [],
+            "Relative method": relative.get("method", ""),
+        })
+
+    rows.sort(
+        key=lambda row: (
+            row["Score"] is None,
+            -(row["Score"] if row["Score"] is not None else -999),
+            -row["Volume USD"],
+        )
+    )
+    return rows
+
+
 def get_asset_trend_score(code, lbank_pairs, atr_period=14, ut_multiplier=2.0):
     """Small rule-based trend score from closed 4h and daily LBank candles."""
     pair = lbank_symbol_from_code(code)
@@ -1604,7 +1689,51 @@ else:
     selected_coin = coins_df[coins_df["Code"] == selected_code].iloc[0]
 
 st.divider()
-st.subheader(f"۲. مقایسه قیمت {selected_code}")
+st.subheader("۲. اولویت رمزارزها برای بررسی خرید")
+st.caption("این فهرست به‌صورت پویا از ارزهای موجود در فهرست شما که در LBank جفت USDT دارند ساخته می‌شود. رتبه‌ها از روند ۴ساعته/روزانه، عملکرد نسبت به BTC، تغییر ۲۴ساعته و حجم واقعی کمک می‌گیرند؛ «اولویت بررسی» به معنی خرید فوری نیست.")
+try:
+    with st.spinner("مقایسه روند و قدرت نسبی رمزارزهای برتر فهرست..."):
+        crypto_ranking = rank_crypto_candidates(
+            coins_df, lbank_pairs, int(atr_period), float(ut_multiplier)
+        )
+    if crypto_ranking:
+        ranking_df = pd.DataFrame(crypto_ranking)
+        best = ranking_df.iloc[0]
+        if best["Score"] is not None and best["Score"] >= 3:
+            st.success(f"**انتخاب اول فعلی برای بررسی: {best['Code']}** — {best['Reason']}. قبل از خرید، بخش نقطه ورود و واکنش به نقدینگی همین ارز را هم تأیید کن.")
+        else:
+            st.info("**فعلاً خرید فوری تأیید نشده است.** رتبه اول جدول فقط بهترین گزینه نسبی بین داده‌های موجود است؛ اگر امتیاز پایین یا داده ناکافی باشد، منتظر تأیید بمان.")
+        display_ranking = ranking_df[[
+            "Code", "Priority", "Score", "24h Change %", "BTC Relative %", "Reason"
+        ]].copy()
+        display_ranking = display_ranking.rename(columns={
+            "Code": "رمزارز",
+            "Priority": "اولویت",
+            "Score": "امتیاز مدل",
+            "24h Change %": "تغییر ۲۴ساعته (%)",
+            "BTC Relative %": "تغییر نسبت به BTC (%)",
+            "Reason": "دلیل ساده",
+        })
+        for col in ("تغییر ۲۴ساعته (%)", "تغییر نسبت به BTC (%)"):
+            display_ranking[col] = display_ranking[col].map(
+                lambda value: f"{value:+.2f}%" if value is not None and pd.notna(value) else "—"
+            )
+        display_ranking["امتیاز مدل"] = display_ranking["امتیاز مدل"].map(
+            lambda value: str(value) if value is not None and pd.notna(value) else "—"
+        )
+        st.dataframe(display_ranking, use_container_width=True, hide_index=True)
+        with st.expander("چرا این رتبه‌بندی را داده؟"):
+            for item in crypto_ranking:
+                st.markdown(f"**{item['Code']} — {item['Priority']}**")
+                st.caption("؛ ".join(item["Trend notes"][:4]) if item["Trend notes"] else item["Reason"])
+                st.caption(item["Relative method"])
+    else:
+        st.warning("از فهرست فعلی، رمزارز قابل بررسی با جفت USDT در LBank پیدا نشد.")
+except Exception as exc:
+    st.warning(f"رتبه‌بندی رمزارزها کامل نشد: {type(exc).__name__}: {str(exc)[:180]}")
+
+st.divider()
+st.subheader(f"۳. مقایسه قیمت {selected_code}")
 st.caption(
     "این بخش قیمت‌های عمومی گزارش‌شده از چند صرافی را کنار هم می‌گذارد. "
     "اختلاف‌ها ممکن است ناشی از زمان به‌روزرسانی، بازار یا نقدشوندگی باشند."
@@ -1639,7 +1768,7 @@ if compare_errors:
 # -------------------- Multi-timeframe technical analysis --------------------
 
 st.divider()
-st.subheader("۳. ارزش نسبت به بیت‌کوین (BTC Pair)")
+st.subheader("۴. ارزش نسبت به بیت‌کوین (BTC Pair)")
 st.caption(
     "این بخش بررسی می‌کند خودِ ارز در برابر BTC قوی‌تر شده یا ضعیف‌تر؛ "
     "ممکن است قیمت دلاری بالا برود اما نسبت آن به بیت‌کوین افت کند."
@@ -1690,7 +1819,7 @@ if selected_code in ("BTC", "XAUT"):
         st.warning(f"محاسبه BTC/XAUT انجام نشد: {type(exc).__name__}: {str(exc)[:160]}")
 
 st.divider()
-st.subheader("۴. تحلیل تکنیکال")
+st.subheader("۵. تحلیل تکنیکال")
 st.caption(
     "۱۵ دقیقه برای حرکت کوتاه‌مدت، ۴ ساعت برای روند میان‌مدت و روزانه برای تصویر بزرگ‌تر است. "
     "سیگنال‌ها از کندل‌های بسته‌شده محاسبه می‌شوند؛ هیچ شاخصی نتیجه را تضمین نمی‌کند."
@@ -2096,35 +2225,38 @@ elif book_stats["imbalance"] < 0:
 else:
     st.info("در لحظه دریافت داده، عدم‌تعادل دفتر سفارش نزدیک به صفر است.")
 
-# Interpret the nearest visible bid/ask walls as conditional liquidity scenarios.
+# Plain-language liquidity interpretation: visible order-book walls, not future liquidation estimates.
 mid_price = number(book_stats.get("mid"))
 near_bids = [w for w in book_stats.get("bid_walls", []) if number(w.get("price")) < mid_price]
 near_asks = [w for w in book_stats.get("ask_walls", []) if number(w.get("price")) > mid_price]
 nearest_bid = max(near_bids, key=lambda w: number(w.get("price"))) if near_bids else None
 nearest_ask = min(near_asks, key=lambda w: number(w.get("price"))) if near_asks else None
-st.markdown("#### تفسیر عملی نقدینگی نزدیک قیمت")
+st.markdown("#### جمع‌بندی ساده نقدینگی")
+st.caption("به زبان ساده: این بخش فقط سفارش‌های بزرگی را می‌سنجد که همین حالا در دفتر سفارش LBank دیده می‌شوند؛ نمی‌تواند با قطعیت پیش‌بینی کند قیمت کدام سمت می‌رود.")
 if nearest_bid and nearest_ask:
     bid_distance = (mid_price - number(nearest_bid["price"])) / mid_price * 100
     ask_distance = (number(nearest_ask["price"]) - mid_price) / mid_price * 100
     liq_a, liq_b = st.columns(2)
-    liq_a.metric("نزدیک‌ترین دیوار خرید زیر قیمت", fmt_price(nearest_bid["price"]), delta=f"{bid_distance:.2f}% فاصله")
-    liq_b.metric("نزدیک‌ترین دیوار فروش بالای قیمت", fmt_price(nearest_ask["price"]), delta=f"{ask_distance:.2f}% فاصله")
-    if ask_distance < bid_distance * 0.8 and number(nearest_ask.get("value")) >= number(nearest_bid.get("value")):
-        st.write("**سناریوی نزدیک‌تر: حرکت به سمت دیوار فروش بالایی.** اگر قیمت با حجم و کندل‌های بسته‌شده رو به بالا حرکت کند، آن ناحیه می‌تواند آزمایش شود؛ در برخورد، دنبال شکست و تثبیت یا رد قیمت باش، نه خرید کورکورانه.")
-    elif bid_distance < ask_distance * 0.8 and number(nearest_bid.get("value")) >= number(nearest_ask.get("value")):
-        st.write("**سناریوی نزدیک‌تر: آزمایش دیوار خرید پایینی.** اگر فشار فروش ادامه یابد، قیمت می‌تواند آن ناحیه را آزمایش کند؛ پس از نفوذ، فقط برگشت و تثبیت بالای سطح می‌تواند نشانه دفاع خریداران باشد.")
+    liq_a.metric("سطح زیر قیمت (خریداران)", fmt_price(nearest_bid["price"]), delta=f"{bid_distance:.2f}% پایین‌تر")
+    liq_b.metric("سطح بالای قیمت (فروشندگان)", fmt_price(nearest_ask["price"]), delta=f"{ask_distance:.2f}% بالاتر")
+    bid_value = number(nearest_bid.get("value"))
+    ask_value = number(nearest_ask.get("value"))
+    if ask_distance <= bid_distance * 0.85 and ask_value >= bid_value:
+        st.success(f"**اولویت بررسی: سطح بالایی {fmt_price(nearest_ask['price'])}.** هم نزدیک‌تر است و هم دیوار فروش آن دست‌کم به‌اندازه دیوار خرید زیر قیمت است. این فقط سطحی است که باید زیر نظر بگیریم، نه پیش‌بینی قطعی رشد.")
+    elif bid_distance <= ask_distance * 0.85 and bid_value >= ask_value:
+        st.warning(f"**اولویت بررسی: سطح پایینی {fmt_price(nearest_bid['price'])}.** هم نزدیک‌تر است و هم دیوار خرید آن دست‌کم به‌اندازه دیوار فروش بالای قیمت است. این به معنی قطعی بودن افت قیمت نیست.")
     else:
-        st.write("**جهت جمع‌آوری نقدینگی نامشخص است.** دو سمت از نظر فاصله/اندازه برتری واضحی ندارند؛ منتظر شکست و تثبیت یا sweep و بازپس‌گیری سطح بمان.")
-    st.caption("این فقط مقایسه دیوارهای قابل‌مشاهده دفتر سفارش همین صرافی است، نه نقشه پوزیشن‌های لیکوییدشدنی. سفارش‌ها ممکن است پیش از اجرا لغو شوند.")
+        st.info("**نتیجه: هنوز برنده مشخصی نداریم.** دو سطح از نظر فاصله و اندازه اختلاف واضحی ندارند؛ فعلاً فقط صبر کن و دنبال تأیید کندل بمان.")
+    st.markdown("**وقتی قیمت به سطح رسید:**")
+    st.markdown(
+        f"- **اگر به سطح پایین {fmt_price(nearest_bid['price'])} رسید:** فقط وقتی خرید را بررسی کن که قیمت دوباره بالای سطح برگردد و کندل بسته‌شده آن را تأیید کند؛ اگر زیر سطح ماند، خرید نکن.\n"
+        f"- **اگر به سطح بالا {fmt_price(nearest_ask['price'])} رسید:** اگر قیمت پس زده شد، خرید تازه نکن؛ اگر شکست و بالای آن تثبیت شد، با تصور مقاومت قطعی نفروش.\n"
+        "- **اگر تأیید نگرفتی:** معامله نکن. این راهنما برای بازار اسپات است؛ سیگنال فروش الزاماً به معنی شورت نیست."
+    )
+    st.caption("این سطح‌ها دیوارهای سفارش‌اند، نه نقاط دقیق لیکوییدیشن پوزیشن‌ها. سفارش‌های بزرگ ممکن است قبل از اجرا لغو شوند.")
 else:
-    st.info("برای تعیین سطح نزدیک‌تر، دیوار خرید و فروش معتبر کافی دریافت نشد؛ از روی داده ناقص جهت جمع‌آوری نقدینگی تعیین نمی‌شود.")
-
-st.markdown("**وقتی قیمت به سطح می‌رسد چه کنم؟**")
-st.markdown(
-    "- **نزدیک سطح خرید/حمایت:** خرید را تنها با واکنش صعودیِ تأییدشده (sweep زیر سطح و بازپس‌گیری، یا شکست مقاومت خرد) بررسی کن؛ اگر قیمت زیر سطح تثبیت شد، سناریوی خرید باطل است.\n"
-    "- **نزدیک سطح فروش/مقاومت:** اگر قیمت رد شد و زیر سطح برگشت، از ورود تازه به خرید پرهیز کن و برای داراییِ موجود، خروج پله‌ای را بررسی کن؛ اگر بالای سطح شکست و تثبیت شد، فروش زودهنگام می‌تواند اشتباه باشد.\n"
-    "- **درست روی سطح وارد نشو:** ورود پس از تأیید، حد ابطال پشت سطح، و اندازه موقعیت متناسب با ریسک؛ در بازار اسپات، سیگنال فروش معمولاً یعنی کاهش/عدم افزودن دارایی، نه الزاماً شورت."
-)
+    st.info("داده کافی برای مقایسه یک سطح خرید و یک سطح فروش وجود ندارد؛ از روی اطلاعات ناقص جهت تعیین نمی‌کنیم.")
+    st.write("**رفتار پیشنهادی: فعلاً صبر کن.** پس از ظاهر شدن سطح معتبر و بسته‌شدن کندل تأییدی، نقطه ورود را دوباره بررسی کن.")
 
 flows = st.columns(4)
 flows[0].metric("حجم خرید اخیر", fmt_usd(trade_stats["buy_usd"]))
@@ -2166,7 +2298,7 @@ with st.expander("جزئیات دفتر سفارش: سطوح خرید و فرو�
         st.dataframe(ask_df, use_container_width=True, hide_index=True)
 
 st.divider()
-st.subheader("۶. سناریوی احتمالی ورود و خروج")
+st.subheader("۷. سناریوی احتمالی ورود و خروج")
 st.caption(
     "این سناریو یک محاسبه تقریبی بر پایه دفتر سفارش است، نه سفارش واقعی یا توصیه خریدوفروش."
 )
@@ -2199,7 +2331,7 @@ else:
     )
 
 st.divider()
-st.subheader("۷. جمع‌بندی تصمیم: طلا، رمزارز یا ترکیب؟")
+st.subheader("۸. جمع‌بندی تصمیم: طلا، رمزارز یا ترکیب؟")
 st.caption("قاعده‌ای شفاف بر پایه نسبت BTC/XAUT و روند واقعی ۴ساعته/روزانه BTC و XAUT؛ این پیشنهاد خودکار است، شخصی‌سازی مالی نیست و هیچ سفارشی ثبت نمی‌کند.")
 try:
     allocation_ratio = get_btc_xau_metrics(lbank_pairs)
