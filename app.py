@@ -976,7 +976,7 @@ def get_btc_relative_metrics(code, lbank_pairs):
     }
 
 
-@st.cache_data(ttl=180, show_spinner=False)
+@st.cache_data(ttl=300, show_spinner=False)
 def get_btc_xau_metrics(lbank_pairs):
     """Synthetic BTC/XAUT cross-rate calculated only from real LBank BTC/USDT and XAUT/USDT candles."""
     btc_pair = "btc_usdt"
@@ -1049,6 +1049,7 @@ def get_asset_trend_score(code, lbank_pairs, atr_period=14, ut_multiplier=2.0):
     return {"score": score, "notes": notes}
 
 
+@st.cache_data(ttl=180, show_spinner=False)
 def fetch_free_liquidation_heatmap(symbol="BTC", window_minutes=240, price_buckets=50):
     """Free public endpoint: observed executed liquidations, not projected liquidation levels."""
     response = requests.get(
@@ -2165,7 +2166,7 @@ with st.expander("جزئیات دفتر سفارش: سطوح خرید و فرو�
         st.dataframe(ask_df, use_container_width=True, hide_index=True)
 
 st.divider()
-st.subheader("۵. سناریوی احتمالی ورود و خروج")
+st.subheader("۶. سناریوی احتمالی ورود و خروج")
 st.caption(
     "این سناریو یک محاسبه تقریبی بر پایه دفتر سفارش است، نه سفارش واقعی یا توصیه خریدوفروش."
 )
@@ -2198,7 +2199,7 @@ else:
     )
 
 st.divider()
-st.subheader("۶. جمع‌بندی تصمیم: طلا، رمزارز یا ترکیب؟")
+st.subheader("۷. جمع‌بندی تصمیم: طلا، رمزارز یا ترکیب؟")
 st.caption("قاعده‌ای شفاف بر پایه نسبت BTC/XAUT و روند واقعی ۴ساعته/روزانه BTC و XAUT؛ این پیشنهاد خودکار است، شخصی‌سازی مالی نیست و هیچ سفارشی ثبت نمی‌کند.")
 try:
     allocation_ratio = get_btc_xau_metrics(lbank_pairs)
