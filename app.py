@@ -521,13 +521,19 @@ def get_cryptometer_key():
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def fetch_cryptometer_endpoint(endpoint, api_key):
+def fetch_cryptometer_endpoint(endpoint, api_key, endpoint_params=None):
     """Fetch a documented CryptoMeter endpoint; never log or display the API key."""
-    if endpoint not in {"trend-indicator-v3", "merged-orderbook"}:
-        raise ValueError("CryptoMeter endpoint is not enabled in the free-data integration.")
+    allowed_endpoints = {
+        "trend-indicator-v3", "merged-orderbook",
+        "volume-flow", "liquidity-lens", "xtrades",
+    }
+    if endpoint not in allowed_endpoints:
+        raise ValueError("CryptoMeter endpoint is not enabled.")
+    params = dict(endpoint_params or {})
+    params["api_key"] = api_key
     response = requests.get(
         f"{CRYPTOMETER_URL}/{endpoint}/",
-        params={"api_key": api_key},
+        params=params,
         headers={"accept": "application/json"},
         timeout=15,
     )
@@ -1212,8 +1218,11 @@ def get_btc_xau_metrics(lbank_pairs):
     }
 
 
-def rank_crypto_candidates(coins_df, lbank_pairs, atr_period=1, ut_multiplier=2.0):
-    """Rank a small, liquid, LBank-listed shortlist using real candles and BTC-relative strength."""
+def rank_crypto_candidates(
+    coins_df, lbank_pairs, atr_period=1, ut_multiplier=2.0,
+    cryptometer_liquidity=None, cryptometer_whales=None,
+):
+    """Rank LBank-listed candidates using candles, BTC-relative strength and optional CryptoMeter flows."""
     excluded = {
         "XAUT", "USDT", "USDC", "FDUSD", "TUSD", "DAI", "USDE",
         "USDD", "USDP", "PYUSD", "EURC", "USD1", "USTC",
@@ -1250,7 +1259,31 @@ def rank_crypto_candidates(coins_df, lbank_pairs, atr_period=1, ut_multiplier=2.
         relative = get_btc_relative_metrics(code, lbank_pairs)
         trend_score = trend.get("score")
         relative_change = relative.get("change_pct")
-        if trend_score is None and relative_change is None:
+        liquidity_row = {}
+        if isinstance(cryptometer_liquidity, dict):
+            liquidity_row = cryptometer_liquidity.get(code, {}) or {}
+        netflow_usd = number(liquidity_row.get("netflow"), None)
+
+        whale_buy_usd = 0.0
+        whale_sell_usd = 0.0
+        whale_count = 0
+        if isinstance(cryptometer_whales, list):
+            for whale in cryptometer_whales:
+                if not isinstance(whale, dict) or str(whale.get("symbol", "")).upper() != code:
+                    continue
+                side = str(whale.get("side", "")).upper()
+                usd_value = number(whale.get("usd_total", whale.get("total")), 0.0)
+                if usd_value <= 0:
+                    continue
+                if side == "BUY":
+                    whale_buy_usd += usd_value
+                    whale_count += 1
+                elif side == "SELL":
+                    whale_sell_usd += usd_value
+                    whale_count += 1
+        whale_net_usd = whale_buy_usd - whale_sell_usd
+
+        if trend_score is None and relative_change is None and netflow_usd is None and whale_count == 0:
             score = None
         else:
             score = int(trend_score or 0)
@@ -1258,6 +1291,18 @@ def rank_crypto_candidates(coins_df, lbank_pairs, atr_period=1, ut_multiplier=2.
                 score += 1 if relative_change > 0 else (-1 if relative_change < 0 else 0)
             if pd.notna(day_change):
                 score += 1 if day_change > 0 else (-1 if day_change < 0 else 0)
+            if netflow_usd is not None:
+                score += 1 if netflow_usd > 0 else (-1 if netflow_usd < 0 else 0)
+            if whale_count >= 2:
+                score += 1 if whale_net_usd > 0 else (-1 if whale_net_usd < 0 else 0)
+
+        flow_notes = []
+        if netflow_usd is not None:
+            flow_notes.append(f"CryptoMeter خالص جریان نقدینگی: {netflow_usd:,.0f} دلار")
+        if whale_count:
+            flow_notes.append(
+                f"معاملات بزرگ: خرید {whale_buy_usd:,.0f} دلار در برابر فروش {whale_sell_usd:,.0f} دلار ({whale_count} معامله)"
+            )
 
         if score is None:
             label = "داده ناکافی"
@@ -1282,8 +1327,11 @@ def rank_crypto_candidates(coins_df, lbank_pairs, atr_period=1, ut_multiplier=2.
             "24h Change %": day_change if pd.notna(day_change) else None,
             "BTC Relative %": relative_change,
             "Volume USD": number(coin.get("Volume USD")),
+            "CryptoMeter Netflow USD": netflow_usd,
+            "Whale Net USD": whale_net_usd if whale_count else None,
             "Reason": reason,
             "Trend notes": trend.get("notes") or [],
+            "Flow notes": flow_notes,
             "Relative method": relative.get("method", ""),
         })
 
@@ -1765,6 +1813,13 @@ with st.sidebar:
             help="ضریب فاصله حد متحرک UT از قیمت؛ افزایش آن معمولاً فاصله را بیشتر می‌کند و سیگنال‌ها را تغییر می‌دهد.",
         )
 
+    st.divider()
+    use_cryptometer_paid = st.checkbox(
+        "فعال‌سازی جریان نقدینگی و معاملات نهنگ‌ها (API پولی)",
+        value=False,
+        help="با فعال‌کردن، endpointهای volume-flow، liquidity-lens و xtrades فراخوانی می‌شوند. دسترسی پولی باید از قبل در حساب CryptoMeter فعال شده باشد؛ هیچ خریدی از داخل برنامه انجام نمی‌شود.",
+    )
+
     refresh = st.button("🔄 به‌روزرسانی داده‌ها", use_container_width=True)
 
 if refresh:
@@ -1887,11 +1942,93 @@ else:
 
 st.divider()
 st.subheader("۲. اولویت رمزارزها برای بررسی خرید")
-st.caption("این فهرست به‌صورت پویا از ارزهای موجود در فهرست شما که در LBank جفت USDT دارند ساخته می‌شود. رتبه‌ها از روند ۴ساعته/روزانه، عملکرد نسبت به BTC، تغییر ۲۴ساعته و حجم واقعی کمک می‌گیرند؛ «اولویت بررسی» به معنی خرید فوری نیست.")
+st.caption("این فهرست به‌صورت پویا از ارزهای موجود در فهرست شما که در LBank جفت USDT دارند ساخته می‌شود. رتبه‌ها از روند ۴ساعته/روزانه، عملکرد نسبت به BTC، تغییر ۲۴ساعته و حجم واقعی کمک می‌گیرند؛ در صورت فعال‌کردن دسترسی پولی، خالص جریان نقدینگی و معاملات بزرگ CryptoMeter نیز امتیاز را تعدیل می‌کنند. «اولویت بررسی» به معنی خرید فوری نیست.")
+
+cm_paid_data = {"volume_flow": None, "liquidity_lens": None, "xtrades": None}
+cm_paid_errors = []
+cm_key_for_ranking = get_cryptometer_key()
+if use_cryptometer_paid:
+    if not cm_key_for_ranking:
+        st.warning("برای داده‌های پولی CryptoMeter، ابتدا CRYPTOMETER_API_KEY را در Streamlit → App settings → Secrets تنظیم کن.")
+    else:
+        with st.spinner("دریافت جریان نقدینگی و معاملات بزرگ CryptoMeter..."):
+            for endpoint, params, data_key in [
+                ("volume-flow", {"timeframe": "4h"}, "volume_flow"),
+                ("liquidity-lens", {"timeframe": "4h"}, "liquidity_lens"),
+                ("xtrades", {}, "xtrades"),
+            ]:
+                try:
+                    cm_paid_data[data_key] = fetch_cryptometer_endpoint(endpoint, cm_key_for_ranking, params)
+                except Exception as cm_exc:
+                    cm_paid_errors.append(f"{endpoint}: {type(cm_exc).__name__}: {str(cm_exc)[:150]}")
+
+if use_cryptometer_paid:
+    with st.expander("جزئیات جریان نقدینگی و معاملات بزرگ CryptoMeter", expanded=True):
+        st.caption("داده‌ها در تایم‌فریم ۴ساعته دریافت می‌شوند؛ xtrades شامل آخرین معاملات بزرگِ برگشتی از API است. این‌ها داده تجمیعی بازارند و الزاماً مختص LBank نیستند.")
+        flow_payload = cm_paid_data.get("volume_flow")
+        if isinstance(flow_payload, dict):
+            flow_rows = []
+            for category in ("inflow", "outflow", "netflow"):
+                items = flow_payload.get(category) or []
+                for item in items[:10] if isinstance(items, list) else []:
+                    if isinstance(item, dict):
+                        flow_rows.append({
+                            "نوع جریان": category,
+                            "از": item.get("from", "—"),
+                            "به": item.get("to", "—"),
+                            "حجم (دلار)": number(item.get("volume"), None),
+                        })
+            if flow_rows:
+                st.markdown("**مسیرهای Volume Flow**")
+                st.dataframe(pd.DataFrame(flow_rows), use_container_width=True, hide_index=True)
+            else:
+                st.info("Volume Flow داده مسیر قابل نمایش برنگرداند.")
+        lens_payload = cm_paid_data.get("liquidity_lens")
+        if isinstance(lens_payload, dict):
+            lens_rows = []
+            for symbol, values in lens_payload.items():
+                if isinstance(values, dict):
+                    lens_rows.append({
+                        "رمزارز": str(symbol).upper(),
+                        "ورودی (دلار)": number(values.get("inflow"), None),
+                        "خروجی (دلار)": number(values.get("outflow"), None),
+                        "خالص جریان (دلار)": number(values.get("netflow"), None),
+                    })
+            if lens_rows:
+                lens_df = pd.DataFrame(lens_rows).sort_values("خالص جریان (دلار)", ascending=False, na_position="last")
+                st.markdown("**خالص جریان نقدینگی به تفکیک رمزارز**")
+                st.dataframe(lens_df.head(20), use_container_width=True, hide_index=True)
+        whale_payload = cm_paid_data.get("xtrades")
+        whale_rows = whale_payload if isinstance(whale_payload, list) else []
+        if whale_rows:
+            whale_df = pd.DataFrame([
+                {
+                    "رمزارز": str(row.get("symbol", "")).upper(),
+                    "جفت‌ارز": row.get("pair", "—"),
+                    "صرافی": row.get("exchange", "—"),
+                    "سمت": row.get("side", "—"),
+                    "ارزش (دلار)": number(row.get("usd_total", row.get("total")), None),
+                    "زمان": row.get("timestamp", "—"),
+                }
+                for row in whale_rows[:30] if isinstance(row, dict)
+            ])
+            st.markdown("**آخرین معاملات بزرگ ثبت‌شده (Whale Trades)**")
+            st.dataframe(whale_df, use_container_width=True, hide_index=True)
+        if cm_paid_errors:
+            st.warning("برخی endpointها داده ندادند؛ احتمالاً دسترسی پولی آن endpoint در پلن API فعال نیست یا سهمیه/سرویس محدود است.")
+            for cm_error in cm_paid_errors:
+                st.caption(cm_error)
+        if not any(cm_paid_data.values()) and not cm_paid_errors:
+            st.info("هنوز داده‌ای از endpointهای پولی دریافت نشده است.")
+
+cm_lens_for_ranking = cm_paid_data.get("liquidity_lens")
+cm_whales_for_ranking = cm_paid_data.get("xtrades")
 try:
-    with st.spinner("مقایسه روند و قدرت نسبی رمزارزهای برتر فهرست..."):
+    with st.spinner("مقایسه روند، قدرت نسبی و جریان نقدینگی رمزارزهای برتر فهرست..."):
         crypto_ranking = rank_crypto_candidates(
-            coins_df, lbank_pairs, int(atr_period), float(ut_multiplier)
+            coins_df, lbank_pairs, int(atr_period), float(ut_multiplier),
+            cryptometer_liquidity=cm_lens_for_ranking,
+            cryptometer_whales=cm_whales_for_ranking,
         )
     if crypto_ranking:
         ranking_df = pd.DataFrame(crypto_ranking)
@@ -1901,7 +2038,8 @@ try:
         else:
             st.info("**فعلاً خرید فوری تأیید نشده است.** رتبه اول جدول فقط بهترین گزینه نسبی بین داده‌های موجود است؛ اگر امتیاز پایین یا داده ناکافی باشد، منتظر تأیید بمان.")
         display_ranking = ranking_df[[
-            "Code", "Priority", "Score", "24h Change %", "BTC Relative %", "Reason"
+            "Code", "Priority", "Score", "24h Change %", "BTC Relative %",
+            "CryptoMeter Netflow USD", "Whale Net USD", "Reason"
         ]].copy()
         display_ranking = display_ranking.rename(columns={
             "Code": "رمزارز",
@@ -1909,8 +2047,14 @@ try:
             "Score": "امتیاز مدل",
             "24h Change %": "تغییر ۲۴ساعته (%)",
             "BTC Relative %": "تغییر نسبت به BTC (%)",
+            "CryptoMeter Netflow USD": "خالص جریان CryptoMeter ($)",
+            "Whale Net USD": "خالص معاملات نهنگ‌ها ($)",
             "Reason": "دلیل ساده",
         })
+        for col in ("خالص جریان CryptoMeter ($)", "خالص معاملات نهنگ‌ها ($)"):
+            display_ranking[col] = display_ranking[col].map(
+                lambda value: f"${value:,.0f}" if value is not None and pd.notna(value) else "—"
+            )
         for col in ("تغییر ۲۴ساعته (%)", "تغییر نسبت به BTC (%)"):
             display_ranking[col] = display_ranking[col].map(
                 lambda value: f"{value:+.2f}%" if value is not None and pd.notna(value) else "—"
@@ -1922,7 +2066,8 @@ try:
         with st.expander("چرا این رتبه‌بندی را داده؟"):
             for item in crypto_ranking:
                 st.markdown(f"**{item['Code']} — {item['Priority']}**")
-                st.caption("؛ ".join(item["Trend notes"][:4]) if item["Trend notes"] else item["Reason"])
+                note_parts = (item["Trend notes"] or []) + (item.get("Flow notes") or [])
+                st.caption("؛ ".join(note_parts[:5]) if note_parts else item["Reason"])
                 st.caption(item["Relative method"])
     else:
         st.warning("از فهرست فعلی، رمزارز قابل بررسی با جفت USDT در LBank پیدا نشد.")
@@ -2321,7 +2466,10 @@ with st.expander("جریان نقدینگی و فشار خرید/فروش — Cr
     else:
         try:
             with st.spinner("دریافت داده‌های تجمیعی CryptoMeter..."):
-                trend_data = fetch_cryptometer_endpoint("trend-indicator-v3", cryptometer_key)
+                trend_data = fetch_cryptometer_endpoint(
+                    "trend-indicator-v3", cryptometer_key,
+                    {"pair": f"{selected_code.lower()}-usdt", "timeframe": "4h"},
+                )
                 book_data = fetch_cryptometer_endpoint("merged-orderbook", cryptometer_key)
 
             trend_rows = trend_data if isinstance(trend_data, list) else [trend_data]
@@ -2380,8 +2528,8 @@ with st.expander("جریان نقدینگی و فشار خرید/فروش — Cr
             else:
                 st.warning("CryptoMeter در حال حاضر داده‌ای برای دفتر سفارش تجمیعی برنگرداند.")
             st.caption(
-                "محدودیت منبع: endpointهای volume-flow و liquidity-lens در مستندات فعلی CryptoMeter پولی علامت‌گذاری شده‌اند؛ "
-                "این نسخه فقط endpointهای بدون برچسب Paid را فراخوانی می‌کند تا ناخواسته هزینه ایجاد نشود."
+                "Volume Flow، Liquidity Lens و xTrades فقط با فعال‌کردن گزینه API پولی در نوار کناری فراخوانی می‌شوند؛ "
+                "دسترسی endpointها باید از قبل در حساب CryptoMeter فعال باشد. هیچ خریدی خودکار انجام نمی‌شود."
             )
         except Exception as exc:
             st.warning(
