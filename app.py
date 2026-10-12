@@ -1025,7 +1025,7 @@ def get_asset_trend_score(code, lbank_pairs, atr_period=14, ut_multiplier=2.0):
     notes = []
     for timeframe in ("4 ساعت", "روزانه"):
         try:
-            candles = fetch_lbank_klines(pair, timeframe, 100)
+            candles = fetch_lbank_klines(pair, timeframe, 260)
             indicators = add_market_indicators(candles, atr_period, ut_multiplier)
             summary = latest_signal_summary(indicators)
             if summary["buy_signal"]:
