@@ -2356,7 +2356,7 @@ st.caption(
 with st.expander("جریان نقدینگی و فشار خرید/فروش — CryptoMeter.io", expanded=False):
     st.markdown(
         "این بخش داده‌های تجمیعی CryptoMeter را کنار دفتر سفارش LBank قرار می‌دهد. "
-        "برای جلوگیری از درخواست‌های تکراری، داده‌ها تا ۵ دقیقه cache می‌شوند. "
+        "برای کنترل مصرف سهمیه، داده‌ها تا ۱۵ دقیقه cache می‌شوند. "
         "کلید API را فقط در Streamlit Secrets نگه دار."
     )
     cryptometer_key = get_cryptometer_key()
@@ -2369,11 +2369,33 @@ with st.expander("جریان نقدینگی و فشار خرید/فروش — Cr
         st.code('CRYPTOMETER_API_KEY = "کلید-شما"', language="toml")
     else:
         try:
-            with st.spinner("دریافت داده‌های تجمیعی CryptoMeter..."):
-                trend_data = fetch_cryptometer_endpoint("trend-indicator-v3", cryptometer_key)
-                book_data = fetch_cryptometer_endpoint("merged-orderbook", cryptometer_key)
-                movement_data = fetch_cryptometer_endpoint("rapid-movements", cryptometer_key)
-                tickerlist_data = fetch_cryptometer_endpoint("tickerlist", cryptometer_key, {"e": "binance"})
+            cm_endpoint_errors = {}
+            cm_endpoint_data = {
+                "trend-indicator-v3": None,
+                "merged-orderbook": None,
+                "rapid-movements": None,
+                "tickerlist": None,
+            }
+            with st.spinner("دریافت داده‌های رایگان CryptoMeter..."):
+                for endpoint, params in [
+                    ("trend-indicator-v3", {}),
+                    ("merged-orderbook", {}),
+                    ("rapid-movements", {}),
+                    ("tickerlist", {"e": "binance"}),
+                ]:
+                    try:
+                        cm_endpoint_data[endpoint] = fetch_cryptometer_endpoint(
+                            endpoint, cryptometer_key, params
+                        )
+                    except Exception as endpoint_exc:
+                        cm_endpoint_errors[endpoint] = (
+                            f"{type(endpoint_exc).__name__}: {str(endpoint_exc)[:140]}"
+                        )
+
+            trend_data = cm_endpoint_data["trend-indicator-v3"]
+            book_data = cm_endpoint_data["merged-orderbook"]
+            movement_data = cm_endpoint_data["rapid-movements"]
+            tickerlist_data = cm_endpoint_data["tickerlist"]
 
             trend_rows = trend_data if isinstance(trend_data, list) else [trend_data]
             trend_rows = [row for row in trend_rows if isinstance(row, dict)]
@@ -2518,6 +2540,8 @@ with st.expander("جریان نقدینگی و فشار خرید/فروش — Cr
                 for derivative_error in derivative_errors:
                     st.caption(f"داده تکمیلی در دسترس نبود — {derivative_error}")
 
+            for failed_endpoint, error_text in cm_endpoint_errors.items():
+                st.caption(f"داده {failed_endpoint} فعلاً در دسترس نبود: {error_text}")
             st.caption(
                 "در این بخش فقط endpointهایی فراخوانی می‌شوند که در مستندات API فعلی با برچسب Paid مشخص نشده‌اند. "
                 "Volume Flow، Liquidity Lens و xTrades API پولی‌اند و عمداً فراخوانی نمی‌شوند. "
