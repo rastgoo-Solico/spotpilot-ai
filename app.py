@@ -520,12 +520,12 @@ def get_cryptometer_key():
     return os.environ.get("CRYPTOMETER_API_KEY", "").strip()
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=900, show_spinner=False)
 def fetch_cryptometer_endpoint(endpoint, api_key, endpoint_params=None):
-    """Fetch a documented CryptoMeter endpoint; never log or display the API key."""
+    """Fetch documented free CryptoMeter endpoints; never log or display the API key."""
     allowed_endpoints = {
-        "trend-indicator-v3", "merged-orderbook",
-        "volume-flow", "liquidity-lens", "xtrades",
+        "trend-indicator-v3", "merged-orderbook", "rapid-movements",
+        "24h-trade-volume-v2", "open-interest", "long-shorts-data",
     }
     if endpoint not in allowed_endpoints:
         raise ValueError("CryptoMeter endpoint is not enabled.")
@@ -1813,13 +1813,6 @@ with st.sidebar:
             help="ضریب فاصله حد متحرک UT از قیمت؛ افزایش آن معمولاً فاصله را بیشتر می‌کند و سیگنال‌ها را تغییر می‌دهد.",
         )
 
-    st.divider()
-    use_cryptometer_paid = st.checkbox(
-        "فعال‌سازی جریان نقدینگی و معاملات نهنگ‌ها (API پولی)",
-        value=False,
-        help="با فعال‌کردن، endpointهای volume-flow، liquidity-lens و xtrades فراخوانی می‌شوند. دسترسی پولی باید از قبل در حساب CryptoMeter فعال شده باشد؛ هیچ خریدی از داخل برنامه انجام نمی‌شود.",
-    )
-
     refresh = st.button("🔄 به‌روزرسانی داده‌ها", use_container_width=True)
 
 if refresh:
@@ -1942,93 +1935,11 @@ else:
 
 st.divider()
 st.subheader("۲. اولویت رمزارزها برای بررسی خرید")
-st.caption("این فهرست به‌صورت پویا از ارزهای موجود در فهرست شما که در LBank جفت USDT دارند ساخته می‌شود. رتبه‌ها از روند ۴ساعته/روزانه، عملکرد نسبت به BTC، تغییر ۲۴ساعته و حجم واقعی کمک می‌گیرند؛ در صورت فعال‌کردن دسترسی پولی، خالص جریان نقدینگی و معاملات بزرگ CryptoMeter نیز امتیاز را تعدیل می‌کنند. «اولویت بررسی» به معنی خرید فوری نیست.")
-
-cm_paid_data = {"volume_flow": None, "liquidity_lens": None, "xtrades": None}
-cm_paid_errors = []
-cm_key_for_ranking = get_cryptometer_key()
-if use_cryptometer_paid:
-    if not cm_key_for_ranking:
-        st.warning("برای داده‌های پولی CryptoMeter، ابتدا CRYPTOMETER_API_KEY را در Streamlit → App settings → Secrets تنظیم کن.")
-    else:
-        with st.spinner("دریافت جریان نقدینگی و معاملات بزرگ CryptoMeter..."):
-            for endpoint, params, data_key in [
-                ("volume-flow", {"timeframe": "4h"}, "volume_flow"),
-                ("liquidity-lens", {"timeframe": "4h"}, "liquidity_lens"),
-                ("xtrades", {}, "xtrades"),
-            ]:
-                try:
-                    cm_paid_data[data_key] = fetch_cryptometer_endpoint(endpoint, cm_key_for_ranking, params)
-                except Exception as cm_exc:
-                    cm_paid_errors.append(f"{endpoint}: {type(cm_exc).__name__}: {str(cm_exc)[:150]}")
-
-if use_cryptometer_paid:
-    with st.expander("جزئیات جریان نقدینگی و معاملات بزرگ CryptoMeter", expanded=True):
-        st.caption("داده‌ها در تایم‌فریم ۴ساعته دریافت می‌شوند؛ xtrades شامل آخرین معاملات بزرگِ برگشتی از API است. این‌ها داده تجمیعی بازارند و الزاماً مختص LBank نیستند.")
-        flow_payload = cm_paid_data.get("volume_flow")
-        if isinstance(flow_payload, dict):
-            flow_rows = []
-            for category in ("inflow", "outflow", "netflow"):
-                items = flow_payload.get(category) or []
-                for item in items[:10] if isinstance(items, list) else []:
-                    if isinstance(item, dict):
-                        flow_rows.append({
-                            "نوع جریان": category,
-                            "از": item.get("from", "—"),
-                            "به": item.get("to", "—"),
-                            "حجم (دلار)": number(item.get("volume"), None),
-                        })
-            if flow_rows:
-                st.markdown("**مسیرهای Volume Flow**")
-                st.dataframe(pd.DataFrame(flow_rows), use_container_width=True, hide_index=True)
-            else:
-                st.info("Volume Flow داده مسیر قابل نمایش برنگرداند.")
-        lens_payload = cm_paid_data.get("liquidity_lens")
-        if isinstance(lens_payload, dict):
-            lens_rows = []
-            for symbol, values in lens_payload.items():
-                if isinstance(values, dict):
-                    lens_rows.append({
-                        "رمزارز": str(symbol).upper(),
-                        "ورودی (دلار)": number(values.get("inflow"), None),
-                        "خروجی (دلار)": number(values.get("outflow"), None),
-                        "خالص جریان (دلار)": number(values.get("netflow"), None),
-                    })
-            if lens_rows:
-                lens_df = pd.DataFrame(lens_rows).sort_values("خالص جریان (دلار)", ascending=False, na_position="last")
-                st.markdown("**خالص جریان نقدینگی به تفکیک رمزارز**")
-                st.dataframe(lens_df.head(20), use_container_width=True, hide_index=True)
-        whale_payload = cm_paid_data.get("xtrades")
-        whale_rows = whale_payload if isinstance(whale_payload, list) else []
-        if whale_rows:
-            whale_df = pd.DataFrame([
-                {
-                    "رمزارز": str(row.get("symbol", "")).upper(),
-                    "جفت‌ارز": row.get("pair", "—"),
-                    "صرافی": row.get("exchange", "—"),
-                    "سمت": row.get("side", "—"),
-                    "ارزش (دلار)": number(row.get("usd_total", row.get("total")), None),
-                    "زمان": row.get("timestamp", "—"),
-                }
-                for row in whale_rows[:30] if isinstance(row, dict)
-            ])
-            st.markdown("**آخرین معاملات بزرگ ثبت‌شده (Whale Trades)**")
-            st.dataframe(whale_df, use_container_width=True, hide_index=True)
-        if cm_paid_errors:
-            st.warning("برخی endpointها داده ندادند؛ احتمالاً دسترسی پولی آن endpoint در پلن API فعال نیست یا سهمیه/سرویس محدود است.")
-            for cm_error in cm_paid_errors:
-                st.caption(cm_error)
-        if not any(cm_paid_data.values()) and not cm_paid_errors:
-            st.info("هنوز داده‌ای از endpointهای پولی دریافت نشده است.")
-
-cm_lens_for_ranking = cm_paid_data.get("liquidity_lens")
-cm_whales_for_ranking = cm_paid_data.get("xtrades")
+st.caption("این فهرست به‌صورت پویا از ارزهای موجود در فهرست شما که در LBank جفت USDT دارند ساخته می‌شود. رتبه‌ها از روند ۴ساعته/روزانه، عملکرد نسبت به BTC، تغییر ۲۴ساعته و حجم واقعی کمک می‌گیرند. داده‌های CryptoMeter رایگان در پنل جداگانه نمایش داده می‌شوند؛ «اولویت بررسی» به معنی خرید فوری نیست.")
 try:
-    with st.spinner("مقایسه روند، قدرت نسبی و جریان نقدینگی رمزارزهای برتر فهرست..."):
+    with st.spinner("مقایسه روند و قدرت نسبی رمزارزهای برتر فهرست..."):
         crypto_ranking = rank_crypto_candidates(
-            coins_df, lbank_pairs, int(atr_period), float(ut_multiplier),
-            cryptometer_liquidity=cm_lens_for_ranking,
-            cryptometer_whales=cm_whales_for_ranking,
+            coins_df, lbank_pairs, int(atr_period), float(ut_multiplier)
         )
     if crypto_ranking:
         ranking_df = pd.DataFrame(crypto_ranking)
@@ -2038,8 +1949,7 @@ try:
         else:
             st.info("**فعلاً خرید فوری تأیید نشده است.** رتبه اول جدول فقط بهترین گزینه نسبی بین داده‌های موجود است؛ اگر امتیاز پایین یا داده ناکافی باشد، منتظر تأیید بمان.")
         display_ranking = ranking_df[[
-            "Code", "Priority", "Score", "24h Change %", "BTC Relative %",
-            "CryptoMeter Netflow USD", "Whale Net USD", "Reason"
+            "Code", "Priority", "Score", "24h Change %", "BTC Relative %", "Reason"
         ]].copy()
         display_ranking = display_ranking.rename(columns={
             "Code": "رمزارز",
@@ -2047,14 +1957,8 @@ try:
             "Score": "امتیاز مدل",
             "24h Change %": "تغییر ۲۴ساعته (%)",
             "BTC Relative %": "تغییر نسبت به BTC (%)",
-            "CryptoMeter Netflow USD": "خالص جریان CryptoMeter ($)",
-            "Whale Net USD": "خالص معاملات نهنگ‌ها ($)",
             "Reason": "دلیل ساده",
         })
-        for col in ("خالص جریان CryptoMeter ($)", "خالص معاملات نهنگ‌ها ($)"):
-            display_ranking[col] = display_ranking[col].map(
-                lambda value: f"${value:,.0f}" if value is not None and pd.notna(value) else "—"
-            )
         for col in ("تغییر ۲۴ساعته (%)", "تغییر نسبت به BTC (%)"):
             display_ranking[col] = display_ranking[col].map(
                 lambda value: f"{value:+.2f}%" if value is not None and pd.notna(value) else "—"
@@ -2466,11 +2370,9 @@ with st.expander("جریان نقدینگی و فشار خرید/فروش — Cr
     else:
         try:
             with st.spinner("دریافت داده‌های تجمیعی CryptoMeter..."):
-                trend_data = fetch_cryptometer_endpoint(
-                    "trend-indicator-v3", cryptometer_key,
-                    {"pair": f"{selected_code.lower()}-usdt", "timeframe": "4h"},
-                )
+                trend_data = fetch_cryptometer_endpoint("trend-indicator-v3", cryptometer_key)
                 book_data = fetch_cryptometer_endpoint("merged-orderbook", cryptometer_key)
+                movement_data = fetch_cryptometer_endpoint("rapid-movements", cryptometer_key)
 
             trend_rows = trend_data if isinstance(trend_data, list) else [trend_data]
             trend_rows = [row for row in trend_rows if isinstance(row, dict)]
@@ -2527,9 +2429,23 @@ with st.expander("جریان نقدینگی و فشار خرید/فروش — Cr
                 st.dataframe(book_df, use_container_width=True, hide_index=True)
             else:
                 st.warning("CryptoMeter در حال حاضر داده‌ای برای دفتر سفارش تجمیعی برنگرداند.")
+            movement_rows = movement_data if isinstance(movement_data, list) else []
+            movement_rows = [row for row in movement_rows if isinstance(row, dict)]
+            st.markdown("**حرکت‌های سریع بازار در ۴ ساعت اخیر (API رایگان)**")
+            if movement_rows:
+                movement_df = pd.DataFrame([{
+                    "جفت‌ارز": row.get("pair", "—"),
+                    "صرافی": row.get("exchange", "—"),
+                    "جهت حرکت": row.get("side", "—"),
+                    "تغییر تشخیص‌داده‌شده (%)": number(row.get("change_detected"), None),
+                    "زمان": row.get("timestamp", "—"),
+                } for row in movement_rows[:30]])
+                st.dataframe(movement_df, use_container_width=True, hide_index=True)
+            else:
+                st.info("در آخرین پاسخ CryptoMeter حرکت سریع قابل‌نمایشی وجود نداشت.")
             st.caption(
-                "Volume Flow، Liquidity Lens و xTrades فقط با فعال‌کردن گزینه API پولی در نوار کناری فراخوانی می‌شوند؛ "
-                "دسترسی endpointها باید از قبل در حساب CryptoMeter فعال باشد. هیچ خریدی خودکار انجام نمی‌شود."
+                "این APIهای بدون برچسب Paid در مستندات استفاده می‌شوند. Volume Flow، Liquidity Lens و xTrades API پولی‌اند و در این نسخه فراخوانی نمی‌شوند. "
+                "فشار روند و دفتر سفارش تجمیعی مربوط به کل بازار/چند صرافی‌اند، نه صرفاً LBank."
             )
         except Exception as exc:
             st.warning(
@@ -2658,18 +2574,39 @@ else:
 
 # Plain-language liquidity interpretation: visible order-book walls, not future liquidation estimates.
 mid_price = number(book_stats.get("mid"))
-near_bids = [w for w in book_stats.get("bid_walls", []) if number(w.get("price")) < mid_price]
-near_asks = [w for w in book_stats.get("ask_walls", []) if number(w.get("price")) > mid_price]
+# Only call a level a wall when it passes the significance threshold. The fallback
+# rows are useful in the detailed table but may simply be ordinary top-of-book levels.
+near_bids = [
+    w for w in book_stats.get("bid_walls", [])
+    if number(w.get("price")) < mid_price and w.get("classification") == "Large order"
+]
+near_asks = [
+    w for w in book_stats.get("ask_walls", [])
+    if number(w.get("price")) > mid_price and w.get("classification") == "Large order"
+]
 nearest_bid = max(near_bids, key=lambda w: number(w.get("price"))) if near_bids else None
 nearest_ask = min(near_asks, key=lambda w: number(w.get("price"))) if near_asks else None
 st.markdown("#### جمع‌بندی ساده نقدینگی")
-st.caption("به زبان ساده: این بخش فقط سفارش‌های بزرگی را می‌سنجد که همین حالا در دفتر سفارش LBank دیده می‌شوند؛ نمی‌تواند با قطعیت پیش‌بینی کند قیمت کدام سمت می‌رود.")
+st.caption(
+    f"مرجع فاصله، قیمت میانی بهترین خرید و فروش LBank است: {fmt_price(mid_price)}. "
+    "در این جمع‌بندی فقط سفارش‌هایی دیوار محسوب می‌شوند که از آستانه آماری اندازه سفارش عبور کنند؛ "
+    "سطوح عادی دفتر سفارش در جدول جزئیات می‌مانند. این تحلیل پیش‌بینی قطعی جهت قیمت نیست."
+)
+def format_wall_distance(distance):
+    if distance < 0.0001:
+        return "<0.0001%"
+    if distance < 0.01:
+        return f"{distance:.4f}%"
+    if distance < 1:
+        return f"{distance:.3f}%"
+    return f"{distance:.2f}%"
+
 if nearest_bid and nearest_ask:
     bid_distance = (mid_price - number(nearest_bid["price"])) / mid_price * 100
     ask_distance = (number(nearest_ask["price"]) - mid_price) / mid_price * 100
     liq_a, liq_b = st.columns(2)
-    liq_a.metric("سطح زیر قیمت (خریداران)", fmt_price(nearest_bid["price"]), delta=f"{bid_distance:.2f}% پایین‌تر")
-    liq_b.metric("سطح بالای قیمت (فروشندگان)", fmt_price(nearest_ask["price"]), delta=f"{ask_distance:.2f}% بالاتر")
+    liq_a.metric("دیوار خرید زیر قیمت", fmt_price(nearest_bid["price"]), delta=f"{format_wall_distance(bid_distance)} پایین‌تر")
+    liq_b.metric("دیوار فروش بالای قیمت", fmt_price(nearest_ask["price"]), delta=f"{format_wall_distance(ask_distance)} بالاتر")
     bid_value = number(nearest_bid.get("value"))
     ask_value = number(nearest_ask.get("value"))
     if ask_distance <= bid_distance * 0.85 and ask_value >= bid_value:
@@ -2686,8 +2623,11 @@ if nearest_bid and nearest_ask:
     )
     st.caption("این سطح‌ها دیوارهای سفارش‌اند، نه نقاط دقیق لیکوییدیشن پوزیشن‌ها. سفارش‌های بزرگ ممکن است قبل از اجرا لغو شوند.")
 else:
-    st.info("داده کافی برای مقایسه یک سطح خرید و یک سطح فروش وجود ندارد؛ از روی اطلاعات ناقص جهت تعیین نمی‌کنیم.")
-    st.write("**رفتار پیشنهادی: فعلاً صبر کن.** پس از ظاهر شدن سطح معتبر و بسته‌شدن کندل تأییدی، نقطه ورود را دوباره بررسی کن.")
+    st.info(
+        "در دفتر سفارش فعلی، دیوار خرید و فروشِ معنادار طبق آستانه آماری پیدا نشد. "
+        "بنابراین سطح‌های نزدیکِ بهترین خرید/فروش را به‌اشتباه به‌عنوان دیوار نقدینگی معرفی نمی‌کنیم."
+    )
+    st.write("**نتیجه: فعلاً صبر کن.** دفتر سفارش را دوباره بررسی کن و فقط وقتی سطح معنادار و کندل تأییدی وجود دارد، تصمیم بگیر.")
 
 flows = st.columns(4)
 flows[0].metric("حجم خرید اخیر", fmt_usd(trade_stats["buy_usd"]))
