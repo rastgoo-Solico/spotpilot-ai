@@ -690,11 +690,15 @@ def fetch_lbank_klines(pair, timeframe, size=300):
     df = df[(df["timestamp"] + interval_seconds) <= now_seconds].copy()
     df.reset_index(drop=True, inplace=True)
 
-    if len(df) < 30:
+    # Short lookbacks (for example, 4 daily candles used only to calculate
+    # 24h relative strength) must not be rejected by the 30-candle minimum
+    # intended for longer technical-indicator history.
+    min_required = min(30, requested_size)
+    if len(df) < min_required:
         raise RuntimeError(
             f"پس از دریافت و حذف کندل باز، فقط {len(df)} کندل بسته‌شده برای "
-            f"{pair} ({timeframe}) باقی ماند. پاسخ API یا موجود بودن این جفت‌ارز "
-            "در LBank را بررسی کن."
+            f"{pair} ({timeframe}) باقی ماند؛ حداقل موردنیاز برای این درخواست "
+            f"{min_required} کندل است. پاسخ API یا موجود بودن این جفت‌ارز در LBank را بررسی کن."
         )
 
     df["Time"] = pd.to_datetime(df["timestamp"], unit="s", utc=True)
