@@ -354,7 +354,75 @@ def build_pdf_report(report_data):
 
     add_heading("۱. فهرست ارزهای LiveCoinWatch")
     add_paragraph("فهرست زیر شامل همه ردیف‌های باقی‌مانده پس از اعمال فیلتر حجم فعلی است.")
-    add_table(report_data.get("coins_df"), col_widths=[1.0, 1.1, 1.25, 1.25, 1.15, 1.1, 0.9])
+    add_table(report_data.get("coins_df"), col_widths=[1.0, 1.1, 1.25, 1.25, 1.15, 1.1, 0.9, 0.9])
+    coins_for_quality = report_data.get("coins_df")
+    if coins_for_quality is not None and "کنترل قیمت" in coins_for_quality.columns:
+        flagged = coins_for_quality[coins_for_quality["کنترل قیمت"].astype(str).isin(["بررسی دستی", "قیمت نامعتبر"])]
+        if not flagged.empty:
+            add_paragraph(
+                "هشدار کنترل داده: قیمت یک یا چند نماد غیرعادی یا نامعتبر است و باید با منبع مستقل بررسی شود: "
+                + "، ".join(str(v) for v in flagged["نماد"].tolist()[:12])
+                + ". این برچسب به‌تنهایی اثبات خطای منبع نیست."
+            )
+
+    ratio = report_data.get("btc_xau_metrics") or {}
+    if ratio.get("current") is not None:
+        add_heading("نسبت BTC/XAUT و تخصیص مدل")
+        add_paragraph(
+            f"نرخ متقاطع فعلی: {number(ratio.get('current')):.4f} XAUT برای هر BTC | "
+            f"تغییر ۱روزه: {number(ratio.get('change_1d'), float('nan')):+.2f}% | "
+            f"تغییر ۷روزه: {number(ratio.get('change_7d'), float('nan')):+.2f}%"
+        )
+        if report_data.get("allocation"):
+            add_paragraph(
+                f"خروجی مدل تخصیص: {report_data.get('allocation')} | "
+                f"سهم XAUT: {report_data.get('gold_pct', '—')}% | "
+                f"سهم رمزارز: {report_data.get('crypto_pct', '—')}%"
+            )
+            add_paragraph(str(report_data.get("allocation_reason") or ""))
+        add_paragraph("این نرخ از BTC/USDT تقسیم بر XAUT/USDT ساخته می‌شود؛ نرخ جفت مستقیم نیست.")
+
+    ranking = report_data.get("crypto_ranking") or []
+    if ranking:
+        add_heading("رتبه‌بندی رمزارزها برای بررسی بیشتر")
+        ranking_df = pd.DataFrame(ranking)
+        wanted = [c for c in ["Code", "Priority", "Score", "24h Change %", "BTC Relative %", "Reason"] if c in ranking_df.columns]
+        ranking_df = ranking_df[wanted].head(7).copy()
+        for col in ["24h Change %", "BTC Relative %"]:
+            if col in ranking_df.columns:
+                ranking_df[col] = ranking_df[col].map(lambda v: f"{number(v):+.2f}%" if v is not None and pd.notna(v) else "—")
+        add_table(ranking_df)
+
+    cm_trend = report_data.get("cryptometer_trend") or {}
+    if isinstance(cm_trend, list):
+        cm_trend = next((row for row in reversed(cm_trend) if isinstance(row, dict)), {})
+    if isinstance(cm_trend, dict) and cm_trend:
+        add_heading("شاخص تجمیعی CryptoMeter")
+        add_paragraph(
+            f"امتیاز روند: {cm_trend.get('trend_score', '—')} | "
+            f"فشار خرید: {cm_trend.get('buy_pressure', '—')}% | "
+            f"فشار فروش: {cm_trend.get('sell_pressure', '—')}% | "
+            f"زمان داده: {cm_trend.get('timestamp', '—')}"
+        )
+        add_paragraph("این شاخص تجمیعی چندصرافی است و نماینده اختصاصی LBank نیست.")
+
+    cm_moves = report_data.get("cryptometer_movement_df")
+    if cm_moves is not None and not cm_moves.empty:
+        add_heading("حرکت‌های سریع بازار — CryptoMeter")
+        add_table(cm_moves.head(10))
+
+    liq_summary = report_data.get("liquidity_summary") or {}
+    if liq_summary:
+        add_heading("جمع‌بندی ساده نقدینگی LBank")
+        add_paragraph(
+            f"قیمت میانی: {liq_summary.get('mid', '—')} | "
+            f"دیوار خرید زیر قیمت: {liq_summary.get('bid_price', 'پیدا نشد')} "
+            f"({liq_summary.get('bid_distance', '—')}) | "
+            f"دیوار فروش بالای قیمت: {liq_summary.get('ask_price', 'پیدا نشد')} "
+            f"({liq_summary.get('ask_distance', '—')})"
+        )
+        add_paragraph(str(liq_summary.get("interpretation") or ""))
+        add_paragraph("دیوارها سفارش‌های قابل‌مشاهده‌اند و ممکن است پیش از اجرا لغو شوند.")
 
     add_heading("۲. مقایسه قیمت صرافی‌ها")
     add_table(report_data.get("comparison_df"), col_widths=[1.2, 1.3, 1.1, 1.3])
@@ -417,12 +485,34 @@ def build_pdf_report(report_data):
 
         indicators = result.get("indicators")
         if indicators is not None and not indicators.empty:
-            export_cols = [c for c in ["Time", "Open", "High", "Low", "Close", "Volume", "ATR", "UT Stop", "UT Buy", "UT Sell", "Structure"] if c in indicators.columns]
-            candles_table = indicators.tail(150)[export_cols].copy()
+            interval_seconds = int(TIMEFRAMES.get(tf_name, {}).get("seconds", 0))
+            last_open = pd.to_datetime(summary.get("time"), utc=True, errors="coerce")
+            if pd.notna(last_open) and interval_seconds:
+                candle_close = last_open + pd.Timedelta(seconds=interval_seconds)
+                age_minutes = max(0.0, (pd.Timestamp.now(tz="UTC") - candle_close).total_seconds() / 60)
+                threshold_minutes = interval_seconds / 60 * 2
+                freshness = "تازه" if age_minutes <= threshold_minutes else "با تأخیر؛ تحلیل را با احتیاط بخوان"
+                add_paragraph(
+                    f"تازگی داده: {freshness} | پایان آخرین کندل: {candle_close.strftime('%Y-%m-%d %H:%M UTC')} | "
+                    f"فاصله از پایان کندل: {age_minutes:.0f} دقیقه"
+                )
+            export_cols = [c for c in ["Time", "Close", "ATR", "UT Stop", "UT Buy", "UT Sell", "Structure"] if c in indicators.columns]
+            candles_table = indicators.tail(24)[export_cols].copy()
             if "Time" in candles_table.columns:
-                candles_table["Time"] = pd.to_datetime(candles_table["Time"], utc=True, errors="coerce").dt.strftime("%Y-%m-%d %H:%M UTC")
-            add_paragraph("داده‌های کندل و اندیکاتور مربوط به نمودار (حداکثر ۱۵۰ ردیف آخر):")
-            add_table(candles_table, col_widths=[1.5] + [1.0] * (len(export_cols) - 1))
+                candles_table["Time"] = pd.to_datetime(candles_table["Time"], utc=True, errors="coerce").dt.strftime("%m-%d %H:%M UTC")
+            for col in ["Close", "ATR", "UT Stop"]:
+                if col in candles_table.columns:
+                    candles_table[col] = pd.to_numeric(candles_table[col], errors="coerce").map(lambda v: f"{v:,.2f}" if pd.notna(v) else "—")
+            for col in ["UT Buy", "UT Sell"]:
+                if col in candles_table.columns:
+                    candles_table[col] = candles_table[col].map(lambda v: "بله" if bool(v) else "خیر")
+            candles_table = candles_table.rename(columns={
+                "Time": "زمان (UTC)", "Close": "بسته‌شدن", "ATR": "ATR",
+                "UT Stop": "حد UT", "UT Buy": "سیگنال خرید", "UT Sell": "سیگنال فروش",
+                "Structure": "ساختار",
+            })
+            add_paragraph("آخرین ۲۴ کندل بسته‌شده (برای جزئیات بیشتر از نمودار تعاملی استفاده کن):")
+            add_table(candles_table, col_widths=[1.4, 1.0, 0.9, 1.0, 0.9, 0.9, 1.5])
 
     add_heading("۴. دفتر سفارش و جریان معاملات LBank")
     add_paragraph(
@@ -641,6 +731,11 @@ def fetch_lcw_market(min_btc_volume):
             "Exchanges reported": coin.get("exchanges"),
             "Markets reported": coin.get("markets"),
             "Pairs reported": coin.get("pairs"),
+            "Price check": (
+                "قیمت نامعتبر" if price_usd <= 0
+                else "بررسی دستی" if price_usd >= 1_000_000
+                else "—"
+            ),
         })
 
     pin_rank = {code: index for index, code in enumerate(PINNED_CODES)}
@@ -803,12 +898,7 @@ def fetch_lbank_ticker(pair):
 
 @st.cache_data(ttl=30, show_spinner=False)
 def fetch_lbank_klines(pair, timeframe, size=300):
-    """دریافت کندل‌های عمومی LBank و حذف کندل در حال تشکیل.
-
-    پارامتر time در API کندل LBank زمان برحسب ثانیه است. برای گرفتن
-    تاریخچه باید زمان شروعی در گذشته فرستاده شود؛ ارسال زمان فعلی می‌تواند
-    پاسخ خالی بدهد. timestamp خروجی نیز در صورت نیاز به ثانیه نرمال می‌شود.
-    """
+    """Fetch closed LBank candles in pages; LBank may cap each response at ~150 rows."""
     if timeframe not in TIMEFRAMES:
         raise ValueError("تایم‌فریم پشتیبانی نمی‌شود.")
 
@@ -816,56 +906,81 @@ def fetch_lbank_klines(pair, timeframe, size=300):
     interval_seconds = int(tf["seconds"])
     now_seconds = int(time.time())
     requested_size = min(max(int(size), 1), 2000)
+    target_rows = requested_size + 5
+    cursor = max(0, now_seconds - (target_rows + 3) * interval_seconds)
+    raw_candles = []
+    seen_timestamps = set()
+    max_rounds = int((target_rows + 149) / 150) + 3
 
-    # LBank بر اساس پارامتر time، کندل‌ها را از زمان ارسالی به بعد برمی‌گرداند.
-    # کمی بافر اضافه می‌کنیم تا حذف کندل باز، تعداد کافی کندل باقی بگذارد.
-    start_seconds = max(0, now_seconds - (requested_size + 5) * interval_seconds)
-
-    payload = get_json(
-        f"{LBANK_URL}/kline.do",
-        params={
-            "symbol": pair,
-            "type": tf["type"],
-            "size": requested_size,
-            "time": start_seconds,
-        },
-        timeout=25,
-    )
-
-    if not isinstance(payload, dict) or not is_success(payload):
-        message = payload.get("msg", payload) if isinstance(payload, dict) else payload
-        raise RuntimeError(f"LBank kline API error: {message}")
-
-    raw = payload.get("data") or []
-    if not isinstance(raw, list) or not raw:
-        raise RuntimeError(
-            f"LBank برای {pair} در تایم‌فریم {timeframe} کندلی برنگرداند. "
-            "پارامتر زمان، نماد و پاسخ API را بررسی کن."
+    # Request bounded pages and advance from the last returned candle. A single
+    # size=300 request can be capped by the exchange and leave the newest data out.
+    for _ in range(max_rounds):
+        remaining = target_rows - len(seen_timestamps)
+        if remaining <= 0:
+            break
+        chunk_size = min(150, remaining)
+        payload = get_json(
+            f"{LBANK_URL}/kline.do",
+            params={
+                "symbol": pair,
+                "type": tf["type"],
+                "size": chunk_size,
+                "time": int(cursor),
+            },
+            timeout=25,
         )
+        if not isinstance(payload, dict) or not is_success(payload):
+            message = payload.get("msg", payload) if isinstance(payload, dict) else payload
+            raise RuntimeError(f"LBank kline API error: {message}")
+
+        batch = payload.get("data") or []
+        if not isinstance(batch, list) or not batch:
+            break
+
+        normalized_times = []
+        new_count = 0
+        for candle in batch:
+            if not isinstance(candle, (list, tuple)) or len(candle) < 6:
+                continue
+            timestamp = number(candle[0])
+            if timestamp <= 0:
+                continue
+            if timestamp > 10_000_000_000:
+                timestamp /= 1000.0
+            timestamp = int(timestamp)
+            normalized_times.append(timestamp)
+            if timestamp not in seen_timestamps:
+                raw_candles.append((timestamp, candle))
+                seen_timestamps.add(timestamp)
+                new_count += 1
+
+        if not normalized_times or new_count == 0:
+            break
+        last_timestamp = max(normalized_times)
+        if last_timestamp < cursor:
+            break
+        cursor = last_timestamp + interval_seconds
+
+        if len(batch) < chunk_size:
+            break
 
     rows = []
-    for candle in raw:
-        if not isinstance(candle, (list, tuple)) or len(candle) < 6:
-            continue
-
-        timestamp = number(candle[0])
-        if timestamp <= 0:
-            continue
-        # مستندات LBank ثانیه را مشخص می‌کنند؛ این شرط برای پاسخ‌های
-        # احتمالی با میلی‌ثانیه هم ایمنی اضافه می‌کند.
-        if timestamp > 10_000_000_000:
-            timestamp /= 1000.0
-
+    for timestamp, candle in raw_candles:
         open_price = number(candle[1])
         high_price = number(candle[2])
         low_price = number(candle[3])
         close_price = number(candle[4])
-        volume = number(candle[5])
+        volume = number(candle[5], float("nan"))
         if min(open_price, high_price, low_price, close_price) <= 0:
             continue
-
+        if pd.isna(volume) or volume < 0:
+            continue
+        if high_price < max(open_price, close_price, low_price):
+            continue
+        if low_price > min(open_price, close_price, high_price):
+            continue
         rows.append({
-            "timestamp": int(timestamp),
+            "timestamp": timestamp,
             "Open": open_price,
             "High": high_price,
             "Low": low_price,
@@ -875,33 +990,32 @@ def fetch_lbank_klines(pair, timeframe, size=300):
 
     df = pd.DataFrame(rows)
     if df.empty:
-        raise RuntimeError("ساختار داده‌های کندل LBank قابل استفاده نیست.")
+        raise RuntimeError(
+            f"LBank برای {pair} در تایم‌فریم {timeframe} کندل معتبر برنگرداند."
+        )
 
     df = (
         df.drop_duplicates(subset=["timestamp"])
         .sort_values("timestamp")
         .reset_index(drop=True)
     )
-
-    # timestamp زمان شروع کندل است؛ تنها کندلی را نگه می‌داریم که پایانش
-    # گذشته باشد. این شرط یک کندل اضافی را به اشتباه حذف نمی‌کند.
+    # Keep only candles whose full interval has ended, then retain the requested
+    # newest rows (not the oldest page returned by the exchange).
     df = df[(df["timestamp"] + interval_seconds) <= now_seconds].copy()
-    df.reset_index(drop=True, inplace=True)
+    df = df.tail(requested_size).reset_index(drop=True)
 
-    # Short lookbacks (for example, 4 daily candles used only to calculate
-    # 24h relative strength) must not be rejected by the 30-candle minimum
-    # intended for longer technical-indicator history.
-    min_required = min(30, requested_size)
+    # SMA 200 needs at least 200 closed candles; short relative-strength calls
+    # request only a few candles and keep that smaller requirement.
+    min_required = min(requested_size, 200)
     if len(df) < min_required:
         raise RuntimeError(
-            f"پس از دریافت و حذف کندل باز، فقط {len(df)} کندل بسته‌شده برای "
-            f"{pair} ({timeframe}) باقی ماند؛ حداقل موردنیاز برای این درخواست "
-            f"{min_required} کندل است. پاسخ API یا موجود بودن این جفت‌ارز در LBank را بررسی کن."
+            f"پس از صفحه‌بندی و حذف کندل باز، فقط {len(df)} کندل بسته‌شده برای "
+            f"{pair} ({timeframe}) باقی ماند؛ حداقل موردنیاز {min_required} کندل است. "
+            "پاسخ API یا موجود بودن این جفت‌ارز را بررسی کن."
         )
 
     df["Time"] = pd.to_datetime(df["timestamp"], unit="s", utc=True)
     return df
-
 
 def calculate_atr(df, period=1):
     high = df["High"]
@@ -1823,6 +1937,7 @@ for pinned_code in PINNED_CODES:
             "Price USD": None, "24h Change %": None,
             "Volume USD": None, "Volume BTC equivalent": None,
             "Exchanges reported": None, "Markets reported": None, "Pairs reported": None,
+            "Price check": "داده ناموجود",
         })
 
 coins_df = pd.DataFrame(coins)
@@ -1840,7 +1955,7 @@ coins_df["LBank listed"] = coins_df["Code"].apply(
 display_df = coins_df[
     [
         "Name", "Code", "Price USD", "24h Change %",
-        "Volume USD", "Volume BTC equivalent", "LBank listed",
+        "Volume USD", "Volume BTC equivalent", "LBank listed", "Price check",
     ]
 ].copy()
 display_df = display_df.rename(columns={
@@ -1851,6 +1966,7 @@ display_df = display_df.rename(columns={
     "Volume USD": "حجم ۲۴ساعته (دلار)",
     "Volume BTC equivalent": "حجم معادل BTC",
     "LBank listed": "در LBank",
+    "Price check": "کنترل قیمت",
 })
 display_df["قیمت (دلار)"] = display_df["قیمت (دلار)"].map(fmt_price)
 display_df["حجم ۲۴ساعته (دلار)"] = display_df["حجم ۲۴ساعته (دلار)"].map(fmt_usd)
@@ -2820,6 +2936,26 @@ try:
         "lbank_status": lbank_status,
         "coins_df": display_df,
         "comparison_df": comp_df,
+        "crypto_ranking": locals().get("crypto_ranking", []),
+        "btc_xau_metrics": locals().get("allocation_ratio") or locals().get("btc_xau") or {},
+        "allocation": locals().get("allocation"),
+        "allocation_reason": locals().get("allocation_reason"),
+        "gold_pct": locals().get("gold_pct"),
+        "crypto_pct": locals().get("crypto_pct"),
+        "cryptometer_trend": locals().get("trend"),
+        "cryptometer_movement_df": locals().get("movement_df"),
+        "liquidity_summary": {
+            "mid": fmt_price(mid_price),
+            "bid_price": fmt_price(nearest_bid["price"]) if nearest_bid else None,
+            "ask_price": fmt_price(nearest_ask["price"]) if nearest_ask else None,
+            "bid_distance": format_wall_distance((mid_price - number(nearest_bid["price"])) / mid_price * 100) if nearest_bid and mid_price > 0 else None,
+            "ask_distance": format_wall_distance((number(nearest_ask["price"]) - mid_price) / mid_price * 100) if nearest_ask and mid_price > 0 else None,
+            "interpretation": (
+                "فقط دیوارهای آماری معنادار در نظر گرفته شده‌اند."
+                if nearest_bid and nearest_ask else
+                "حداقل یکی از دو سمت دیوار معنادار ندارد؛ سطح عادی را به‌جای دیوار معرفی نکن."
+            ),
+        },
         "compare_errors": compare_errors,
         "timeframe_results": locals().get("timeframe_results", {}),
         "best_bid": fmt_price(book_stats.get("best_bid")),
