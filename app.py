@@ -2801,12 +2801,12 @@ except Exception as exc:
 
 metrics = st.columns(4)
 metrics[0].metric(
-    "بهترین خرید", fmt_price(book_stats["best_bid"]),
-    help="بالاترین قیمت خریدِ موجود در دفتر سفارش.",
+    "بهترین قیمت خرید (اسپرد)", fmt_price(book_stats["best_bid"]),
+    help="بالاترین قیمت خریدِ موجود در دفتر سفارش؛ این عدد به‌تنهایی محل انباشت نقدینگی نیست.",
 )
 metrics[1].metric(
-    "بهترین فروش", fmt_price(book_stats["best_ask"]),
-    help="پایین‌ترین قیمت فروشِ موجود در دفتر سفارش.",
+    "بهترین قیمت فروش (اسپرد)", fmt_price(book_stats["best_ask"]),
+    help="پایین‌ترین قیمت فروشِ موجود در دفتر سفارش؛ این عدد به‌تنهایی محل انباشت نقدینگی نیست.",
 )
 metrics[2].metric(
     "فاصله خرید و فروش", format_percent(book_stats["spread_pct"]),
@@ -3037,14 +3037,14 @@ try:
         "liquidation_heatmap": locals().get("heatmap"),
         "liquidity_summary": {
             "mid": fmt_price(mid_price),
-            "bid_price": fmt_price(nearest_bid["price"]) if nearest_bid else None,
-            "ask_price": fmt_price(nearest_ask["price"]) if nearest_ask else None,
-            "bid_distance": format_wall_distance((mid_price - number(nearest_bid["price"])) / mid_price * 100) if nearest_bid and mid_price > 0 else None,
-            "ask_distance": format_wall_distance((number(nearest_ask["price"]) - mid_price) / mid_price * 100) if nearest_ask and mid_price > 0 else None,
+            "bid_price": fmt_price(strongest_bid["price"]) if strongest_bid else None,
+            "ask_price": fmt_price(strongest_ask["price"]) if strongest_ask else None,
+            "bid_distance": format_wall_distance((mid_price - number(strongest_bid["price"])) / mid_price * 100) if strongest_bid and mid_price > 0 else None,
+            "ask_distance": format_wall_distance((number(strongest_ask["price"]) - mid_price) / mid_price * 100) if strongest_ask and mid_price > 0 else None,
             "interpretation": (
-                "فقط دیوارهای آماری معنادار در نظر گرفته شده‌اند."
-                if nearest_bid and nearest_ask else
-                "حداقل یکی از دو سمت دیوار معنادار ندارد؛ سطح عادی را به‌جای دیوار معرفی نکن."
+                "سطوح بر اساس ارزش تجمیعی سفارش‌ها در بازه‌های قیمتی ۰٫۱۰٪ رتبه‌بندی شده‌اند؛ این‌ها نقدینگی قابل‌مشاهده‌اند، نه پیش‌بینی قطعی شکار نقدینگی."
+                if strongest_bid and strongest_ask else
+                "داده کافی برای تعیین ناحیه تجمیعی در هر دو سمت وجود ندارد."
             ),
         },
         "compare_errors": compare_errors,
