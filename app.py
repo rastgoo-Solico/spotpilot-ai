@@ -977,6 +977,78 @@ def get_btc_relative_metrics(code, lbank_pairs):
 
 
 @st.cache_data(ttl=180, show_spinner=False)
+def get_btc_xau_metrics(lbank_pairs):
+    """Synthetic BTC/XAUT cross-rate calculated only from real LBank BTC/USDT and XAUT/USDT candles."""
+    btc_pair = "btc_usdt"
+    gold_pair = "xaut_usdt"
+    if btc_pair not in lbank_pairs or gold_pair not in lbank_pairs:
+        return {
+            "current": None, "change_1d": None, "change_7d": None,
+            "source": f"{btc_pair} + {gold_pair}",
+            "method": "برای ساخت نرخ متقاطع، داده واقعی BTC/USDT و XAUT/USDT در LBank لازم است.",
+        }
+
+    btc = fetch_lbank_klines(btc_pair, "روزانه", 40)
+    gold = fetch_lbank_klines(gold_pair, "روزانه", 40)
+    joined = pd.merge(
+        btc[["timestamp", "Close"]].rename(columns={"Close": "btc_usdt"}),
+        gold[["timestamp", "Close"]].rename(columns={"Close": "xaut_usdt"}),
+        on="timestamp", how="inner",
+    )
+    joined = joined[(joined["btc_usdt"] > 0) & (joined["xaut_usdt"] > 0)]
+    if len(joined) < 8:
+        return {
+            "current": None, "change_1d": None, "change_7d": None,
+            "source": f"{btc_pair} + {gold_pair}",
+            "method": "برای محاسبه تغییر یک‌روزه و هفت‌روزه، کندل بسته‌شده کافی نیست.",
+        }
+
+    ratio = joined["btc_usdt"] / joined["xaut_usdt"]
+    current = float(ratio.iloc[-1])
+    prev = float(ratio.iloc[-2])
+    week_ago = float(ratio.iloc[-8])
+    return {
+        "current": current,
+        "change_1d": (current / prev - 1) * 100 if prev > 0 else None,
+        "change_7d": (current / week_ago - 1) * 100 if week_ago > 0 else None,
+        "source": f"{btc_pair} + {gold_pair}",
+        "method": "نرخ متقاطع مصنوعی BTC/XAUT = قیمت BTC/USDT ÷ قیمت XAUT/USDT؛ قیمت جفت مستقیم ادعا نمی‌شود.",
+    }
+
+
+def get_asset_trend_score(code, lbank_pairs, atr_period=14, ut_multiplier=2.0):
+    """Small rule-based trend score from closed 4h and daily LBank candles."""
+    pair = lbank_symbol_from_code(code)
+    if pair not in lbank_pairs:
+        return {"score": None, "notes": [f"{pair} در LBank موجود نیست."]}
+    score = 0
+    notes = []
+    for timeframe in ("4 ساعت", "روزانه"):
+        try:
+            candles = fetch_lbank_klines(pair, timeframe, 100)
+            indicators = add_market_indicators(candles, atr_period, ut_multiplier)
+            summary = latest_signal_summary(indicators)
+            if summary["buy_signal"]:
+                score += 2
+                notes.append(f"{timeframe}: سیگنال خرید UT")
+            elif summary["sell_signal"]:
+                score -= 2
+                notes.append(f"{timeframe}: سیگنال فروش UT")
+            last = indicators.iloc[-1]
+            ma50 = number(last.get("SMA 50"), float("nan"))
+            ma200 = number(last.get("SMA 200"), float("nan"))
+            if pd.notna(ma50) and pd.notna(ma200):
+                if summary["close"] > ma50 > ma200:
+                    score += 1
+                    notes.append(f"{timeframe}: روند میانگین‌ها صعودی")
+                elif summary["close"] < ma50 < ma200:
+                    score -= 1
+                    notes.append(f"{timeframe}: روند میانگین‌ها نزولی")
+        except Exception as exc:
+            notes.append(f"{timeframe}: داده کافی نیست ({type(exc).__name__})")
+    return {"score": score, "notes": notes}
+
+
 def fetch_free_liquidation_heatmap(symbol="BTC", window_minutes=240, price_buckets=50):
     """Free public endpoint: observed executed liquidations, not projected liquidation levels."""
     response = requests.get(
@@ -1595,6 +1667,27 @@ try:
 except Exception as exc:
     st.warning(f"تحلیل نسبت به BTC انجام نشد؛ داده واقعی کافی نیست: {type(exc).__name__}: {str(exc)[:180]}")
 
+if selected_code in ("BTC", "XAUT"):
+    st.markdown("#### نسبت بیت‌کوین به طلا (BTC/XAUT)")
+    try:
+        btc_xau = get_btc_xau_metrics(lbank_pairs)
+        if btc_xau["current"] is None:
+            st.info(btc_xau["method"])
+        else:
+            q1, q2, q3 = st.columns(3)
+            q1.metric("BTC/XAUT مصنوعی", f"{btc_xau['current']:.4f} XAUT برای هر BTC")
+            q2.metric("تغییر یک‌روزه", f"{btc_xau['change_1d']:+.2f}%")
+            q3.metric("تغییر هفت‌روزه", f"{btc_xau['change_7d']:+.2f}%")
+            st.caption(btc_xau["method"])
+            if btc_xau["change_7d"] >= 2 and btc_xau["change_1d"] > 0:
+                st.success("قدرت نسبی فعلاً به نفع بیت‌کوین است: با هر BTC طلای بیشتری می‌توان خرید. این به‌تنهایی سیگنال ورود نیست.")
+            elif btc_xau["change_7d"] <= -2 and btc_xau["change_1d"] < 0:
+                st.warning("قدرت نسبی فعلاً به نفع طلا (XAUT) است: ارزش BTC نسبت به طلا افت کرده است.")
+            else:
+                st.info("برتری نسبی روشن نیست؛ برای تصمیم، روند ۴ساعته/روزانه و نقاط ورود را هم تأیید کن.")
+    except Exception as exc:
+        st.warning(f"محاسبه BTC/XAUT انجام نشد: {type(exc).__name__}: {str(exc)[:160]}")
+
 st.divider()
 st.subheader("۴. تحلیل تکنیکال")
 st.caption(
@@ -1925,10 +2018,20 @@ with st.expander("نقشه رایگان لیکوییدیشن BTC (بدون کل�
                 st.dataframe(pd.DataFrame(cluster_rows), use_container_width=True, hide_index=True)
             elif heatmap.get("note"):
                 st.info(str(heatmap["note"]))
+            long_total = number(sides.get("long", totals.get("long_liq_notional")))
+            short_total = number(sides.get("short", totals.get("short_liq_notional")))
+            if long_total > 0 or short_total > 0:
+                if short_total >= long_total * 1.25 and short_total > 0:
+                    st.info("تفسیر گذشته‌نگر: لیکوییدیشن شورت‌ها بیشتر بوده؛ در این بازه خریدهای اجباریِ بستن شورت غالب بوده‌اند. این ثابت نمی‌کند که قیمت بعداً به نقدینگی بالاتر می‌رود.")
+                elif long_total >= short_total * 1.25 and long_total > 0:
+                    st.info("تفسیر گذشته‌نگر: لیکوییدیشن لانگ‌ها بیشتر بوده؛ در این بازه فروش‌های اجباریِ بستن لانگ غالب بوده‌اند. این ثابت نمی‌کند که قیمت بعداً به نقدینگی پایین‌تر می‌رود.")
+                else:
+                    st.info("تفسیر گذشته‌نگر: لیکوییدیشن لانگ و شورت نسبتاً نزدیک‌اند؛ از این داده به‌تنهایی جهت بعدی قابل استنتاج نیست.")
             st.caption(
                 "این داده‌ها لیکوییدیشن‌هایی هستند که واقعاً در جریان زنده صرافی‌ها ثبت شده‌اند؛ "
-                "آن‌ها محل تجمع سفارش‌های آینده یا پیش‌بینی قیمت نیستند. بازارهای منبع شامل Binance، "
-                "OKX، Bybit، Bitget و BitMEX هستند و لزوماً مختص LBank نیستند."
+                "آن‌ها محل تجمع سفارش‌های آینده یا پیش‌بینی قیمت نیستند. برای سطح‌های تخمینیِ هنوز مصرف‌نشده، "
+                "نقشه LiqMap را جداگانه بررسی کن. بازارهای منبع شامل Binance، OKX، Bybit، Bitget و BitMEX هستند "
+                "و لزوماً مختص LBank نیستند."
             )
         else:
             st.info(f"نقشه رایگان فعلاً در دسترس نیست: {heatmap_error}")
@@ -1991,6 +2094,36 @@ elif book_stats["imbalance"] < 0:
     st.info("در لحظه دریافت داده، ارزش سفارش‌های فروشِ قابل‌مشاهده بیشتر است؛ این به‌تنهایی به معنی افت قیمت نیست.")
 else:
     st.info("در لحظه دریافت داده، عدم‌تعادل دفتر سفارش نزدیک به صفر است.")
+
+# Interpret the nearest visible bid/ask walls as conditional liquidity scenarios.
+mid_price = number(book_stats.get("mid"))
+near_bids = [w for w in book_stats.get("bid_walls", []) if number(w.get("price")) < mid_price]
+near_asks = [w for w in book_stats.get("ask_walls", []) if number(w.get("price")) > mid_price]
+nearest_bid = max(near_bids, key=lambda w: number(w.get("price"))) if near_bids else None
+nearest_ask = min(near_asks, key=lambda w: number(w.get("price"))) if near_asks else None
+st.markdown("#### تفسیر عملی نقدینگی نزدیک قیمت")
+if nearest_bid and nearest_ask:
+    bid_distance = (mid_price - number(nearest_bid["price"])) / mid_price * 100
+    ask_distance = (number(nearest_ask["price"]) - mid_price) / mid_price * 100
+    liq_a, liq_b = st.columns(2)
+    liq_a.metric("نزدیک‌ترین دیوار خرید زیر قیمت", fmt_price(nearest_bid["price"]), delta=f"{bid_distance:.2f}% فاصله")
+    liq_b.metric("نزدیک‌ترین دیوار فروش بالای قیمت", fmt_price(nearest_ask["price"]), delta=f"{ask_distance:.2f}% فاصله")
+    if ask_distance < bid_distance * 0.8 and number(nearest_ask.get("value")) >= number(nearest_bid.get("value")):
+        st.write("**سناریوی نزدیک‌تر: حرکت به سمت دیوار فروش بالایی.** اگر قیمت با حجم و کندل‌های بسته‌شده رو به بالا حرکت کند، آن ناحیه می‌تواند آزمایش شود؛ در برخورد، دنبال شکست و تثبیت یا رد قیمت باش، نه خرید کورکورانه.")
+    elif bid_distance < ask_distance * 0.8 and number(nearest_bid.get("value")) >= number(nearest_ask.get("value")):
+        st.write("**سناریوی نزدیک‌تر: آزمایش دیوار خرید پایینی.** اگر فشار فروش ادامه یابد، قیمت می‌تواند آن ناحیه را آزمایش کند؛ پس از نفوذ، فقط برگشت و تثبیت بالای سطح می‌تواند نشانه دفاع خریداران باشد.")
+    else:
+        st.write("**جهت جمع‌آوری نقدینگی نامشخص است.** دو سمت از نظر فاصله/اندازه برتری واضحی ندارند؛ منتظر شکست و تثبیت یا sweep و بازپس‌گیری سطح بمان.")
+    st.caption("این فقط مقایسه دیوارهای قابل‌مشاهده دفتر سفارش همین صرافی است، نه نقشه پوزیشن‌های لیکوییدشدنی. سفارش‌ها ممکن است پیش از اجرا لغو شوند.")
+else:
+    st.info("برای تعیین سطح نزدیک‌تر، دیوار خرید و فروش معتبر کافی دریافت نشد؛ از روی داده ناقص جهت جمع‌آوری نقدینگی تعیین نمی‌شود.")
+
+st.markdown("**وقتی قیمت به سطح می‌رسد چه کنم؟**")
+st.markdown(
+    "- **نزدیک سطح خرید/حمایت:** خرید را تنها با واکنش صعودیِ تأییدشده (sweep زیر سطح و بازپس‌گیری، یا شکست مقاومت خرد) بررسی کن؛ اگر قیمت زیر سطح تثبیت شد، سناریوی خرید باطل است.\n"
+    "- **نزدیک سطح فروش/مقاومت:** اگر قیمت رد شد و زیر سطح برگشت، از ورود تازه به خرید پرهیز کن و برای داراییِ موجود، خروج پله‌ای را بررسی کن؛ اگر بالای سطح شکست و تثبیت شد، فروش زودهنگام می‌تواند اشتباه باشد.\n"
+    "- **درست روی سطح وارد نشو:** ورود پس از تأیید، حد ابطال پشت سطح، و اندازه موقعیت متناسب با ریسک؛ در بازار اسپات، سیگنال فروش معمولاً یعنی کاهش/عدم افزودن دارایی، نه الزاماً شورت."
+)
 
 flows = st.columns(4)
 flows[0].metric("حجم خرید اخیر", fmt_usd(trade_stats["buy_usd"]))
@@ -2063,6 +2196,49 @@ else:
     st.info(
         "سطوح قابل استفاده برای سناریوی ورود و خروج از داده فعلی به دست نیامدند."
     )
+
+st.divider()
+st.subheader("۶. جمع‌بندی تصمیم: طلا، رمزارز یا ترکیب؟")
+st.caption("قاعده‌ای شفاف بر پایه نسبت BTC/XAUT و روند واقعی ۴ساعته/روزانه BTC و XAUT؛ این پیشنهاد خودکار است، شخصی‌سازی مالی نیست و هیچ سفارشی ثبت نمی‌کند.")
+try:
+    allocation_ratio = get_btc_xau_metrics(lbank_pairs)
+    btc_trend = get_asset_trend_score("BTC", lbank_pairs, int(atr_period), float(ut_multiplier))
+    gold_trend = get_asset_trend_score("XAUT", lbank_pairs, int(atr_period), float(ut_multiplier))
+    ratio_week = allocation_ratio.get("change_7d")
+    ratio_day = allocation_ratio.get("change_1d")
+    btc_score = btc_trend.get("score")
+    gold_score = gold_trend.get("score")
+
+    if ratio_week is None or ratio_day is None or btc_score is None or gold_score is None:
+        allocation = "ترکیب ۵۰٪ طلا + ۵۰٪ رمزارز"
+        allocation_reason = "داده کافی برای برتری معتبر یک طرف نداریم؛ پیش‌فرض محافظه‌کارانه‌ترِ این مدل ترکیب است، نه ۱۰۰٪ یک دارایی."
+        gold_pct, crypto_pct = 50, 50
+    elif ratio_week >= 2 and ratio_day > 0 and btc_score >= 1 and gold_score <= 0:
+        allocation = "۱۰۰٪ رمزارز"
+        allocation_reason = "BTC/XAUT در هفته تقویت شده، تغییر روزانه هم مثبت است و روند BTC از XAUT قوی‌تر است. در سبد رمزارز، BTC گزینه اصلی این سیگنال است؛ آلت‌کوین‌ها فقط با قدرت نسبی مثبت نسبت به BTC."
+        gold_pct, crypto_pct = 0, 100
+    elif ratio_week <= -2 and ratio_day < 0 and gold_score >= 1 and btc_score <= 0:
+        allocation = "۱۰۰٪ طلا (XAUT)"
+        allocation_reason = "BTC/XAUT در هفته افت کرده، تغییر روزانه هم منفی است و روند XAUT از BTC قوی‌تر است؛ این یعنی طلا در بازه بررسی‌شده قدرت نسبی بیشتری داشته است."
+        gold_pct, crypto_pct = 100, 0
+    else:
+        allocation = "ترکیب ۵۰٪ طلا + ۵۰٪ رمزارز"
+        allocation_reason = "نسبت BTC/XAUT و روندهای تکنیکال تأیید هم‌زمان و قوی نمی‌دهند؛ بنابراین این مدل از شرط‌بندی ۱۰۰٪ روی یک سمت اجتناب می‌کند."
+        gold_pct, crypto_pct = 50, 50
+
+    st.subheader(f"پیشنهاد فعلی مدل: {allocation}")
+    ac1, ac2, ac3 = st.columns(3)
+    ac1.metric("سهم طلا (XAUT)", f"{gold_pct}%")
+    ac2.metric("سهم رمزارز", f"{crypto_pct}%")
+    ac3.metric("تغییر هفت‌روزه BTC/XAUT", f"{ratio_week:+.2f}%" if ratio_week is not None else "داده ناکافی")
+    st.write(allocation_reason)
+    st.caption("کنترل‌های تأیید: " + "؛ ".join((btc_trend.get("notes") or []) + (gold_trend.get("notes") or []) + [allocation_ratio.get("method", "")]))
+    st.markdown(
+        "**چطور اجرا را مدیریت کنی؟** ورود یک‌باره نکن؛ در صورت تصمیم به اجرا، پله‌ای وارد شو. اگر قیمت به سطح نقدینگی رسید، تا واکنش و بسته‌شدن کندل صبر کن. در سناریوی خرید، حد ابطال باید پیش از ورود مشخص باشد. XAUT توکن طلای دیجیتال است، نه طلای فیزیکی، و ریسک ناشر/امانت‌داری و صرافی دارد."
+    )
+except Exception as exc:
+    st.warning(f"جمع‌بندی تخصیص به‌دلیل نبود داده واقعی کامل نشد: {type(exc).__name__}: {str(exc)[:180]}")
+    st.info("تا زمان دسترسی به داده، مدل درصد ۱۰۰٪ طلا یا ۱۰۰٪ رمزارز را توصیه نمی‌کند؛ نسبت BTC/XAUT و روندهای BTC و XAUT را دوباره بررسی کن.")
 
 st.warning(
     "این برنامه از داده‌های عمومی بازار استفاده می‌کند و معامله‌ای ثبت نمی‌کند. "
