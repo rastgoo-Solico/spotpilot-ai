@@ -977,43 +977,60 @@ def get_btc_relative_metrics(code, lbank_pairs):
 
 
 @st.cache_data(ttl=180, show_spinner=False)
-def fetch_coinglass_heatmap(symbol="BTCUSDT", time_range="3d"):
-    api_key = ""
-    try:
-        api_key = str(st.secrets["COINGLASS_API_KEY"]).strip()
-    except Exception:
-        api_key = ""
-    if not api_key:
-        return None, "کلید COINGLASS_API_KEY تنظیم نشده است."
-
+def fetch_free_liquidation_heatmap(symbol="BTC", window_minutes=240, price_buckets=50):
+    """Free public endpoint: observed executed liquidations, not projected liquidation levels."""
     response = requests.get(
-        "https://open-api-v4.coinglass.com/api/futures/liquidation/heatmap/model1",
-        params={"exchange": "Binance", "symbol": symbol, "range": time_range},
-        headers={"accept": "application/json", "CG-API-KEY": api_key},
+        "https://api.smartmoneyapi.com/v1/liquidations/heatmap",
+        params={
+            "symbol": symbol,
+            "window_minutes": int(window_minutes),
+            "price_buckets": int(price_buckets),
+        },
+        headers={"accept": "application/json"},
         timeout=25,
     )
     response.raise_for_status()
     payload = response.json()
-    if str(payload.get("code")) != "0" or not isinstance(payload.get("data"), dict):
-        return None, str(payload.get("msg") or "پاسخ معتبر از CoinGlass دریافت نشد.")
-    data = payload["data"]
-    y_axis = data.get("y_axis") or []
-    liquidation = data.get("liquidation_leverage_data") or []
-    candles = data.get("price_candlesticks") or []
-    if not y_axis or not liquidation or not candles:
-        return None, "پاسخ API داده کافی برای ساخت نقشه حرارتی ندارد."
-    x_count = len(candles)
-    z = [[None for _ in range(x_count)] for _ in y_axis]
-    for point in liquidation:
-        if not isinstance(point, (list, tuple)) or len(point) < 3:
-            continue
-        xi = int(number(point[0], -1))
-        yi = int(number(point[1], -1))
-        value = number(point[2])
-        if 0 <= xi < x_count and 0 <= yi < len(y_axis):
-            z[yi][xi] = (z[yi][xi] or 0) + value
-    x_values = [datetime.fromtimestamp(number(c[0]), tz=timezone.utc) for c in candles]
-    return {"x": x_values, "y": y_axis, "z": z}, None
+    if not isinstance(payload, dict):
+        return None, "پاسخ API در قالب مورد انتظار نیست."
+
+    prices = payload.get("price_levels") or []
+    times = payload.get("time_buckets") or []
+    matrix = payload.get("matrix") or []
+    clusters = payload.get("clusters") or []
+    if not prices or not times or not matrix:
+        return {
+            "clusters": clusters,
+            "totals": payload.get("totals") or {},
+            "by_side": payload.get("by_side") or {},
+            "note": payload.get("note") or "در بازه انتخاب‌شده لیکوییدیشن ثبت‌شده کافی موجود نیست.",
+            "public": payload.get("public", True),
+        }, None
+
+    # Normalize the provider's matrix to Plotly's [price rows][time columns].
+    if len(matrix) == len(times) and matrix and len(matrix[0]) == len(prices):
+        z = [list(row) for row in zip(*matrix)]
+    elif len(matrix) == len(prices) and matrix and len(matrix[0]) == len(times):
+        z = matrix
+    else:
+        return None, "ابعاد ماتریس لیکوییدیشن با محورهای قیمت/زمان سازگار نیست."
+
+    x_values = []
+    for value in times:
+        timestamp = number(value, None)
+        if timestamp is not None:
+            # Normalize milliseconds if the provider ever returns them.
+            if timestamp > 10_000_000_000:
+                timestamp /= 1000.0
+            x_values.append(datetime.fromtimestamp(timestamp, tz=timezone.utc))
+        else:
+            x_values.append(str(value))
+    return {
+        "x": x_values, "y": prices, "z": z, "clusters": clusters,
+        "totals": payload.get("totals") or {},
+        "by_side": payload.get("by_side") or {},
+        "note": payload.get("note"), "public": payload.get("public", True),
+    }, None
 
 
 # -------------------- Other exchanges: comparison only --------------------
@@ -1863,37 +1880,61 @@ st.divider()
 st.subheader("۵. نقدینگی و معاملات اخیر LBank")
 st.caption(
     "دفتر سفارش LBank نقدینگیِ سفارش‌های قابل‌مشاهده همین صرافی را نشان می‌دهد. "
-    "نقشه CoinGlass تخمینی از سطوح احتمالی لیکوییدیشن در بازار فیوچرز است و با دفتر سفارش فرق دارد."
+    "نقشه لیکوییدیشن رایگان، معاملات لیکوییدشده واقعی را از چند بازار فیوچرز جمع می‌کند؛ "
+    "این داده با سفارش‌های اسپات یا برآورد موقعیت‌های هنوز لیکوییدنشده فرق دارد."
 )
-with st.expander("نقشه لیکوییدیشن CoinGlass (اختیاری)", expanded=False):
+with st.expander("نقشه رایگان لیکوییدیشن BTC (بدون کلید API)", expanded=False):
     st.markdown(
-        f"نقشه اصلی را هم می‌توانی در [CoinGlass باز کنی]({COINGLASS_HEATMAP_URL}). "
-        "برای نمایش نقشه داخل این برنامه، کلید API معتبر CoinGlass را در Streamlit Secrets "
-        "با نام COINGLASS_API_KEY قرار بده. طبق مستندات رسمی، endpoint نقشه حرارتی به پلن "
-        "Professional یا Enterprise نیاز دارد؛ بدون دسترسی API هیچ داده‌ای جعل یا تخمین زده نمی‌شود."
+        "این نقشه از API عمومی SmartMoneyAPI استفاده می‌کند؛ طبق مستندات ارائه‌دهنده، "
+        "بدون کلید و رایگان است اما محدودیت درخواست بر اساس IP دارد. "
+        "برای نقشه تخمینی سطوح احتمالی (نه لیکوییدیشن‌های انجام‌شده)، "
+        "[LiqMap رایگان و متن‌باز را باز کن](https://liqmap.smithblock.ai/). "
+        f"همچنین [نقشه CoinGlass]({COINGLASS_HEATMAP_URL}) برای مشاهده دستی در دسترس است."
     )
     try:
-        heatmap, heatmap_error = fetch_coinglass_heatmap("BTCUSDT", "3d")
+        heatmap, heatmap_error = fetch_free_liquidation_heatmap("BTC", 240, 50)
         if heatmap:
-            fig_liq = go.Figure(data=go.Heatmap(
-                x=heatmap["x"], y=heatmap["y"], z=heatmap["z"],
-                colorscale="Turbo", colorbar={"title": "برآورد لیکوییدیشن"},
-                hovertemplate="زمان: %{x}<br>قیمت: %{y:,.2f}<br>مقدار: %{z:,.0f}<extra></extra>",
-            ))
-            fig_liq.update_layout(
-                title="BTCUSDT — نقشه حرارتی لیکوییدیشن Binance (۳ روز)",
-                xaxis_title="زمان (UTC)", yaxis_title="سطح قیمت (USDT)", height=520,
-            )
-            st.plotly_chart(fig_liq, use_container_width=True)
+            totals = heatmap.get("totals") or {}
+            sides = heatmap.get("by_side") or {}
+            m1, m2, m3 = st.columns(3)
+            m1.metric("مجموع لیکوییدیشن ثبت‌شده", fmt_usd(number(totals.get("total_notional"))))
+            m2.metric("لیکوییدیشن پوزیشن‌های لانگ", fmt_usd(number(sides.get("long", totals.get("long_liq_notional")))))
+            m3.metric("لیکوییدیشن پوزیشن‌های شورت", fmt_usd(number(sides.get("short", totals.get("short_liq_notional")))))
+            if heatmap.get("z"):
+                fig_liq = go.Figure(data=go.Heatmap(
+                    x=heatmap["x"], y=heatmap["y"], z=heatmap["z"],
+                    colorscale="Turbo", colorbar={"title": "لیکوییدیشن ثبت‌شده"},
+                    hovertemplate="زمان: %{x}<br>قیمت: %{y:,.2f}<br>مقدار: %{z:,.0f}<extra></extra>",
+                ))
+                fig_liq.update_layout(
+                    title="BTC — لیکوییدیشن‌های واقعی ثبت‌شده در ۴ ساعت اخیر",
+                    xaxis_title="زمان (UTC)", yaxis_title="قیمت (USDT)", height=500,
+                )
+                st.plotly_chart(fig_liq, use_container_width=True)
+            clusters = heatmap.get("clusters") or []
+            if clusters:
+                cluster_rows = []
+                for cluster in clusters[:12]:
+                    cluster_rows.append({
+                        "قیمت": fmt_price(number(cluster.get("price"))),
+                        "مبلغ لیکوییدشده": fmt_usd(number(cluster.get("notional"))),
+                        "لانگ": fmt_usd(number(cluster.get("long_notional"))),
+                        "شورت": fmt_usd(number(cluster.get("short_notional"))),
+                        "تعداد": int(number(cluster.get("count"))),
+                    })
+                st.dataframe(pd.DataFrame(cluster_rows), use_container_width=True, hide_index=True)
+            elif heatmap.get("note"):
+                st.info(str(heatmap["note"]))
             st.caption(
-                "این نقشه مربوط به فیوچرز Binance است، نه بازار اسپات LBank؛ "
-                "سطوح مدل‌شده تخمینی‌اند و تضمین نمی‌کنند لیکوییدیشن واقعاً در آن قیمت رخ دهد."
+                "این داده‌ها لیکوییدیشن‌هایی هستند که واقعاً در جریان زنده صرافی‌ها ثبت شده‌اند؛ "
+                "آن‌ها محل تجمع سفارش‌های آینده یا پیش‌بینی قیمت نیستند. بازارهای منبع شامل Binance، "
+                "OKX، Bybit، Bitget و BitMEX هستند و لزوماً مختص LBank نیستند."
             )
         else:
-            st.info(f"نقشه داخلی فعلاً در دسترس نیست: {heatmap_error}")
+            st.info(f"نقشه رایگان فعلاً در دسترس نیست: {heatmap_error}")
     except Exception as exc:
         st.warning(
-            "دریافت نقشه CoinGlass ناموفق بود. کلید API، سطح دسترسی پلن و محدودیت درخواست را بررسی کن. "
+            "دریافت نقشه رایگان ناموفق بود؛ ممکن است API موقتاً در دسترس نباشد یا محدودیت IP فعال شده باشد. "
             f"جزئیات: {type(exc).__name__}: {str(exc)[:180]}"
         )
 
