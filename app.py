@@ -41,48 +41,129 @@ st.set_page_config(page_title="SpotPilot AI", page_icon="📊", layout="wide")
 st.markdown(
     """
     <style>
-    html, body, .stApp, [data-testid="stAppViewContainer"] {
+    /* B Nazanin web font. If the CDN is unavailable, fall back gracefully. */
+    @font-face {
+        font-family: "BNazanin";
+        src: url("https://cdn.jsdelivr.net/gh/peymanx/persian-fonts@main/B_Nazanin/BNazanin.woff") format("woff");
+        font-style: normal;
+        font-weight: 400;
+        font-display: swap;
+    }
+
+    :root {
+        --spotpilot-persian-font: "BNazanin", "B Nazanin", Tahoma, sans-serif;
+    }
+
+    html, body, .stApp, [data-testid="stAppViewContainer"],
+    [data-testid="stHeader"], [data-testid="stMain"],
+    [data-testid="stMainBlockContainer"], [data-testid="stSidebar"],
+    [data-testid="stSidebarContent"], [data-testid="stBottom"],
+    [data-testid="stPopover"], [data-testid="stDialog"] {
+        direction: rtl;
+        text-align: right;
+        font-family: var(--spotpilot-persian-font) !important;
+    }
+
+    /* Keep the same font throughout Streamlit controls and readable text,
+       without overriding Streamlit's icon fonts. */
+    .stApp p, .stApp span:not(.material-icons):not(.material-symbols-rounded),
+    .stApp label, .stApp button, .stApp input, .stApp textarea,
+    .stApp select, .stApp option, .stApp h1, .stApp h2, .stApp h3,
+    .stApp h4, .stApp h5, .stApp h6, .stApp li, .stApp td, .stApp th,
+    .stApp [data-testid="stMarkdownContainer"],
+    .stApp [data-testid="stWidgetLabel"],
+    .stApp [data-testid="stCaptionContainer"],
+    .stApp [data-testid="stAlert"],
+    .stApp [data-testid="stMetric"],
+    .stApp [data-testid="stExpander"],
+    .stApp [data-testid="stTooltipContent"],
+    [role="listbox"], [role="option"], [role="menu"], [role="menuitem"] {
+        font-family: var(--spotpilot-persian-font) !important;
         direction: rtl;
         text-align: right;
     }
+
     .block-container {
         max-width: 1500px;
         padding-top: 1.4rem;
         padding-bottom: 2.5rem;
     }
-    [data-testid="stSidebar"] * {
+
+    [data-testid="stSidebar"],
+    [data-testid="stSidebar"] *:not(svg):not(path):not(.material-icons):not(.material-symbols-rounded) {
         text-align: right;
     }
-    .stMarkdown, .stCaption, .stAlert, .stMetric,
-    [data-testid="stWidgetLabel"], [data-testid="stExpander"] {
+
+    [data-testid="stHorizontalBlock"] {
+        direction: rtl;
+    }
+
+    [data-testid="stVerticalBlock"],
+    [data-testid="stExpander"],
+    [data-testid="stForm"],
+    [data-testid="stAlert"],
+    [data-testid="stNotificationContent"] {
         direction: rtl;
         text-align: right;
     }
+
     [data-testid="stMetricLabel"], [data-testid="stMetricValue"],
     [data-testid="stMetricDelta"] {
         justify-content: flex-start;
         text-align: right;
-    }
-    [data-testid="stDataFrame"], [data-testid="stTable"] {
         direction: rtl;
     }
-    .stSelectbox label, .stNumberInput label, .stSlider label {
+
+    [data-testid="stDataFrame"], [data-testid="stTable"],
+    [data-testid="stDataEditor"] {
+        direction: rtl;
         text-align: right;
     }
-    .stMarkdown ul, .stMarkdown ol {
+
+    .stSelectbox label, .stMultiSelect label, .stNumberInput label,
+    .stSlider label, .stTextInput label, .stTextArea label,
+    .stDateInput label, .stTimeInput label, .stRadio label,
+    .stCheckbox label, .stFileUploader label {
+        text-align: right;
+        direction: rtl;
+    }
+
+    .stMarkdown ul, .stMarkdown ol,
+    [data-testid="stMarkdownContainer"] ul,
+    [data-testid="stMarkdownContainer"] ol {
         padding-right: 1.5rem;
         padding-left: 0;
     }
-    .stButton, .stDownloadButton {
+
+    .stButton, .stDownloadButton, [data-testid="stButton"],
+    [data-testid="stDownloadButton"] {
         direction: rtl;
+        text-align: right;
     }
+
     .stTabs [data-baseweb="tab-list"] {
         direction: rtl;
     }
-    code, pre, .stCode {
+
+    [data-baseweb="select"] > div,
+    [data-baseweb="input"] > div,
+    [data-baseweb="textarea"] {
+        direction: rtl;
+        text-align: right;
+    }
+
+    /* Keep code, API pairs, timestamps, and numeric values in their natural order. */
+    code, pre, .stCode, [data-testid="stCode"],
+    .stDataFrame code, .stTable code {
         direction: ltr;
         text-align: left;
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace !important;
     }
+
+    svg, path, .material-icons, .material-symbols-rounded {
+        font-family: inherit;
+    }
+
     </style>
     """,
     unsafe_allow_html=True,
@@ -2066,6 +2147,7 @@ with st.expander("تحلیل حرفه‌ای بازار | مقایسه قیمت�
                         xaxis={"rangeslider": {"visible": False}, "showgrid": True},
                         yaxis={"side": "right", "showgrid": True},
                         template="plotly_white",
+                        font={"family": "BNazanin, B Nazanin, Tahoma, sans-serif", "size": 14},
                     )
                     st.plotly_chart(
                         fig,
@@ -2189,6 +2271,7 @@ with st.expander("تحلیل حرفه‌ای بازار | مقایسه قیمت�
                     fig_liq.update_layout(
                         title="BTC — لیکوییدیشن‌های واقعی ثبت‌شده در ۴ ساعت اخیر",
                         xaxis_title="زمان (UTC)", yaxis_title="قیمت (USDT)", height=500,
+                        font={"family": "BNazanin, B Nazanin, Tahoma, sans-serif", "size": 14},
                     )
                     st.plotly_chart(fig_liq, use_container_width=True)
                 clusters = heatmap.get("clusters") or []
