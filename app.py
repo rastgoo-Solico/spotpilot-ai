@@ -406,10 +406,42 @@ def build_pdf_report(report_data):
         )
         add_paragraph("این شاخص تجمیعی چندصرافی است و نماینده اختصاصی LBank نیست.")
 
+    cm_book = report_data.get("cryptometer_book_df")
+    if cm_book is not None and not cm_book.empty:
+        add_heading("دفتر سفارش تجمیعی چندصرافی — CryptoMeter")
+        add_table(cm_book.head(10))
+
     cm_moves = report_data.get("cryptometer_movement_df")
     if cm_moves is not None and not cm_moves.empty:
         add_heading("حرکت‌های سریع بازار — CryptoMeter")
         add_table(cm_moves.head(10))
+
+    cm_movers = report_data.get("cryptometer_movers_df")
+    if cm_movers is not None and not cm_movers.empty:
+        add_heading("بازار اسپات Binance — تیکرهای پرحجم")
+        add_table(cm_movers.head(10))
+
+    liquidation = report_data.get("liquidation_heatmap") or {}
+    if liquidation:
+        totals = liquidation.get("totals") or {}
+        sides = liquidation.get("by_side") or {}
+        add_heading("لیکوییدیشن‌های ثبت‌شده در ۴ ساعت اخیر")
+        add_paragraph(
+            f"مجموع ثبت‌شده: {fmt_usd(number(totals.get('total_notional')))} | "
+            f"لانگ: {fmt_usd(number(sides.get('long', totals.get('long_liq_notional'))))} | "
+            f"شورت: {fmt_usd(number(sides.get('short', totals.get('short_liq_notional'))))}"
+        )
+        clusters = liquidation.get("clusters") or []
+        if clusters:
+            cluster_df = pd.DataFrame([{
+                "قیمت": fmt_price(number(c.get("price"))),
+                "مبلغ لیکوییدشده": fmt_usd(number(c.get("notional"))),
+                "لانگ": fmt_usd(number(c.get("long_notional"))),
+                "شورت": fmt_usd(number(c.get("short_notional"))),
+                "تعداد": int(number(c.get("count"))),
+            } for c in clusters[:8] if isinstance(c, dict)])
+            add_table(cluster_df)
+        add_paragraph("این‌ها لیکوییدیشن‌های ثبت‌شده گذشته‌اند، نه سطوح لیکوییدیشن آینده یا پیش‌بینی جهت قیمت.")
 
     liq_summary = report_data.get("liquidity_summary") or {}
     if liq_summary:
@@ -583,6 +615,23 @@ def fmt_price(value):
 def fmt_usd(value):
     try:
         return f"${float(value):,.2f}"
+    except (TypeError, ValueError):
+        return "—"
+
+
+def format_percent(value):
+    """Format small non-zero percentages without rounding them to a misleading zero."""
+    try:
+        value = float(value)
+        if not pd.notna(value):
+            return "—"
+        if value != 0 and abs(value) < 0.0001:
+            return "<0.0001%" if value > 0 else ">-0.0001%"
+        if abs(value) < 0.01:
+            return f"{value:+.4f}%"
+        if abs(value) < 1:
+            return f"{value:+.3f}%"
+        return f"{value:+.2f}%"
     except (TypeError, ValueError):
         return "—"
 
@@ -1974,7 +2023,7 @@ display_df["حجم معادل BTC"] = display_df["حجم معادل BTC"].map(
     lambda value: f"{value:,.2f}" if pd.notna(value) else "—"
 )
 display_df["تغییر ۲۴ساعته"] = display_df["تغییر ۲۴ساعته"].map(
-    lambda value: f"{value:+.2f}%" if value is not None else "—"
+    lambda value: f"{value:+.2f}%" if value is not None and pd.notna(value) else "—"
 )
 display_df["در LBank"] = display_df["در LBank"].map(
     lambda listed: "بله" if listed else "خیر"
@@ -2729,7 +2778,7 @@ metrics[1].metric(
     help="پایین‌ترین قیمت فروشِ موجود در دفتر سفارش.",
 )
 metrics[2].metric(
-    "فاصله خرید و فروش", f"{book_stats['spread_pct']:.4f}%",
+    "فاصله خرید و فروش", format_percent(book_stats["spread_pct"]),
     help="فاصله نسبی بهترین قیمت فروش و خرید؛ فاصله کمتر معمولاً اجرای معامله را کم‌هزینه‌تر می‌کند، اما کافی نیست.",
 )
 metrics[3].metric(
@@ -2943,7 +2992,10 @@ try:
         "gold_pct": locals().get("gold_pct"),
         "crypto_pct": locals().get("crypto_pct"),
         "cryptometer_trend": locals().get("trend"),
+        "cryptometer_book_df": locals().get("book_df"),
         "cryptometer_movement_df": locals().get("movement_df"),
+        "cryptometer_movers_df": locals().get("movers_df"),
+        "liquidation_heatmap": locals().get("heatmap"),
         "liquidity_summary": {
             "mid": fmt_price(mid_price),
             "bid_price": fmt_price(nearest_bid["price"]) if nearest_bid else None,
@@ -2960,7 +3012,7 @@ try:
         "timeframe_results": locals().get("timeframe_results", {}),
         "best_bid": fmt_price(book_stats.get("best_bid")),
         "best_ask": fmt_price(book_stats.get("best_ask")),
-        "spread_pct": f"{book_stats.get('spread_pct', 0):.4f}%",
+        "spread_pct": format_percent(book_stats.get("spread_pct", 0)),
         "imbalance": f"{book_stats.get('imbalance', 0) * 100:+.2f}%",
         "buy_usd": fmt_usd(trade_stats.get("buy_usd", 0)),
         "sell_usd": fmt_usd(trade_stats.get("sell_usd", 0)),
