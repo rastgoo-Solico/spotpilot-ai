@@ -482,7 +482,7 @@ def fetch_lbank_pairs():
     for item in raw:
         if isinstance(item, str):
             pair = item.lower().replace("-", "_").replace("/", "_")
-            if pair.endswith("_usdt"):
+            if pair.endswith(("_usdt", "_btc")):
                 pairs.add(pair)
 
         elif isinstance(item, dict):
@@ -494,7 +494,7 @@ def fetch_lbank_pairs():
             )
             if candidate:
                 pair = str(candidate).lower().replace("-", "_").replace("/", "_")
-                if pair.endswith("_usdt"):
+                if pair.endswith(("_usdt", "_btc")):
                     pairs.add(pair)
 
     if not pairs:
@@ -932,7 +932,6 @@ def make_atr_trade_plan(df, key_value=2.0):
     }
 
 
-@st.cache_data(ttl=60, show_spinner=False)
 def get_btc_relative_metrics(code, lbank_pairs):
     """Return asset BTC value and 24h relative move from real LBank candles."""
     direct_pair = lbank_btc_symbol_from_code(code)
@@ -1430,7 +1429,7 @@ if not coins:
 
 try:
     lbank_pairs = set(fetch_lbank_pairs())
-    lbank_status = f"{len(lbank_pairs)} جفت‌ارز USDT شناسایی شد"
+    lbank_status = f"{sum(1 for pair in lbank_pairs if pair.endswith('_usdt'))} جفت‌ارز USDT و {sum(1 for pair in lbank_pairs if pair.endswith('_btc'))} جفت‌ارز BTC شناسایی شد"
 except Exception as exc:
     lbank_pairs = set()
     lbank_status = f"دریافت جفت‌ارزهای LBank ناموفق بود: {exc}"
