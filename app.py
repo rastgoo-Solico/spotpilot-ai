@@ -40,9 +40,8 @@ st.set_page_config(page_title="SpotPilot AI", page_icon="📊", layout="wide")
 
 
 # -------------------- Persian RTL presentation (UI only) --------------------
-# B Nazanin is preferred; the bundled font URL has a second host fallback.
-# If external font delivery is unavailable, use locally installed B Nazanin or
-# Tahoma, whose Persian glyph shaping is supported by modern browsers.
+# Use system fonts only; no remote font dependency. Modern browsers shape Persian
+# text automatically when the selected system font contains the required glyphs.
 st.markdown(
     """
     <style>
