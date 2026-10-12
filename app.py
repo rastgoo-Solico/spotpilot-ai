@@ -37,6 +37,52 @@ TIMEFRAMES = {
     "روزانه": {"type": "day1", "seconds": 24 * 60 * 60},
 }
 
+
+def detect_elliott_candidates(frame, left=3, right=3, min_swing_pct=0.35):
+    """Return heuristic swing points for an Elliott-wave *candidate*, not a confirmed count."""
+    if frame is None or len(frame) < left + right + 8:
+        return pd.DataFrame(columns=["index", "Time", "Price", "Kind", "Label"])
+    data = frame.reset_index(drop=True)
+    highs = pd.to_numeric(data["High"], errors="coerce").to_numpy()
+    lows = pd.to_numeric(data["Low"], errors="coerce").to_numpy()
+    raw = []
+    for i in range(left, len(data) - right):
+        hi_window = highs[i-left:i+right+1]
+        lo_window = lows[i-left:i+right+1]
+        if pd.notna(highs[i]) and highs[i] >= hi_window.max() and (highs[i] > hi_window[:-1].max() or highs[i] > hi_window[-1]):
+            raw.append({"index": i, "Time": data.loc[i, "Time"], "Price": float(highs[i]), "Kind": "high"})
+        if pd.notna(lows[i]) and lows[i] <= lo_window.min() and (lows[i] < lo_window[:-1].min() or lows[i] < lo_window[-1]):
+            raw.append({"index": i, "Time": data.loc[i, "Time"], "Price": float(lows[i]), "Kind": "low"})
+    raw.sort(key=lambda p: p["index"])
+    # Keep one pivot per direction, retaining the more extreme point when same-side pivots repeat.
+    pivots = []
+    for point in raw:
+        if pivots and point["Kind"] == pivots[-1]["Kind"]:
+            more_extreme = (point["Price"] > pivots[-1]["Price"]) if point["Kind"] == "high" else (point["Price"] < pivots[-1]["Price"])
+            if more_extreme:
+                pivots[-1] = point
+            continue
+        if pivots:
+            move = abs(point["Price"] / pivots[-1]["Price"] - 1) * 100 if pivots[-1]["Price"] else 0
+            if move < min_swing_pct:
+                continue
+        pivots.append(point)
+    # Label recent pivots as a visual hypothesis only; do not assert rule validation.
+    recent = pivots[-9:]
+    labels = []
+    if len(recent) >= 6:
+        # Most recent six alternating pivots are the start plus five impulse turns.
+        for j, p in enumerate(recent[-6:]):
+            labels.append((p, f"({j})" if j == 0 else f"({j})"))
+    elif len(recent) >= 4:
+        for j, p in enumerate(recent[-4:]):
+            labels.append((p, ["A", "B", "C", "D"][j]))
+    result = []
+    for p, label in labels:
+        result.append({**p, "Label": label})
+    return pd.DataFrame(result)
+
+
 st.set_page_config(page_title="SpotPilot AI", page_icon="📊", layout="wide")
 
 
@@ -2348,6 +2394,8 @@ else:
                     st.warning(plan["reason"])
 
                 st.markdown("#### نمودار قیمت و میانگین‌ها")
+                elliott_enabled = st.checkbox("نمایش شمارش احتمالی امواج الیوت روی نمودار", value=True, key="elliott_overlay")
+                st.caption("شمارش موج‌ها با نقاط چرخش قیمت و قواعد اکتشافی تولید می‌شود؛ فرضیه‌ای برای بررسی دستی است، نه شمارش قطعی یا سیگنال مستقل.")
                 chart_df = indicators.tail(150).copy()
                 fig = go.Figure()
                 fig.add_trace(go.Candlestick(
@@ -2398,6 +2446,23 @@ else:
                         mode="markers", name="علامت فروش UT",
                         marker={"symbol": "triangle-down", "size": 10, "color": "#dc2626"},
                     ))
+                if elliott_enabled:
+                    wave_points = detect_elliott_candidates(chart_df)
+                    if not wave_points.empty:
+                        fig.add_trace(go.Scatter(
+                            x=wave_points["Time"],
+                            y=wave_points["Price"],
+                            mode="lines+markers+text",
+                            text=wave_points["Label"],
+                            textposition="top center",
+                            name="امواج الیوت — فرضیه",
+                            line={"color": "#7c3aed", "width": 2, "dash": "dot"},
+                            marker={"size": 8, "color": "#7c3aed", "symbol": "circle"},
+                            textfont={"color": "#7c3aed", "size": 12},
+                            hovertemplate="نقطه موجی احتمالی<br>زمان: %{x}<br>قیمت: %{y}<br>برچسب: %{text}<extra></extra>",
+                        ))
+                    else:
+                        st.info("برای شمارش اکتشافی موج‌ها، کندل یا نقاط چرخش کافی در این بازه وجود ندارد.")
                 fig.update_layout(
                     height=520,
                     margin={"l": 12, "r": 12, "t": 28, "b": 12},
