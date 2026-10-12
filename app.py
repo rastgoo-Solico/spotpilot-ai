@@ -25,6 +25,9 @@ LCW_URL = "https://api.livecoinwatch.com"
 LBANK_URL = "https://api.lbank.info/v2"
 OTHER_EXCHANGES = ["binance", "bybit", "okx", "kucoin", "kraken"]
 QUOTE = "USDT"
+PINNED_CODES = ("BTC", "XAUT", "SOL", "ETH")
+PINNED_NAMES = {"BTC": "Bitcoin", "XAUT": "Tether Gold", "SOL": "Solana", "ETH": "Ethereum"}
+COINGLASS_HEATMAP_URL = "https://www.coinglass.com/pro/futures/LiquidationHeatMap"
 
 TIMEFRAMES = {
     "15 دقیقه": {"type": "minute15", "seconds": 15 * 60},
@@ -415,10 +418,12 @@ def fetch_lcw_market(min_btc_volume):
     rows = []
 
     for coin in all_coins:
+        coin_code = str(coin.get("code", "")).upper()
         volume_usd = number(coin.get("volume"))
         price_usd = number(coin.get("rate"))
 
-        if volume_usd < min_usd_volume:
+        # Keep pinned symbols even when below the scanner's volume threshold.
+        if volume_usd < min_usd_volume and coin_code not in PINNED_CODES:
             continue
 
         delta = coin.get("delta") or {}
@@ -430,7 +435,7 @@ def fetch_lcw_market(min_btc_volume):
 
         rows.append({
             "Name": coin.get("name", ""),
-            "Code": str(coin.get("code", "")).upper(),
+            "Code": coin_code,
             "Price USD": price_usd,
             "24h Change %": change_pct,
             "Volume USD": volume_usd,
@@ -440,13 +445,13 @@ def fetch_lcw_market(min_btc_volume):
             "Pairs reported": coin.get("pairs"),
         })
 
+    pin_rank = {code: index for index, code in enumerate(PINNED_CODES)}
     rows.sort(
         key=lambda row: (
-            row["24h Change %"]
-            if row["24h Change %"] is not None
-            else float("-inf")
-        ),
-        reverse=True,
+            0 if row["Code"] in pin_rank else 1,
+            pin_rank.get(row["Code"], 999),
+            -(row["24h Change %"] if row["24h Change %"] is not None else float("-inf")),
+        )
     )
 
     return rows, btc_usd, len(all_coins)
@@ -456,6 +461,10 @@ def fetch_lcw_market(min_btc_volume):
 
 def lbank_symbol_from_code(code):
     return f"{code.lower()}_usdt"
+
+
+def lbank_btc_symbol_from_code(code):
+    return f"{code.lower()}_btc"
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -923,6 +932,91 @@ def make_atr_trade_plan(df, key_value=2.0):
     }
 
 
+@st.cache_data(ttl=60, show_spinner=False)
+def get_btc_relative_metrics(code, lbank_pairs):
+    """Return asset BTC value and 24h relative move from real LBank candles."""
+    direct_pair = lbank_btc_symbol_from_code(code)
+    btc_usdt_pair = "btc_usdt"
+    asset_usdt_pair = lbank_symbol_from_code(code)
+
+    if direct_pair in lbank_pairs:
+        candles = fetch_lbank_klines(direct_pair, "روزانه", 4)
+        if len(candles) >= 2:
+            current = number(candles.iloc[-1]["Close"])
+            previous = number(candles.iloc[-2]["Close"])
+            change = (current / previous - 1) * 100 if previous > 0 else None
+            return {
+                "btc_value": current, "change_pct": change,
+                "source_pair": direct_pair,
+                "method": "جفت‌ارز مستقیم در بازار LBank",
+            }
+
+    # Derive the cross-rate only from actual asset/USDT and BTC/USDT candles.
+    if asset_usdt_pair in lbank_pairs and btc_usdt_pair in lbank_pairs:
+        asset = fetch_lbank_klines(asset_usdt_pair, "روزانه", 4)
+        btc = fetch_lbank_klines(btc_usdt_pair, "روزانه", 4)
+        if len(asset) >= 2 and len(btc) >= 2:
+            asset_now = number(asset.iloc[-1]["Close"])
+            asset_prev = number(asset.iloc[-2]["Close"])
+            btc_now = number(btc.iloc[-1]["Close"])
+            btc_prev = number(btc.iloc[-2]["Close"])
+            if min(asset_now, asset_prev, btc_now, btc_prev) > 0:
+                current_ratio = asset_now / btc_now
+                previous_ratio = asset_prev / btc_prev
+                return {
+                    "btc_value": current_ratio,
+                    "change_pct": (current_ratio / previous_ratio - 1) * 100,
+                    "source_pair": f"{asset_usdt_pair} + {btc_usdt_pair}",
+                    "method": "نرخ متقاطع محاسبه‌شده از کندل‌های واقعی USDT؛ بازار مستقیم BTC موجود نیست",
+                }
+
+    return {
+        "btc_value": None, "change_pct": None,
+        "source_pair": direct_pair,
+        "method": "داده کافی در LBank در دسترس نیست",
+    }
+
+
+@st.cache_data(ttl=180, show_spinner=False)
+def fetch_coinglass_heatmap(symbol="BTCUSDT", time_range="3d"):
+    api_key = ""
+    try:
+        api_key = str(st.secrets["COINGLASS_API_KEY"]).strip()
+    except Exception:
+        api_key = ""
+    if not api_key:
+        return None, "کلید COINGLASS_API_KEY تنظیم نشده است."
+
+    response = requests.get(
+        "https://open-api-v4.coinglass.com/api/futures/liquidation/heatmap/model1",
+        params={"exchange": "Binance", "symbol": symbol, "range": time_range},
+        headers={"accept": "application/json", "CG-API-KEY": api_key},
+        timeout=25,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if str(payload.get("code")) != "0" or not isinstance(payload.get("data"), dict):
+        return None, str(payload.get("msg") or "پاسخ معتبر از CoinGlass دریافت نشد.")
+    data = payload["data"]
+    y_axis = data.get("y_axis") or []
+    liquidation = data.get("liquidation_leverage_data") or []
+    candles = data.get("price_candlesticks") or []
+    if not y_axis or not liquidation or not candles:
+        return None, "پاسخ API داده کافی برای ساخت نقشه حرارتی ندارد."
+    x_count = len(candles)
+    z = [[None for _ in range(x_count)] for _ in y_axis]
+    for point in liquidation:
+        if not isinstance(point, (list, tuple)) or len(point) < 3:
+            continue
+        xi = int(number(point[0], -1))
+        yi = int(number(point[1], -1))
+        value = number(point[2])
+        if 0 <= xi < x_count and 0 <= yi < len(y_axis):
+            z[yi][xi] = (z[yi][xi] or 0) + value
+    x_values = [datetime.fromtimestamp(number(c[0]), tz=timezone.utc) for c in candles]
+    return {"x": x_values, "y": y_axis, "z": z}, None
+
+
 # -------------------- Other exchanges: comparison only --------------------
 
 def make_exchange(exchange_id):
@@ -1343,7 +1437,23 @@ except Exception as exc:
 
 st.caption(f"وضعیت بازار LBank: {lbank_status}")
 
+# Always retain pinned symbols in the list. Missing values remain blank.
+existing_codes = {str(row.get("Code", "")).upper() for row in coins}
+for pinned_code in PINNED_CODES:
+    if pinned_code not in existing_codes:
+        coins.append({
+            "Name": PINNED_NAMES[pinned_code], "Code": pinned_code,
+            "Price USD": None, "24h Change %": None,
+            "Volume USD": None, "Volume BTC equivalent": None,
+            "Exchanges reported": None, "Markets reported": None, "Pairs reported": None,
+        })
+
 coins_df = pd.DataFrame(coins)
+pin_rank = {code: index for index, code in enumerate(PINNED_CODES)}
+coins_df["_pin_rank"] = coins_df["Code"].map(lambda code: pin_rank.get(code, 999))
+coins_df = coins_df.sort_values(
+    by=["_pin_rank", "24h Change %"], ascending=[True, False], na_position="last"
+).drop(columns=["_pin_rank"]).reset_index(drop=True)
 coins_df["LBank listed"] = coins_df["Code"].apply(
     lambda code: lbank_symbol_from_code(code) in lbank_pairs
 )
@@ -1368,7 +1478,7 @@ display_df = display_df.rename(columns={
 display_df["قیمت (دلار)"] = display_df["قیمت (دلار)"].map(fmt_price)
 display_df["حجم ۲۴ساعته (دلار)"] = display_df["حجم ۲۴ساعته (دلار)"].map(fmt_usd)
 display_df["حجم معادل BTC"] = display_df["حجم معادل BTC"].map(
-    lambda value: f"{value:,.2f}"
+    lambda value: f"{value:,.2f}" if pd.notna(value) else "—"
 )
 display_df["تغییر ۲۴ساعته"] = display_df["تغییر ۲۴ساعته"].map(
     lambda value: f"{value:+.2f}%" if value is not None else "—"
@@ -1378,7 +1488,11 @@ display_df["در LBank"] = display_df["در LBank"].map(
 )
 
 st.subheader("۱. انتخاب ارز")
-st.caption("روی ردیف ارز کلیک کن یا از فهرست انتخاب کن. فهرست بر اساس تغییر ۲۴ساعته مرتب شده است.")
+st.caption(
+    "چهار جفت‌ارز ثابت همیشه در ابتدای فهرست هستند: BTC/USDT، XAUT/USDT، "
+    "SOL/USDT و ETH/USDT. پس از آن سایر ارزها بر اساس تغییر ۲۴ساعته نمایش داده می‌شوند. "
+    "اگر داده واقعی یک نماد در دسترس نباشد، مقدار آن خالی می‌ماند."
+)
 
 event = st.dataframe(
     display_df,
@@ -1436,7 +1550,37 @@ if compare_errors:
 # -------------------- Multi-timeframe technical analysis --------------------
 
 st.divider()
-st.subheader("۳. تحلیل تکنیکال")
+st.subheader("۳. ارزش نسبت به بیت‌کوین (BTC Pair)")
+st.caption(
+    "این بخش بررسی می‌کند خودِ ارز در برابر BTC قوی‌تر شده یا ضعیف‌تر؛ "
+    "ممکن است قیمت دلاری بالا برود اما نسبت آن به بیت‌کوین افت کند."
+)
+try:
+    with st.spinner("بررسی نسبت واقعی ارز به BTC در LBank..."):
+        btc_relative = get_btc_relative_metrics(selected_code, lbank_pairs)
+    rb1, rb2, rb3 = st.columns(3)
+    rb1.metric(
+        f"{selected_code} برحسب BTC",
+        f"{btc_relative['btc_value']:.8f} BTC" if btc_relative["btc_value"] is not None else "—",
+    )
+    rb2.metric(
+        "تغییر نسبت در آخرین ۲۴ ساعت بسته‌شده",
+        f"{btc_relative['change_pct']:+.2f}%" if btc_relative["change_pct"] is not None else "—",
+    )
+    rb3.metric("منبع/بازار", btc_relative["source_pair"])
+    st.caption(btc_relative["method"])
+    if btc_relative["change_pct"] is not None:
+        if btc_relative["change_pct"] > 0:
+            st.success(f"در بازه محاسبه‌شده، {selected_code} نسبت به BTC عملکرد بهتری داشته است.")
+        elif btc_relative["change_pct"] < 0:
+            st.warning(f"در بازه محاسبه‌شده، {selected_code} نسبت به BTC ضعیف‌تر شده است.")
+        else:
+            st.info("عملکرد نسبت به BTC در بازه محاسبه‌شده تقریباً بدون تغییر بوده است.")
+except Exception as exc:
+    st.warning(f"تحلیل نسبت به BTC انجام نشد؛ داده واقعی کافی نیست: {type(exc).__name__}: {str(exc)[:180]}")
+
+st.divider()
+st.subheader("۴. تحلیل تکنیکال")
 st.caption(
     "۱۵ دقیقه برای حرکت کوتاه‌مدت، ۴ ساعت برای روند میان‌مدت و روزانه برای تصویر بزرگ‌تر است. "
     "سیگنال‌ها از کندل‌های بسته‌شده محاسبه می‌شوند؛ هیچ شاخصی نتیجه را تضمین نمی‌کند."
@@ -1714,14 +1858,45 @@ else:
                 "هنوز دست‌کم دو تایم‌فریم سیگنال هم‌جهت تازه ندارند."
             )
 
-# -------------------- Existing order book analysis --------------------
+# -------------------- Order book and liquidation liquidity --------------------
 
 st.divider()
-st.subheader("۴. دفتر سفارش و معاملات اخیر LBank")
+st.subheader("۵. نقدینگی و معاملات اخیر LBank")
 st.caption(
-    "دفتر سفارش، سفارش‌های خرید و فروشِ در انتظار را نشان می‌دهد؛ "
-    "معاملات اخیر، خریدوفروش‌های ثبت‌شده را خلاصه می‌کند. این دو داده یکسان نیستند."
+    "دفتر سفارش LBank نقدینگیِ سفارش‌های قابل‌مشاهده همین صرافی را نشان می‌دهد. "
+    "نقشه CoinGlass تخمینی از سطوح احتمالی لیکوییدیشن در بازار فیوچرز است و با دفتر سفارش فرق دارد."
 )
+with st.expander("نقشه لیکوییدیشن CoinGlass (اختیاری)", expanded=False):
+    st.markdown(
+        f"نقشه اصلی را هم می‌توانی در [CoinGlass باز کنی]({COINGLASS_HEATMAP_URL}). "
+        "برای نمایش نقشه داخل این برنامه، کلید API معتبر CoinGlass را در Streamlit Secrets "
+        "با نام COINGLASS_API_KEY قرار بده. طبق مستندات رسمی، endpoint نقشه حرارتی به پلن "
+        "Professional یا Enterprise نیاز دارد؛ بدون دسترسی API هیچ داده‌ای جعل یا تخمین زده نمی‌شود."
+    )
+    try:
+        heatmap, heatmap_error = fetch_coinglass_heatmap("BTCUSDT", "3d")
+        if heatmap:
+            fig_liq = go.Figure(data=go.Heatmap(
+                x=heatmap["x"], y=heatmap["y"], z=heatmap["z"],
+                colorscale="Turbo", colorbar={"title": "برآورد لیکوییدیشن"},
+                hovertemplate="زمان: %{x}<br>قیمت: %{y:,.2f}<br>مقدار: %{z:,.0f}<extra></extra>",
+            ))
+            fig_liq.update_layout(
+                title="BTCUSDT — نقشه حرارتی لیکوییدیشن Binance (۳ روز)",
+                xaxis_title="زمان (UTC)", yaxis_title="سطح قیمت (USDT)", height=520,
+            )
+            st.plotly_chart(fig_liq, use_container_width=True)
+            st.caption(
+                "این نقشه مربوط به فیوچرز Binance است، نه بازار اسپات LBank؛ "
+                "سطوح مدل‌شده تخمینی‌اند و تضمین نمی‌کنند لیکوییدیشن واقعاً در آن قیمت رخ دهد."
+            )
+        else:
+            st.info(f"نقشه داخلی فعلاً در دسترس نیست: {heatmap_error}")
+    except Exception as exc:
+        st.warning(
+            "دریافت نقشه CoinGlass ناموفق بود. کلید API، سطح دسترسی پلن و محدودیت درخواست را بررسی کن. "
+            f"جزئیات: {type(exc).__name__}: {str(exc)[:180]}"
+        )
 
 if not selected_lbank_pair:
     st.warning(
