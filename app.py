@@ -351,6 +351,10 @@ def build_pdf_report(report_data):
         f"تعداد ارزهای پس از فیلتر: {report_data.get('coin_count', '—')}"
     )
     add_paragraph(f"وضعیت LBank: {report_data.get('lbank_status', '—')}")
+    add_paragraph(
+        "منابع زمانی یکسانی ندارند: قیمت خلاصه از LiveCoinWatch، مقایسه از تیکرهای صرافی‌ها، "
+        "و تحلیل تکنیکال از کندل‌های بسته‌شده LBank است. اختلاف قیمت را همراه با زمان آخرین کندل بخوان."
+    )
 
     add_heading("۱. فهرست ارزهای LiveCoinWatch")
     add_paragraph("فهرست زیر شامل همه ردیف‌های باقی‌مانده پس از اعمال فیلتر حجم فعلی است.")
@@ -2246,9 +2250,29 @@ else:
                 d.metric("وضعیت", plan["status"])
 
                 st.caption(
-                    f"زمان آخرین کندل بسته‌شده (UTC): "
+                    f"زمان شروع آخرین کندل بسته‌شده (UTC): "
                     f"{summary['time'].strftime('%Y-%m-%d %H:%M')}"
                 )
+                candle_close_time = summary["time"] + pd.Timedelta(
+                    seconds=int(TIMEFRAMES[tf_name]["seconds"])
+                )
+                candle_age_minutes = max(
+                    0.0,
+                    (pd.Timestamp.now(tz="UTC") - candle_close_time).total_seconds() / 60,
+                )
+                stale_threshold = int(TIMEFRAMES[tf_name]["seconds"]) / 60 * 2
+                if candle_age_minutes > stale_threshold:
+                    st.warning(
+                        f"داده این تایم‌فریم قدیمی است: آخرین کندل در "
+                        f"{candle_close_time.strftime('%Y-%m-%d %H:%M UTC')} بسته شد "
+                        f"({candle_age_minutes:.0f} دقیقه پیش). تا به‌روزرسانی داده، "
+                        "این سیگنال را مبنای ورود قرار نده."
+                    )
+                else:
+                    st.caption(
+                        f"تازگی داده: مناسب | پایان آخرین کندل: "
+                        f"{candle_close_time.strftime('%Y-%m-%d %H:%M UTC')}"
+                    )
 
                 last = indicators.iloc[-1]
                 st.markdown("#### میانگین‌های متحرک؛ قیمت نسبت به روند کجاست؟")
