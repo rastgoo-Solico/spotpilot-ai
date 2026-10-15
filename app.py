@@ -1,6 +1,6 @@
 """
 SpotPilot AI — Market analysis dashboard
-Full single-file version: improved backend + complete Streamlit UI.
+Full single-file version with calculation consistency fixes.
 """
 import statistics
 import math
@@ -56,7 +56,7 @@ if DEBUG:
 # ===========================================================================
 _SESSION = requests.Session()
 _SESSION.headers.update({
-    "User-Agent": "SpotPilotAI/2.0 (+public-market-data)",
+    "User-Agent": "SpotPilotAI/2.1 (+public-market-data)",
     "Accept": "application/json",
 })
 
@@ -157,6 +157,26 @@ def is_success(payload):
     return False
 
 
+def tiered_score(pct, thresholds=(0.5, 3.0)):
+    """
+    Tiered scoring for percentage changes:
+      +2 if pct >= high, +1 if pct >= low, -1 if pct <= -low, -2 if pct <= -high, else 0.
+    Avoids the binary +1/0/-1 that loses magnitude information.
+    """
+    try:
+        if pct is None or not pd.notna(pct):
+            return 0
+        pct = float(pct)
+    except (TypeError, ValueError):
+        return 0
+    low, high = thresholds
+    if pct >= high: return 2
+    if pct >= low:  return 1
+    if pct <= -high: return -2
+    if pct <= -low:  return -1
+    return 0
+
+
 def get_lcw_key():
     try:
         return str(st.secrets["LIVECOINWATCH_API_KEY"]).strip()
@@ -218,7 +238,6 @@ def fetch_lcw_market(min_btc_volume):
     btc_usd = None
     all_coins = []
     empty_pages = 0
-
     for offset in range(0, 2000, 100):
         batch = lcw_post("coins/list", {
             "currency": "USD", "sort": "volume", "order": "descending",
@@ -227,13 +246,11 @@ def fetch_lcw_market(min_btc_volume):
         if not isinstance(batch, list) or not batch:
             break
         all_coins.extend(batch)
-
         if btc_usd is None:
             for item in batch:
                 if str(item.get("code", "")).upper() == "BTC":
                     btc_usd = number(item.get("rate"), None)
                     break
-
         if min_btc_volume and btc_usd:
             min_usd = min_btc_volume * btc_usd
             below = sum(1 for c in batch if number(c.get("volume")) < min_usd)
@@ -243,7 +260,6 @@ def fetch_lcw_market(min_btc_volume):
                     break
             else:
                 empty_pages = 0
-
         if len(batch) < 100:
             break
 
@@ -259,14 +275,11 @@ def fetch_lcw_market(min_btc_volume):
         coin_code = str(coin.get("code", "")).upper()
         volume_usd = number(coin.get("volume"))
         price_usd = number(coin.get("rate"))
-
         if volume_usd < min_usd_volume and coin_code not in PINNED_CODES:
             continue
-
         delta = coin.get("delta") or {}
         day_delta = delta.get("day")
         change_pct = (number(day_delta) - 1) * 100 if day_delta is not None else None
-
         rows.append({
             "Name": coin.get("name", ""),
             "Code": coin_code,
@@ -387,7 +400,6 @@ def fetch_lbank_ticker(pair):
 def fetch_lbank_klines(pair, timeframe, size=300):
     if timeframe not in TIMEFRAMES:
         raise ValueError("تایم‌فریم پشتیبانی نمی‌شود.")
-
     tf = TIMEFRAMES[timeframe]
     interval_seconds = int(tf["seconds"])
     now_seconds = int(time.time())
@@ -492,17 +504,12 @@ def fetch_lbank_klines(pair, timeframe, size=300):
 # ===========================================================================
 def calculate_atr(df, period=14):
     period = max(int(period), 2)
-    high = df["High"]
-    low = df["Low"]
-    close = df["Close"]
+    high = df["High"]; low = df["Low"]; close = df["Close"]
     prev_close = close.shift(1)
     true_range = pd.concat([
-        high - low,
-        (high - prev_close).abs(),
-        (low - prev_close).abs(),
+        high - low, (high - prev_close).abs(), (low - prev_close).abs(),
     ], axis=1).max(axis=1)
-    atr = true_range.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean()
-    return atr
+    return true_range.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean()
 
 
 def calculate_ut_bot(df, atr_period=14, key_value=2.0):
@@ -609,6 +616,26 @@ def latest_signal_summary(df):
     }
 
 
+def ut_state(df):
+    """
+    Return trend state: +1 uptrend (close above UT stop), -1 downtrend, 0 unknown.
+    Also reports whether a fresh crossover fired on the last candle.
+    """
+    if df is None or df.empty:
+        return {"state": 0, "fresh_buy": False, "fresh_sell": False}
+    last = df.iloc[-1]
+    close = number(last.get("Close"))
+    ut_stop = number(last.get("UT Stop"), float("nan"))
+    if close <= 0 or pd.isna(ut_stop):
+        return {"state": 0, "fresh_buy": False, "fresh_sell": False}
+    state = 1 if close > ut_stop else -1
+    return {
+        "state": state,
+        "fresh_buy": bool(last.get("UT Buy", False)),
+        "fresh_sell": bool(last.get("UT Sell", False)),
+    }
+
+
 def make_atr_trade_plan(df, key_value=2.0):
     summary = latest_signal_summary(df)
     close = summary["close"]
@@ -631,7 +658,8 @@ def make_atr_trade_plan(df, key_value=2.0):
     elif bearish_ma and close < summary["ut_stop"]:
         direction = "SHORT WATCH"
     else:
-        return {"status": "WAIT", "reason": "سیگنال UT و تأیید روند هم‌جهت نیستند؛ فعلاً ورود تأیید نشده است.",
+        return {"status": "WAIT",
+                "reason": "سیگنال UT و تأیید روند هم‌جهت نیستند؛ فعلاً ورود تأیید نشده است.",
                 "close": close, "atr": atr}
 
     risk = atr * float(key_value)
@@ -647,13 +675,14 @@ def make_atr_trade_plan(df, key_value=2.0):
         target1 = close - 1.5 * risk
         target2 = close - 2.0 * risk
 
-    is_confirmed_signal = direction in ("LONG", "SHORT")
+    is_confirmed = direction in ("LONG", "SHORT")
     return {
         "status": direction,
         "reason": ("سیگنال UT روی آخرین کندل بسته‌شده ثبت شده است."
-                   if is_confirmed_signal else
+                   if is_confirmed else
                    "این فقط واچ‌لیست روند است؛ سیگنال جدید UT ثبت نشده است."),
-        "close": close, "atr": atr, "stop": stop, "target1": target1, "target2": target2,
+        "close": close, "atr": atr, "stop": stop,
+        "target1": target1, "target2": target2,
         "rr1": 1.5, "rr2": 2.0, "direction": direction,
     }
 
@@ -676,13 +705,11 @@ def detect_elliott_candidates(frame, left=3, right=3, min_swing_pct=0.35):
         h_window = highs[i - left:i + right + 1]
         l_window = lows[i - left:i + right + 1]
         h_val, l_val = highs[i], lows[i]
-
         if pd.notna(h_val) and h_val == np.nanmax(h_window):
             left_side = highs[i - left:i]
             if len(left_side) == 0 or h_val > np.nanmax(left_side):
                 raw.append({"index": i, "Time": data.loc[i, "Time"],
                             "Price": float(h_val), "Kind": "high"})
-
         if pd.notna(l_val) and l_val == np.nanmin(l_window):
             left_side = lows[i - left:i]
             if len(left_side) == 0 or l_val < np.nanmin(left_side):
@@ -733,73 +760,88 @@ def analyze_elliott_context(frame, pivots):
         up = kinds == ["low", "high", "low", "high", "low", "high"]
         down = kinds == ["high", "low", "high", "low", "high", "low"]
         if up:
-            w1, w2, w3, w4, w5 = prices[1]-prices[0], prices[1]-prices[2], prices[3]-prices[2], prices[3]-prices[4], prices[5]-prices[4]
+            w1, w2, w3, w4, w5 = (prices[1]-prices[0], prices[1]-prices[2],
+                                  prices[3]-prices[2], prices[3]-prices[4],
+                                  prices[5]-prices[4])
             if prices[2] <= prices[0]: result["invalid"].append("موج ۲ از مبدأ موج ۱ عبور کرده")
             if prices[3] <= prices[1]: result["invalid"].append("موج ۳ سقف موج ۱ را نشکسته")
-            if prices[4] < prices[1]: result["invalid"].append("هم‌پوشانی موج ۴ و ۱؛ مگر در قطر")
+            if prices[4] < prices[1]: result["invalid"].append("هم‌پوشانی موج ۴ و ۱")
             if w3 <= min(w1, w5): result["invalid"].append("موج ۳ کوتاه‌ترین موج محرک است")
         elif down:
-            w1, w2, w3, w4, w5 = prices[0]-prices[1], prices[2]-prices[1], prices[2]-prices[3], prices[4]-prices[3], prices[4]-prices[5]
+            w1, w2, w3, w4, w5 = (prices[0]-prices[1], prices[2]-prices[1],
+                                  prices[2]-prices[3], prices[4]-prices[3],
+                                  prices[4]-prices[5])
             if prices[2] >= prices[0]: result["invalid"].append("موج ۲ از مبدأ موج ۱ عبور کرده")
             if prices[3] >= prices[1]: result["invalid"].append("موج ۳ کف موج ۱ را نشکسته")
-            if prices[4] > prices[1]: result["invalid"].append("هم‌پوشانی موج ۴ و ۱؛ مگر در قطر")
+            if prices[4] > prices[1]: result["invalid"].append("هم‌پوشانی موج ۴ و ۱")
             if w3 <= min(w1, w5): result["invalid"].append("موج ۳ کوتاه‌ترین موج محرک است")
         else:
             result["invalid"].append("توالی پیوت‌ها با ایمپالس استاندارد هم‌جهت نیست")
         if result["invalid"]:
-            result["notes"].append("شمارش ۵ موجی با یک یا چند قانون سخت سازگار نیست؛ برچسب‌ها قطعی نیستند.")
+            result["notes"].append("شمارش ۵ موجی با قوانین سخت سازگار نیست.")
         else:
             result["score"] += 2
-            result["notes"].append("توالی اخیر با قواعد اصلی ایمپالس سازگار است؛ همچنان یک شمارش احتمالی است.")
+            result["notes"].append("توالی اخیر با قواعد ایمپالس سازگار است.")
 
     close = pd.to_numeric(d["Close"], errors="coerce")
     last = float(close.iloc[-1])
     if "SMA 14" in d and "SMA 50" in d:
         fast, slow = d["SMA 14"].iloc[-1], d["SMA 50"].iloc[-1]
         if pd.notna(fast) and pd.notna(slow):
-            if last > fast > slow: result["score"] += 1; result["notes"].append("قیمت بالای SMA14 و SMA50 است")
-            elif last < fast < slow: result["score"] -= 1; result["notes"].append("قیمت زیر SMA14 و SMA50 است")
-    if "UT Buy" in d and bool(d["UT Buy"].iloc[-1]): result["score"] += 1; result["notes"].append("UT خرید اخیر را تأیید می‌کند")
-    if "UT Sell" in d and bool(d["UT Sell"].iloc[-1]): result["score"] -= 1; result["notes"].append("UT فروش اخیر را تأیید می‌کند")
+            if last > fast > slow: result["score"] += 1; result["notes"].append("قیمت بالای SMA14 و SMA50")
+            elif last < fast < slow: result["score"] -= 1; result["notes"].append("قیمت زیر SMA14 و SMA50")
+
+    if "UT Buy" in d and bool(d["UT Buy"].iloc[-1]):
+        result["score"] += 1; result["notes"].append("سیگنال خرید UT")
+    if "UT Sell" in d and bool(d["UT Sell"].iloc[-1]):
+        result["score"] -= 1; result["notes"].append("سیگنال فروش UT")
+
     if "Volume" in d:
         vol = pd.to_numeric(d["Volume"], errors="coerce")
         baseline = vol.rolling(20).median().iloc[-1]
         if pd.notna(baseline) and baseline > 0 and vol.iloc[-1] > baseline * 1.5:
-            result["notes"].append("حجم آخرین کندل بیش از ۱٫۵ برابر میانه ۲۰ کندل است")
+            result["notes"].append("حجم آخرین کندل > ۱٫۵× میانه")
             result["score"] += 0.5 if direction > 0 else -0.5
+
     recent = d.tail(20)
     support = float(pd.to_numeric(recent["Low"], errors="coerce").iloc[:-1].min())
     resistance = float(pd.to_numeric(recent["High"], errors="coerce").iloc[:-1].max())
     last_low, last_high = float(d["Low"].iloc[-1]), float(d["High"].iloc[-1])
     sweep_down = last_low < support and last > support
     sweep_up = last_high > resistance and last < resistance
-    if sweep_down: result["score"] += 1; result["notes"].append("سایه زیر حمایت و بازگشت قیمت: احتمال جمع‌آوری نقدینگی فروش")
-    if sweep_up: result["score"] -= 1; result["notes"].append("سایه بالای مقاومت و بازگشت قیمت: احتمال جمع‌آوری نقدینگی خرید")
+    if sweep_down: result["score"] += 1; result["notes"].append("سایه زیر حمایت + بازگشت")
+    if sweep_up: result["score"] -= 1; result["notes"].append("سایه بالای مقاومت + بازگشت")
+
     result["score"] = max(-5, min(5, result["score"]))
     result["direction"] = 1 if result["score"] > 0 else -1 if result["score"] < 0 else direction
     result["confidence"] = "متوسط" if abs(result["score"]) >= 2 else "کم"
     result["support"], result["resistance"] = support, resistance
 
-    candle_range = (pd.to_numeric(d["High"], errors="coerce") - pd.to_numeric(d["Low"], errors="coerce"))
-    atr = float(candle_range.rolling(14).mean().iloc[-1])
-    if not math.isfinite(atr) or atr <= 0:
-        atr = max(last * 0.005, 1e-8)
+    # NOTE: previously named `atr` — renamed to `avg_range` since this is
+    # a simple mean of candle range, not Wilder ATR.
+    candle_range = (pd.to_numeric(d["High"], errors="coerce")
+                    - pd.to_numeric(d["Low"], errors="coerce"))
+    avg_range = float(candle_range.rolling(14).mean().iloc[-1])
+    if not math.isfinite(avg_range) or avg_range <= 0:
+        avg_range = max(last * 0.005, 1e-8)
+
     direction = result["direction"]
     recent_swings = []
     if pivots is not None and len(pivots) >= 3:
         recent_swings = pd.to_numeric(pivots.tail(6)["Price"], errors="coerce").dropna().astype(float).tolist()
-    impulse_size = max((max(recent_swings) - min(recent_swings)) if len(recent_swings) >= 3 else 0.0, atr * 1.5)
-    leg = max(atr * 0.65, min(impulse_size * 0.236, atr * 2.5))
+    impulse_size = max((max(recent_swings) - min(recent_swings)) if len(recent_swings) >= 3 else 0.0,
+                       avg_range * 1.5)
+    leg = max(avg_range * 0.65, min(impulse_size * 0.236, avg_range * 2.5))
     if direction > 0:
         a = max(support, last - leg)
         b = min(last + leg * 0.62, resistance if resistance > last else last + leg * 0.62)
         c = max(support, a - leg * 0.15)
-        target = max(last + impulse_size * 0.382, resistance + atr * 0.15)
+        target = max(last + impulse_size * 0.382, resistance + avg_range * 0.15)
     else:
         a = min(resistance, last + leg)
         b = max(last - leg * 0.62, support if support < last else last - leg * 0.62)
         c = min(resistance, a + leg * 0.15)
-        target = min(last - impulse_size * 0.382, support - atr * 0.15)
+        target = min(last - impulse_size * 0.382, support - avg_range * 0.15)
     result["forecast"] = [a, b, c, target]
     result["forecast_labels"] = ["A? اصلاح", "B? بازگشت", "C? اصلاح", "ادامه احتمالی"]
     result["impulse_size"] = impulse_size
@@ -807,7 +849,7 @@ def analyze_elliott_context(frame, pivots):
 
 
 # ===========================================================================
-# BTC-relative & trend score
+# BTC-relative & trend score  (FIXED)
 # ===========================================================================
 def get_btc_relative_metrics(code, lbank_pairs):
     direct_pair = lbank_btc_symbol_from_code(code)
@@ -836,7 +878,7 @@ def get_btc_relative_metrics(code, lbank_pairs):
                 return {"btc_value": current_ratio,
                         "change_pct": (current_ratio / previous_ratio - 1) * 100,
                         "source_pair": f"{asset_usdt_pair} + {btc_usdt_pair}",
-                        "method": "نرخ متقاطع محاسبه‌شده از کندل‌های واقعی USDT"}
+                        "method": "نرخ متقاطع از کندل‌های واقعی USDT"}
     return {"btc_value": None, "change_pct": None, "source_pair": direct_pair,
             "method": "داده کافی در LBank در دسترس نیست"}
 
@@ -846,8 +888,8 @@ def get_btc_xau_metrics(lbank_pairs):
     btc_pair, gold_pair = "btc_usdt", "xaut_usdt"
     if btc_pair not in lbank_pairs or gold_pair not in lbank_pairs:
         return {"current": None, "change_1d": None, "change_7d": None,
-                "source": f"{btc_pair} + {gold_pair}",
-                "method": "برای ساخت نرخ متقاطع، داده واقعی BTC/USDT و XAUT/USDT در LBank لازم است."}
+                "source": f"{btc_pair} + {gold_pair}", "joined_count": 0,
+                "method": "داده BTC/USDT و XAUT/USDT در LBank لازم است."}
     btc = fetch_lbank_klines(btc_pair, "روزانه", 40)
     gold = fetch_lbank_klines(gold_pair, "روزانه", 40)
     joined = pd.merge(
@@ -858,19 +900,27 @@ def get_btc_xau_metrics(lbank_pairs):
     joined = joined[(joined["btc_usdt"] > 0) & (joined["xaut_usdt"] > 0)]
     if len(joined) < 8:
         return {"current": None, "change_1d": None, "change_7d": None,
-                "source": f"{btc_pair} + {gold_pair}",
-                "method": "برای محاسبه تغییر یک‌روزه و هفت‌روزه، کندل بسته‌شده کافی نیست."}
+                "source": f"{btc_pair} + {gold_pair}", "joined_count": len(joined),
+                "method": "کندل بسته مشترک کافی نیست."}
     ratio = joined["btc_usdt"] / joined["xaut_usdt"]
-    current = float(ratio.iloc[-1]); prev = float(ratio.iloc[-2]); week_ago = float(ratio.iloc[-8])
+    current = float(ratio.iloc[-1])
+    prev = float(ratio.iloc[-2])
+    week_ago = float(ratio.iloc[-8])
     return {"current": current,
             "change_1d": (current / prev - 1) * 100 if prev > 0 else None,
             "change_7d": (current / week_ago - 1) * 100 if week_ago > 0 else None,
             "source": f"{btc_pair} + {gold_pair}",
-            "method": "نرخ متقاطع مصنوعی BTC/XAUT = قیمت BTC/USDT ÷ قیمت XAUT/USDT"}
+            "joined_count": len(joined),
+            "method": "نرخ متقاطع BTC/XAUT = BTC/USDT ÷ XAUT/USDT"}
 
 
 @st.cache_data(ttl=180, show_spinner=False)
 def get_asset_trend_score(code, lbank_pairs, atr_period=14, ut_multiplier=2.0):
+    """
+    Per timeframe: UT state (±1) + fresh crossover (±1) + MA structure (±1).
+    Range -3..+3 per timeframe, -6..+6 across both. Better distribution than
+    the previous version that only counted crossovers (rare events).
+    """
     pair = lbank_symbol_from_code(code)
     if pair not in lbank_pairs:
         return {"score": None, "notes": [f"{pair} در LBank موجود نیست."]}
@@ -880,19 +930,30 @@ def get_asset_trend_score(code, lbank_pairs, atr_period=14, ut_multiplier=2.0):
         try:
             candles = fetch_lbank_klines(pair, timeframe, 260)
             indicators = add_market_indicators(candles, atr_period, ut_multiplier)
-            summary = latest_signal_summary(indicators)
-            if summary["buy_signal"]:
-                score += 2; notes.append(f"{timeframe}: سیگنال خرید UT")
-            elif summary["sell_signal"]:
-                score -= 2; notes.append(f"{timeframe}: سیگنال فروش UT")
+            state = ut_state(indicators)
+
+            # 1) UT state (above or below the trailing stop)
+            if state["state"] > 0:
+                score += 1; notes.append(f"{timeframe}: قیمت بالای حد UT (روند صعودی)")
+            elif state["state"] < 0:
+                score -= 1; notes.append(f"{timeframe}: قیمت زیر حد UT (روند نزولی)")
+
+            # 2) Fresh crossover bonus
+            if state["fresh_buy"]:
+                score += 1; notes.append(f"{timeframe}: سیگنال خرید تازه UT")
+            elif state["fresh_sell"]:
+                score -= 1; notes.append(f"{timeframe}: سیگنال فروش تازه UT")
+
+            # 3) MA structure
             last = indicators.iloc[-1]
+            close = number(last["Close"])
             ma50 = number(last.get("SMA 50"), float("nan"))
             ma200 = number(last.get("SMA 200"), float("nan"))
             if pd.notna(ma50) and pd.notna(ma200):
-                if summary["close"] > ma50 > ma200:
-                    score += 1; notes.append(f"{timeframe}: روند میانگین‌ها صعودی")
-                elif summary["close"] < ma50 < ma200:
-                    score -= 1; notes.append(f"{timeframe}: روند میانگین‌ها نزولی")
+                if close > ma50 > ma200:
+                    score += 1; notes.append(f"{timeframe}: روند MA صعودی")
+                elif close < ma50 < ma200:
+                    score -= 1; notes.append(f"{timeframe}: روند MA نزولی")
         except Exception as exc:
             notes.append(f"{timeframe}: داده کافی نیست ({type(exc).__name__})")
     return {"score": score, "notes": notes}
@@ -927,22 +988,24 @@ def rank_crypto_candidates(coins_df, lbank_pairs, atr_period=14, ut_multiplier=2
         relative = get_btc_relative_metrics(code, lbank_pairs)
         trend_score = trend.get("score")
         relative_change = relative.get("change_pct")
+
         if trend_score is None and relative_change is None:
             score = None
         else:
+            # Trend score (range -6..+6)
             score = int(trend_score or 0)
-            if relative_change is not None:
-                score += 1 if relative_change > 0 else (-1 if relative_change < 0 else 0)
-            if pd.notna(day_change):
-                score += 1 if day_change > 0 else (-1 if day_change < 0 else 0)
+            # Tiered relative strength: +2/-2 at ±3%, +1/-1 at ±0.5%
+            score += tiered_score(relative_change, thresholds=(0.5, 3.0))
+            # Tiered day change
+            score += tiered_score(day_change if pd.notna(day_change) else None, thresholds=(0.5, 3.0))
 
         if score is None:
             label, reason = "داده ناکافی", "برای روند و قدرت نسبی داده کافی نیست"
-        elif score >= 3:
-            label, reason = "اولویت ۱: بررسی خرید", "روند تکنیکال و قدرت نسبی بهتر؛ هنوز منتظر تأیید نقطه ورود"
-        elif score >= 1:
-            label, reason = "اولویت ۲: انتظار برای تأیید", "نشانه‌های مثبت محدود یا ترکیبی؛ خرید فوری تأیید نشده"
-        elif score <= -2:
+        elif score >= 5:
+            label, reason = "اولویت ۱: بررسی خرید", "روند تکنیکال و قدرت نسبی قوی؛ منتظر تأیید نقطه ورود"
+        elif score >= 2:
+            label, reason = "اولویت ۲: انتظار برای تأیید", "نشانه‌های مثبت محدود؛ خرید فوری تأیید نشده"
+        elif score <= -3:
             label, reason = "فعلاً اولویت پایین", "روند یا قدرت نسبی ضعیف است"
         else:
             label, reason = "خنثی: صبر", "مزیت روشن نسبت به گزینه‌های دیگر دیده نمی‌شود"
@@ -982,7 +1045,7 @@ def fetch_cryptometer_endpoint(endpoint, api_key, endpoint_params=None):
     if not isinstance(payload, dict):
         raise RuntimeError("CryptoMeter پاسخ نامعتبر برگرداند.")
     if str(payload.get("success", "")).lower() not in {"true", "1"}:
-        message = payload.get("message") or payload.get("error_message") or payload.get("error") or "خطای نامشخص API"
+        message = payload.get("message") or payload.get("error_message") or payload.get("error") or "خطای نامشخص"
         raise RuntimeError(f"CryptoMeter: {str(message)[:180]}")
     data = payload.get("data")
     if data is None:
@@ -1078,8 +1141,10 @@ def analyze_book(book):
         buckets = {}
         for price, qty in levels:
             bucket = math.floor(price / band_width)
-            zone = buckets.setdefault(bucket, {"low": bucket*band_width, "high": (bucket+1)*band_width,
-                                               "quantity": 0.0, "value": 0.0, "weighted_price": 0.0})
+            zone = buckets.setdefault(bucket, {
+                "low": bucket * band_width, "high": (bucket + 1) * band_width,
+                "quantity": 0.0, "value": 0.0, "weighted_price": 0.0,
+            })
             notional = price * qty
             zone["quantity"] += qty
             zone["value"] += notional
@@ -1092,16 +1157,24 @@ def analyze_book(book):
                           "zone_low": zone["low"], "zone_high": zone["high"],
                           "quantity": zone["quantity"], "value": zone["value"], "side": side})
         side_values = [z["value"] for z in zones]
+
+        # FIXED: previous `max(median * 2.5, p90)` collapses to top-1 for small n.
+        # For fewer than 5 zones, use a stable multiple of the median.
         if side_values:
             median_v = statistics.median(side_values)
-            sorted_v = sorted(side_values)
-            p90 = sorted_v[min(len(sorted_v)-1, int(len(sorted_v) * 0.90))]
-            threshold = max(median_v * 2.5, p90)
+            if len(side_values) < 5:
+                threshold = median_v * 2.5
+            else:
+                sorted_v = sorted(side_values)
+                p90 = sorted_v[min(len(sorted_v) - 1, int(len(sorted_v) * 0.90))]
+                threshold = max(median_v * 2.5, p90)
         else:
             threshold = 0.0
+
         for zone in zones:
             zone["significant"] = zone["value"] >= threshold if threshold else False
-            zone["classification"] = ("تراکم بالا در بازه ۰٫۱۰٪" if zone["significant"]
+            zone["classification"] = ("تراکم بالا در بازه ۰٫۱۰٪"
+                                      if zone["significant"]
                                       else "ناحیه نسبی دفتر سفارش")
         zones.sort(key=lambda z: z["value"], reverse=True)
         return zones[:8], threshold
@@ -1121,7 +1194,8 @@ def analyze_trades(trades):
     buy_usd = sell_usd = unknown_usd = 0.0
     buy_count = sell_count = 0
     for t in trades:
-        price = number(t.get("price")); amount = number(t.get("amount")); cost = number(t.get("cost"))
+        price = number(t.get("price")); amount = number(t.get("amount"))
+        cost = number(t.get("cost"))
         if cost <= 0:
             cost = price * amount
         side = t.get("side")
@@ -1175,28 +1249,37 @@ def calculate_trade_plan(book_stats, trade_stats):
     support_distance_pct = (mid - support["price"]) / mid * 100
 
     confirmations, warnings = [], []
-    if book_stats["imbalance"] > 0:
-        confirmations.append("ارزش دفتر سفارش به نفع خریداران است.")
+
+    # FIXED: require *meaningful* imbalance, not just > 0
+    imbalance_meaningful = book_stats["imbalance"] > 0.05
+    net_flow_positive = trade_stats["net_flow"] > 0
+
+    if imbalance_meaningful:
+        confirmations.append(f"عدم‌تعادل دفتر سفارش معنادار ({book_stats['imbalance']*100:+.1f}%) به نفع خریداران.")
+    elif book_stats["imbalance"] > 0:
+        warnings.append(f"عدم‌تعادل دفتر سفارش ضعیف است ({book_stats['imbalance']*100:+.1f}%).")
     else:
         warnings.append("عدم‌تعادل دفتر سفارش به نفع خریداران نیست.")
-    if trade_stats["net_flow"] > 0:
-        confirmations.append("جریان خالص معاملات طبقه‌بندی‌شده مثبت است.")
+
+    if net_flow_positive:
+        confirmations.append("جریان خالص معاملات مثبت است.")
     elif trade_stats["net_flow"] < 0:
-        warnings.append("جریان خالص معاملات طبقه‌بندی‌شده منفی است.")
+        warnings.append("جریان خالص معاملات منفی است.")
     else:
-        warnings.append("جریان خالص خرید مثبت تأیید نشده است.")
+        warnings.append("جریان خالص خرید تأیید نشده است.")
+
     if support_distance_pct > 3:
         warnings.append("نزدیک‌ترین ناحیه خرید بیش از ۳٪ پایین‌تر از قیمت فعلی است.")
     if book_stats["spread_pct"] > 0.5:
         warnings.append("فاصله خرید و فروش بالاست.")
     if rr < 1.2:
-        warnings.append("نسبت سود احتمالی به ریسک کمتر از ۱٫۲ است.")
+        warnings.append("نسبت سود به ریسک کمتر از ۱٫۲ است.")
 
     confirmed = (
         support_distance_pct <= 3
         and book_stats["spread_pct"] <= 0.5
         and rr >= 1.2
-        and (book_stats["imbalance"] > 0 or trade_stats["net_flow"] > 0)
+        and (imbalance_meaningful or net_flow_positive)
     )
     return {
         "status": "ENTRY WATCH" if confirmed else "WAIT",
@@ -1229,14 +1312,14 @@ def fetch_free_liquidation_heatmap(symbol="BTC", window_minutes=240, price_bucke
     if not prices or not times or not matrix:
         return {"clusters": clusters, "totals": payload.get("totals") or {},
                 "by_side": payload.get("by_side") or {},
-                "note": payload.get("note") or "در بازه انتخاب‌شده لیکوییدیشن ثبت‌شده کافی موجود نیست.",
+                "note": payload.get("note") or "لیکوییدیشن کافی موجود نیست.",
                 "public": payload.get("public", True)}, None
     if len(matrix) == len(times) and matrix and len(matrix[0]) == len(prices):
         z = [list(row) for row in zip(*matrix)]
     elif len(matrix) == len(prices) and matrix and len(matrix[0]) == len(times):
         z = matrix
     else:
-        return None, "ابعاد ماتریس لیکوییدیشن با محورهای قیمت/زمان سازگار نیست."
+        return None, "ابعاد ماتریس سازگار نیست."
     x_values = []
     for value in times:
         ts = number(value, None)
@@ -1314,7 +1397,8 @@ def build_pdf_report(report_data):
     title_style = ParagraphStyle("SpotPilotTitle", parent=styles["Title"], fontName=font_name,
                                  fontSize=18, leading=23, alignment=TA_RIGHT, spaceAfter=5 * mm)
     h_style = ParagraphStyle("SpotPilotHeading", parent=styles["Heading2"], fontName=font_name,
-                             fontSize=12, leading=16, alignment=TA_RIGHT, spaceBefore=4 * mm, spaceAfter=2 * mm)
+                             fontSize=12, leading=16, alignment=TA_RIGHT,
+                             spaceBefore=4 * mm, spaceAfter=2 * mm)
     body_style = ParagraphStyle("SpotPilotBody", parent=styles["BodyText"], fontName=font_name,
                                 fontSize=8.5, leading=12, alignment=TA_RIGHT, wordWrap="CJK")
     cell_style = ParagraphStyle("SpotPilotCell", parent=body_style, fontSize=7, leading=9,
@@ -1387,13 +1471,29 @@ def build_pdf_report(report_data):
     add_heading("خلاصه بازار")
     add_paragraph(
         f"قیمت BTC/USD: {report_data.get('btc_usd', '—')} | "
-        f"تعداد ارزهای دریافت‌شده: {report_data.get('fetched_count', '—')} | "
-        f"تعداد ارزهای پس از فیلتر: {report_data.get('coin_count', '—')}"
+        f"ارزهای دریافت‌شده: {report_data.get('fetched_count', '—')} | "
+        f"پس از فیلتر: {report_data.get('coin_count', '—')}"
     )
     add_paragraph(f"وضعیت LBank: {report_data.get('lbank_status', '—')}")
 
     add_heading("۱. فهرست ارزهای LiveCoinWatch")
     add_table(report_data.get("coins_df"), col_widths=[1.0, 1.1, 1.25, 1.25, 1.15, 1.1, 0.9, 0.9])
+
+    ratio = report_data.get("btc_xau_metrics") or {}
+    if ratio.get("current") is not None:
+        add_heading("نسبت BTC/XAUT و تخصیص مدل")
+        add_paragraph(
+            f"نرخ: {number(ratio.get('current')):.4f} XAUT/BTC | "
+            f"۱ روزه: {number(ratio.get('change_1d'), float('nan')):+.2f}% | "
+            f"۷ روزه: {number(ratio.get('change_7d'), float('nan')):+.2f}%"
+        )
+        if report_data.get("allocation"):
+            add_paragraph(
+                f"تخصیص: {report_data.get('allocation')} | "
+                f"XAUT: {report_data.get('gold_pct', '—')}% | "
+                f"رمزارز: {report_data.get('crypto_pct', '—')}%"
+            )
+            add_paragraph(str(report_data.get("allocation_reason") or ""))
 
     ranking = report_data.get("crypto_ranking") or []
     if ranking:
@@ -1417,43 +1517,47 @@ def build_pdf_report(report_data):
         plan = result.get("plan", {})
         add_heading(f"تایم‌فریم {tf_name}")
         add_paragraph(
-            f"زمان آخرین کندل بسته‌شده (UTC): {summary.get('time', '—')} | "
-            f"قیمت بسته‌شده: {summary.get('close', '—')} | ATR: {summary.get('atr', '—')} | "
-            f"حد متحرک UT: {summary.get('ut_stop', '—')}"
+            f"آخرین کندل بسته‌شده: {summary.get('time', '—')} | "
+            f"قیمت: {summary.get('close', '—')} | ATR: {summary.get('atr', '—')} | "
+            f"حد UT: {summary.get('ut_stop', '—')}"
         )
         add_paragraph(
-            f"سیگنال: {'خرید' if summary.get('buy_signal') else 'فروش' if summary.get('sell_signal') else 'بدون سیگنال تازه'} | "
-            f"ساختار بازار: {summary.get('structure', '—')} | سناریو: {plan.get('status', '—')}"
+            f"سیگنال: {'خرید' if summary.get('buy_signal') else 'فروش' if summary.get('sell_signal') else 'بدون تازه'} | "
+            f"ساختار: {summary.get('structure', '—')} | سناریو: {plan.get('status', '—')}"
         )
         if "stop" in plan:
             add_paragraph(
-                f"قیمت مبنا: {plan.get('close', '—')} | حد ضرر: {plan.get('stop', '—')} | "
-                f"هدف ۱: {plan.get('target1', '—')} | هدف ۲: {plan.get('target2', '—')}"
+                f"مبنا: {plan.get('close', '—')} | SL: {plan.get('stop', '—')} | "
+                f"TP1: {plan.get('target1', '—')} | TP2: {plan.get('target2', '—')}"
             )
 
     add_heading("۴. دفتر سفارش و جریان معاملات LBank")
     add_paragraph(
         f"بهترین خرید: {report_data.get('best_bid', '—')} | بهترین فروش: {report_data.get('best_ask', '—')} | "
-        f"فاصله خرید و فروش: {report_data.get('spread_pct', '—')} | عدم‌تعادل: {report_data.get('imbalance', '—')}"
+        f"اسپرد: {report_data.get('spread_pct', '—')} | عدم‌تعادل: {report_data.get('imbalance', '—')}"
     )
     add_paragraph(
-        f"حجم خرید اخیر: {report_data.get('buy_usd', '—')} | حجم فروش اخیر: {report_data.get('sell_usd', '—')} | "
-        f"جریان خالص: {report_data.get('net_flow', '—')} | تعداد معاملات: {report_data.get('trade_count', '—')}"
+        f"حجم خرید: {report_data.get('buy_usd', '—')} | حجم فروش: {report_data.get('sell_usd', '—')} | "
+        f"جریان خالص: {report_data.get('net_flow', '—')} | تعداد: {report_data.get('trade_count', '—')}"
     )
+    add_heading("سطوح خرید")
+    add_table(report_data.get("bid_df"), col_widths=[1.0, 1.0, 1.5, 1.2])
+    add_heading("سطوح فروش")
+    add_table(report_data.get("ask_df"), col_widths=[1.0, 1.0, 1.5, 1.2])
 
-    add_heading("۵. سناریوی احتمالی ورود و خروج")
+    add_heading("۵. سناریوی ورود و خروج")
     order_plan = report_data.get("order_plan") or {}
     add_paragraph(f"وضعیت: {order_plan.get('status', '—')} | توضیح: {order_plan.get('reason', '—')}")
     if "entry" in order_plan:
         add_paragraph(
-            f"ورود احتمالی: {order_plan.get('entry', '—')} | هدف: {order_plan.get('target', '—')} | "
-            f"حد ابطال: {order_plan.get('stop', '—')} | R/R: {order_plan.get('rr', '—')}"
+            f"ورود: {order_plan.get('entry', '—')} | هدف: {order_plan.get('target', '—')} | "
+            f"SL: {order_plan.get('stop', '—')} | R/R: {order_plan.get('rr', '—')}"
         )
 
     add_heading("محدودیت‌ها")
     add_paragraph(
-        "این گزارش از داده‌های عمومی بازار استفاده می‌کند و هیچ معامله‌ای ثبت نمی‌کند. "
-        "سیگنال‌ها و سطوح تحلیلی تخمینی هستند و سود را تضمین نمی‌کنند."
+        "این گزارش از داده‌های عمومی استفاده می‌کند و معامله‌ای ثبت نمی‌کند. "
+        "سیگنال‌ها و سطوح تخمینی هستند و سود را تضمین نمی‌کنند."
     )
 
     doc.build(story, onFirstPage=draw_footer, onLaterPages=draw_footer)
@@ -1462,7 +1566,7 @@ def build_pdf_report(report_data):
 
 
 # ===========================================================================
-# ========== STREAMLIT UI (THIS IS THE PART THAT WAS MISSING) ===============
+# ============================ STREAMLIT UI =================================
 # ===========================================================================
 st.set_page_config(page_title="SpotPilot AI", page_icon="📊", layout="wide")
 
@@ -1470,22 +1574,14 @@ st.markdown(
     """
     <style>
     :root { --spotpilot-persian-font: Tahoma, Arial, sans-serif; }
-
     html, body, .stApp,
-    [data-testid="stAppViewContainer"],
-    [data-testid="stHeader"],
-    [data-testid="stMain"],
-    [data-testid="stMainBlockContainer"],
-    [data-testid="stSidebar"],
-    [data-testid="stSidebarContent"],
-    [data-testid="stBottom"],
-    [data-testid="stPopover"],
-    [data-testid="stDialog"] {
-        direction: rtl;
-        text-align: right;
+    [data-testid="stAppViewContainer"], [data-testid="stHeader"],
+    [data-testid="stMain"], [data-testid="stMainBlockContainer"],
+    [data-testid="stSidebar"], [data-testid="stSidebarContent"],
+    [data-testid="stBottom"], [data-testid="stPopover"], [data-testid="stDialog"] {
+        direction: rtl; text-align: right;
         font-family: var(--spotpilot-persian-font) !important;
     }
-
     .stApp p, .stApp label, .stApp button, .stApp input,
     .stApp textarea, .stApp select, .stApp option,
     .stApp h1, .stApp h2, .stApp h3, .stApp h4, .stApp h5, .stApp h6,
@@ -1498,71 +1594,43 @@ st.markdown(
     .stApp [data-testid="stExpander"],
     [role="listbox"], [role="option"], [role="menu"], [role="menuitem"] {
         font-family: var(--spotpilot-persian-font) !important;
-        direction: rtl;
-        text-align: right;
-        line-height: 1.65;
+        direction: rtl; text-align: right; line-height: 1.65;
     }
-
     .block-container { max-width: 1500px; padding-top: 1.4rem; padding-bottom: 2.5rem; }
-
-    [data-testid="stSidebar"] *:not(svg):not(path):not(.material-icons):not(.material-symbols-rounded) {
-        text-align: right;
-    }
-
-    [data-testid="stHorizontalBlock"],
-    [data-testid="stVerticalBlock"],
-    [data-testid="stExpander"],
-    [data-testid="stForm"],
-    [data-testid="stAlert"],
-    [data-testid="stNotificationContent"] { direction: rtl; }
-
+    [data-testid="stSidebar"] *:not(svg):not(path):not(.material-icons):not(.material-symbols-rounded) { text-align: right; }
+    [data-testid="stHorizontalBlock"], [data-testid="stVerticalBlock"],
+    [data-testid="stExpander"], [data-testid="stForm"],
+    [data-testid="stAlert"], [data-testid="stNotificationContent"] { direction: rtl; }
     .stTabs [data-baseweb="tab-list"] { direction: rtl; }
-
     .stButton, .stDownloadButton,
-    [data-testid="stButton"], [data-testid="stDownloadButton"] {
-        direction: rtl; text-align: center;
-    }
-
-    [data-baseweb="select"] > div,
-    [data-baseweb="input"] > div,
-    [data-baseweb="textarea"],
-    [role="listbox"], [role="option"] {
+    [data-testid="stButton"], [data-testid="stDownloadButton"] { direction: rtl; text-align: center; }
+    [data-baseweb="select"] > div, [data-baseweb="input"] > div,
+    [data-baseweb="textarea"], [role="listbox"], [role="option"] {
         direction: rtl; text-align: right;
         font-family: var(--spotpilot-persian-font) !important;
     }
-
     .stMarkdown ul, .stMarkdown ol,
-    [data-testid="stMarkdownContainer"] ul,
-    [data-testid="stMarkdownContainer"] ol {
+    [data-testid="stMarkdownContainer"] ul, [data-testid="stMarkdownContainer"] ol {
         padding-right: 1.5rem; padding-left: 0;
     }
-
     [data-testid="stMetricLabel"] {
         direction: rtl; text-align: right; justify-content: flex-start;
         font-family: var(--spotpilot-persian-font) !important;
     }
-
-    [data-testid="stMetricValue"],
-    [data-testid="stMetricDelta"] {
+    [data-testid="stMetricValue"], [data-testid="stMetricDelta"] {
         direction: ltr; text-align: right;
-        unicode-bidi: plaintext;
-        font-variant-numeric: tabular-nums;
+        unicode-bidi: plaintext; font-variant-numeric: tabular-nums;
     }
-
     .stNumberInput input, .stDateInput input, .stTimeInput input {
-        direction: ltr; text-align: left;
-        font-variant-numeric: tabular-nums;
+        direction: ltr; text-align: left; font-variant-numeric: tabular-nums;
     }
-
     [data-testid="stDataFrame"], [data-testid="stTable"], [data-testid="stDataEditor"] {
         direction: rtl; text-align: right;
     }
-
     code, pre, .stCode, [data-testid="stCode"] {
         direction: ltr; text-align: left;
         font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace !important;
     }
-
     .material-icons, .material-symbols-rounded, [data-testid="stIconMaterial"] {
         font-family: "Material Icons", "Material Symbols Rounded", sans-serif !important;
         direction: ltr;
@@ -1599,11 +1667,10 @@ with st.sidebar:
         st.caption("اگر با این پارامترها آشنا نیستی، مقدار پیش‌فرض را تغییر نده.")
         atr_period = st.number_input(
             "دوره ATR", min_value=2, max_value=100, value=14, step=1,
-            help="تعداد کندل‌های مورد استفاده برای برآورد نوسان. مقدار پیش‌فرض ۱۴ استاندارد Wilder است.",
+            help="تعداد کندل‌های برآورد نوسان. پیش‌فرض ۱۴ استاندارد Wilder است.",
         )
         ut_multiplier = st.number_input(
             "ضریب ATR (Key Value)", min_value=0.1, max_value=20.0, value=2.0, step=0.1,
-            help="ضریب فاصله حد متحرک UT از قیمت.",
         )
 
     refresh = st.button("🔄 به‌روزرسانی داده‌ها", use_container_width=True)
@@ -1645,10 +1712,11 @@ if not coins:
 
 try:
     lbank_pairs = set(fetch_lbank_pairs())
-    lbank_status = f"{sum(1 for p in lbank_pairs if p.endswith('_usdt'))} جفت‌ارز USDT و {sum(1 for p in lbank_pairs if p.endswith('_btc'))} جفت‌ارز BTC شناسایی شد"
+    lbank_status = (f"{sum(1 for p in lbank_pairs if p.endswith('_usdt'))} USDT "
+                    f"و {sum(1 for p in lbank_pairs if p.endswith('_btc'))} BTC")
 except Exception as exc:
     lbank_pairs = set()
-    lbank_status = f"دریافت جفت‌ارزهای LBank ناموفق بود: {exc}"
+    lbank_status = f"دریافت جفت‌ارزها ناموفق بود: {exc}"
 
 st.caption(f"وضعیت بازار LBank: {lbank_status}")
 
@@ -1692,10 +1760,7 @@ display_df["تغییر ۲۴ساعته"] = display_df["تغییر ۲۴ساعته"
 display_df["در LBank"] = display_df["در LBank"].map(lambda b: "بله" if b else "خیر")
 
 st.subheader("۱. انتخاب ارز")
-st.caption(
-    "چهار جفت‌ارز ثابت همیشه در ابتدای فهرست هستند: BTC/USDT، XAUT/USDT، "
-    "SOL/USDT و ETH/USDT."
-)
+st.caption("چهار جفت‌ارز ثابت همیشه در ابتدای فهرست هستند.")
 
 event = st.dataframe(
     display_df, use_container_width=True, hide_index=True, height=360,
@@ -1712,7 +1777,10 @@ else:
 # ---------------------------------------------------------------------------
 st.divider()
 st.subheader("۲. اولویت رمزارزها برای بررسی خرید")
-st.caption("رتبه‌ها از روند ۴ساعته/روزانه، عملکرد نسبت به BTC، تغییر ۲۴ساعته و حجم واقعی کمک می‌گیرند.")
+st.caption(
+    "امتیاز ترکیبی از روند UT + کراس‌اُور تازه + ساختار MA در دو تایم‌فریم "
+    "(±۶)، تغییر پله‌ای نسبت به BTC (±۲) و تغییر ۲۴ساعته پله‌ای (±۲)."
+)
 crypto_ranking = []
 try:
     with st.spinner("مقایسه روند و قدرت نسبی رمزارزهای برتر فهرست..."):
@@ -1721,38 +1789,37 @@ try:
     if crypto_ranking:
         ranking_df = pd.DataFrame(crypto_ranking)
         best = ranking_df.iloc[0]
-        if best["Score"] is not None and best["Score"] >= 3:
+        if best["Score"] is not None and best["Score"] >= 5:
             st.success(f"**انتخاب اول فعلی برای بررسی: {best['Code']}** — {best['Reason']}.")
         else:
-            st.info("**فعلاً خرید فوری تأیید نشده است.** رتبه اول جدول فقط بهترین گزینه نسبی بین داده‌های موجود است.")
+            st.info("**فعلاً خرید فوری تأیید نشده است.** رتبه اول فقط بهترین گزینه نسبی است.")
         display_ranking = ranking_df[[
             "Code", "Priority", "Score", "24h Change %", "BTC Relative %", "Reason"
         ]].copy()
         display_ranking = display_ranking.rename(columns={
             "Code": "رمزارز", "Priority": "اولویت", "Score": "امتیاز مدل",
-            "24h Change %": "تغییر ۲۴ساعته (%)", "BTC Relative %": "تغییر نسبت به BTC (%)",
+            "24h Change %": "تغییر ۲۴ساعته (%)", "BTC Relative %": "نسبت به BTC (%)",
             "Reason": "دلیل ساده",
         })
-        for col in ("تغییر ۲۴ساعته (%)", "تغییر نسبت به BTC (%)"):
+        for col in ("تغییر ۲۴ساعته (%)", "نسبت به BTC (%)"):
             display_ranking[col] = display_ranking[col].map(
                 lambda v: f"{v:+.2f}%" if v is not None and pd.notna(v) else "—")
         display_ranking["امتیاز مدل"] = display_ranking["امتیاز مدل"].map(
             lambda v: str(v) if v is not None and pd.notna(v) else "—")
         st.dataframe(display_ranking, use_container_width=True, hide_index=True)
-        with st.expander("چرا این رتبه‌بندی را داده؟"):
+        with st.expander("چرا این رتبه‌بندی؟"):
             for item in crypto_ranking:
-                st.markdown(f"**{item['Code']} — {item['Priority']}**")
-                st.caption("؛ ".join(item["Trend notes"][:5]) if item["Trend notes"] else item["Reason"])
+                st.markdown(f"**{item['Code']} — {item['Priority']} (امتیاز {item['Score']})**")
+                st.caption("؛ ".join(item["Trend notes"][:6]) if item["Trend notes"] else item["Reason"])
                 st.caption(item["Relative method"])
     else:
-        st.warning("از فهرست فعلی، رمزارز قابل بررسی با جفت USDT در LBank پیدا نشد.")
+        st.warning("رمزارز قابل بررسی با جفت USDT در LBank پیدا نشد.")
 except Exception as exc:
-    st.warning(f"رتبه‌بندی رمزارزها کامل نشد: {type(exc).__name__}: {str(exc)[:180]}")
+    st.warning(f"رتبه‌بندی ناموفق: {type(exc).__name__}: {str(exc)[:180]}")
 
 # ---------------------------------------------------------------------------
 st.divider()
 st.subheader(f"۳. مقایسه قیمت {selected_code}")
-st.caption("اختلاف‌ها ممکن است ناشی از زمان به‌روزرسانی، بازار یا نقدشوندگی باشند.")
 
 selected_lbank_pair = lbank_symbol_from_code(selected_code)
 selected_lbank_pair = selected_lbank_pair if selected_lbank_pair in lbank_pairs else None
@@ -1778,7 +1845,6 @@ if compare_errors:
 # ---------------------------------------------------------------------------
 st.divider()
 st.subheader("۴. ارزش نسبت به بیت‌کوین (BTC Pair)")
-st.caption("بررسی می‌کند خودِ ارز در برابر BTC قوی‌تر شده یا ضعیف‌تر.")
 try:
     with st.spinner("بررسی نسبت واقعی ارز به BTC در LBank..."):
         btc_relative = get_btc_relative_metrics(selected_code, lbank_pairs)
@@ -1791,9 +1857,9 @@ try:
     st.caption(btc_relative["method"])
     if btc_relative["change_pct"] is not None:
         if btc_relative["change_pct"] > 0:
-            st.success(f"در بازه محاسبه‌شده، {selected_code} نسبت به BTC عملکرد بهتری داشته است.")
+            st.success(f"{selected_code} نسبت به BTC عملکرد بهتری داشته است.")
         elif btc_relative["change_pct"] < 0:
-            st.warning(f"در بازه محاسبه‌شده، {selected_code} نسبت به BTC ضعیف‌تر شده است.")
+            st.warning(f"{selected_code} نسبت به BTC ضعیف‌تر شده است.")
         else:
             st.info("عملکرد نسبت به BTC تقریباً بدون تغییر بوده است.")
 except Exception as exc:
@@ -1807,7 +1873,7 @@ if selected_code in ("BTC", "XAUT"):
             st.info(btc_xau["method"])
         else:
             q1, q2, q3 = st.columns(3)
-            q1.metric("BTC/XAUT مصنوعی", f"{btc_xau['current']:.4f} XAUT برای هر BTC")
+            q1.metric("BTC/XAUT مصنوعی", f"{btc_xau['current']:.4f} XAUT/BTC")
             q2.metric("تغییر یک‌روزه", f"{btc_xau['change_1d']:+.2f}%")
             q3.metric("تغییر هفت‌روزه", f"{btc_xau['change_7d']:+.2f}%")
             st.caption(btc_xau["method"])
@@ -1817,11 +1883,11 @@ if selected_code in ("BTC", "XAUT"):
 # ---------------------------------------------------------------------------
 st.divider()
 st.subheader("۵. تحلیل تکنیکال")
-st.caption("۱۵ دقیقه برای کوتاه‌مدت، ۴ ساعت میان‌مدت، روزانه بلندمدت. سیگنال‌ها از کندل‌های بسته‌شده محاسبه می‌شوند.")
+st.caption("سیگنال‌ها از کندل‌های بسته‌شده محاسبه می‌شوند.")
 
 timeframe_results = {}
 if not selected_lbank_pair:
-    st.warning(f"{selected_code} در فهرست جفت‌ارزهای USDT در LBank پیدا نشد.")
+    st.warning(f"{selected_code} در جفت‌ارزهای USDT در LBank پیدا نشد.")
 else:
     st.write(f"جفت‌ارز تحلیل: **{selected_lbank_pair}**")
     tf_tabs = st.tabs(["۱۵ دقیقه", "۴ ساعت", "روزانه"])
@@ -1859,9 +1925,9 @@ else:
                 candle_age_minutes = max(0.0, (pd.Timestamp.now(tz="UTC") - candle_close_time).total_seconds() / 60)
                 stale_threshold = int(TIMEFRAMES[tf_name]["seconds"]) / 60 * 2
                 if candle_age_minutes > stale_threshold:
-                    st.warning(f"داده قدیمی است: آخرین کندل {candle_age_minutes:.0f} دقیقه پیش بسته شد.")
+                    st.warning(f"داده قدیمی: آخرین کندل {candle_age_minutes:.0f} دقیقه پیش بسته شد.")
                 else:
-                    st.caption(f"تازگی داده: مناسب | پایان آخرین کندل: {candle_close_time.strftime('%Y-%m-%d %H:%M UTC')}")
+                    st.caption(f"تازگی داده مناسب | پایان آخرین کندل: {candle_close_time.strftime('%Y-%m-%d %H:%M UTC')}")
 
                 last = indicators.iloc[-1]
                 st.markdown("#### میانگین‌های متحرک")
@@ -1869,8 +1935,8 @@ else:
                 ma_values = {}
                 ma_explanations = {
                     14: "کوتاه‌مدت؛ سریع‌تر واکنش نشان می‌دهد.",
-                    50: "میان‌مدت؛ برای دیدن جهت کلی‌تر.",
-                    200: "بلندمدت؛ به تاریخچه کافی نیاز دارد.",
+                    50: "میان‌مدت؛ جهت کلی‌تر.",
+                    200: "بلندمدت؛ تاریخچه کافی لازم است.",
                 }
                 for col, period in zip(ma_cols, (14, 50, 200)):
                     ma_value = number(last.get(f"SMA {period}"), float("nan"))
@@ -1888,13 +1954,13 @@ else:
                 valid_ma = {p: v for p, v in ma_values.items() if pd.notna(v) and v > 0}
                 if 50 in valid_ma and 200 in valid_ma:
                     if summary["close"] > valid_ma[50] > valid_ma[200]:
-                        st.success("قیمت بالاتر از میانگین‌های ۵۰ و ۲۰۰ است؛ روند متمایل به صعودی.")
+                        st.success("قیمت بالای SMA 50 و 200؛ روند متمایل به صعودی.")
                     elif summary["close"] < valid_ma[50] < valid_ma[200]:
-                        st.warning("قیمت پایین‌تر از میانگین‌های ۵۰ و ۲۰۰ است؛ روند متمایل به نزولی.")
+                        st.warning("قیمت زیر SMA 50 و 200؛ روند متمایل به نزولی.")
                     else:
-                        st.info("میانگین‌ها هم‌جهت نیستند؛ روند یک‌دست نیست.")
+                        st.info("میانگین‌ها هم‌جهت نیستند.")
                 else:
-                    st.info("برای برداشت روند بلندمدت، ابتدا باید داده کافی برای SMA 50 و SMA 200 دریافت شود.")
+                    st.info("داده کافی برای SMA 50 و 200 موجود نیست.")
 
                 st.write(f"**ساختار بازار:** {summary['structure']}")
 
@@ -1908,7 +1974,6 @@ else:
                 else:
                     st.warning(plan["reason"])
 
-                # Chart
                 st.markdown("#### نمودار قیمت و میانگین‌ها")
                 elliott_enabled = st.checkbox("نمایش شمارش احتمالی امواج الیوت",
                                               value=False, key=f"elliott_overlay_{tf_name}")
@@ -1922,9 +1987,9 @@ else:
                     increasing_line_color="#16a34a", decreasing_line_color="#dc2626",
                 ))
                 ma_styles = {
-                    14: ("#2563eb", "SMA 14 — کوتاه‌مدت"),
-                    50: ("#f59e0b", "SMA 50 — میان‌مدت"),
-                    200: ("#9333ea", "SMA 200 — بلندمدت"),
+                    14: ("#2563eb", "SMA 14"),
+                    50: ("#f59e0b", "SMA 50"),
+                    200: ("#9333ea", "SMA 200"),
                 }
                 for period, (line_color, line_name) in ma_styles.items():
                     col_name = f"SMA {period}"
@@ -1961,9 +2026,9 @@ else:
                         fig.add_trace(go.Scatter(
                             x=wave_points["Time"], y=wave_points["Price"],
                             mode="lines+markers+text", text=wave_points["Label"],
-                            textposition="top center", name="پیوت‌ها / شمارش احتمالی",
+                            textposition="top center", name="پیوت‌ها",
                             line={"color": "#7c3aed", "width": 2},
-                            marker={"size": 7, "color": "#7c3aed", "symbol": "circle"},
+                            marker={"size": 7, "color": "#7c3aed"},
                             textfont={"color": "#7c3aed", "size": 11},
                             connectgaps=False,
                         ))
@@ -1972,385 +2037,4 @@ else:
                             t0 = pd.to_datetime(chart_df["Time"].iloc[-1], utc=True, errors="coerce")
                             step_seconds = int(TIMEFRAMES.get(tf_name, {}).get("seconds", 14400))
                             next_time = t0 + pd.Timedelta(seconds=step_seconds)
-                            future_times = [t0 + pd.Timedelta(seconds=step_seconds * k) for k in (2, 3, 4, 5)]
-                            future_prices = context["forecast"]
-                            last_pivot = wave_points.iloc[-1]
-                            pivot_time = pd.to_datetime(last_pivot["Time"], utc=True, errors="coerce")
-                            if pd.notna(pivot_time) and pivot_time < t0:
-                                fig.add_trace(go.Scatter(
-                                    x=[pivot_time, t0], y=[float(last_pivot["Price"]), last_price],
-                                    mode="lines", name="پیوت تا قیمت فعلی",
-                                    line={"color": "#94a3b8", "width": 1.5, "dash": "dot"},
-                                ))
-                            fig.add_trace(go.Scatter(
-                                x=[next_time] + future_times, y=[last_price] + future_prices,
-                                mode="lines+markers+text",
-                                text=["مبدأ سناریو"] + context["forecast_labels"],
-                                textposition="top center", name="سناریوی آینده — فرضیه",
-                                line={"color": "#dc2626", "width": 2.5, "dash": "dash"},
-                                marker={"size": 7, "color": "#dc2626"},
-                                connectgaps=False,
-                            ))
-                            st.caption(
-                                f"جهت سناریو: {'صعودی' if context['direction'] > 0 else 'نزولی' if context['direction'] < 0 else 'خنثی'} | "
-                                f"اطمینان: {context['confidence']}"
-                            )
-                            if context["notes"]:
-                                st.write("**شواهد:** " + "؛ ".join(context["notes"]))
-                            if context["invalid"]:
-                                st.warning("قوانین ایمپالس تأیید نشده‌اند: " + "؛ ".join(context["invalid"]))
-                    else:
-                        st.info("برای شمارش موج، پیوت کافی وجود ندارد.")
-                fig.update_layout(
-                    height=520, margin={"l": 12, "r": 12, "t": 28, "b": 12},
-                    hovermode="x unified", xaxis_title="زمان (UTC)", yaxis_title="قیمت",
-                    legend={"orientation": "h", "yanchor": "bottom", "y": 1.02, "xanchor": "left", "x": 0},
-                    xaxis={"rangeslider": {"visible": False}, "showgrid": True},
-                    yaxis={"side": "right", "showgrid": True},
-                    template="plotly_white",
-                )
-                st.plotly_chart(fig, use_container_width=True,
-                                config={"displaylogo": False, "scrollZoom": True})
-
-                signal_table = indicators.tail(12)[
-                    ["Time", "Open", "High", "Low", "Close", "Volume",
-                     "ATR", "UT Stop", "UT Buy", "UT Sell", "Structure"]
-                ].copy()
-                signal_table["Time"] = signal_table["Time"].dt.strftime("%Y-%m-%d %H:%M UTC")
-                for col in ["Open", "High", "Low", "Close", "ATR", "UT Stop"]:
-                    signal_table[col] = signal_table[col].map(fmt_price)
-                with st.expander("جزئیات کندل‌های اخیر"):
-                    st.dataframe(signal_table, use_container_width=True, hide_index=True)
-
-            except Exception as exc:
-                st.error(f"تحلیل تایم‌فریم {tf_name} ناموفق بود: {type(exc).__name__}: {str(exc)[:300]}")
-
-    if timeframe_results:
-        st.markdown("#### خلاصه هم‌جهتی تایم‌فریم‌ها")
-        overview = []
-        for tf_name in tf_names:
-            result = timeframe_results.get(tf_name)
-            if not result:
-                continue
-            summary = result["summary"]
-            plan = result["plan"]
-            overview.append({
-                "تایم‌فریم": tf_name,
-                "قیمت بسته‌شده": fmt_price(summary["close"]),
-                "سیگنال UT": ("خرید" if summary["buy_signal"]
-                              else "فروش" if summary["sell_signal"]
-                              else "بدون سیگنال تازه"),
-                "ساختار": summary["structure"],
-                "سناریو": plan["status"],
-            })
-        st.dataframe(pd.DataFrame(overview), use_container_width=True, hide_index=True)
-
-        buy_count = sum(1 for r in timeframe_results.values() if r["summary"]["buy_signal"])
-        sell_count = sum(1 for r in timeframe_results.values() if r["summary"]["sell_signal"])
-        if buy_count >= 2:
-            st.success(f"هم‌جهتی اولیه: سیگنال خرید UT در {buy_count} تایم‌فریم.")
-        elif sell_count >= 2:
-            st.warning(f"هم‌جهتی نزولی: سیگنال فروش UT در {sell_count} تایم‌فریم.")
-        else:
-            st.info("هنوز دو تایم‌فریم سیگنال هم‌جهت تازه ندارند.")
-
-# ---------------------------------------------------------------------------
-# CryptoMeter expander
-st.divider()
-st.subheader("۶. نقدینگی و معاملات اخیر LBank")
-
-with st.expander("جریان نقدینگی و فشار خرید/فروش — CryptoMeter.io", expanded=False):
-    cryptometer_key = get_cryptometer_key()
-    if not cryptometer_key:
-        st.info("برای فعال‌کردن، CRYPTOMETER_API_KEY را در Streamlit Secrets تنظیم کن.")
-    else:
-        try:
-            trend = {}
-            book_df = pd.DataFrame()
-            movement_df = pd.DataFrame()
-            movers_df = pd.DataFrame()
-            with st.spinner("دریافت داده‌های رایگان CryptoMeter..."):
-                try:
-                    trend_data = fetch_cryptometer_endpoint("trend-indicator-v3", cryptometer_key, {})
-                    trend_rows = trend_data if isinstance(trend_data, list) else [trend_data]
-                    trend_rows = [r for r in trend_rows if isinstance(r, dict)]
-                    trend = trend_rows[-1] if trend_rows else {}
-                except Exception as e:
-                    st.caption(f"trend-indicator-v3 در دسترس نبود: {type(e).__name__}")
-                if trend:
-                    buy_pressure = number(trend.get("buy_pressure"), None)
-                    sell_pressure = number(trend.get("sell_pressure"), None)
-                    trend_score = number(trend.get("trend_score"), None)
-                    tc1, tc2, tc3 = st.columns(3)
-                    tc1.metric("امتیاز روند", f"{trend_score:.2f}" if trend_score is not None else "—")
-                    tc2.metric("فشار خرید", f"{buy_pressure:.2f}%" if buy_pressure is not None else "—")
-                    tc3.metric("فشار فروش", f"{sell_pressure:.2f}%" if sell_pressure is not None else "—")
-        except Exception as exc:
-            st.warning(f"دریافت CryptoMeter ناموفق بود: {type(exc).__name__}: {str(exc)[:180]}")
-
-with st.expander("نقشه رایگان لیکوییدیشن BTC (بدون کلید API)", expanded=False):
-    st.markdown("این نقشه از API عمومی SmartMoneyAPI استفاده می‌کند.")
-    try:
-        heatmap, heatmap_error = fetch_free_liquidation_heatmap("BTC", 240, 50)
-        if heatmap and heatmap.get("z"):
-            totals = heatmap.get("totals") or {}
-            sides = heatmap.get("by_side") or {}
-            m1, m2, m3 = st.columns(3)
-            m1.metric("مجموع لیکوییدیشن", fmt_usd(number(totals.get("total_notional"))))
-            m2.metric("لانگ", fmt_usd(number(sides.get("long", totals.get("long_liq_notional")))))
-            m3.metric("شورت", fmt_usd(number(sides.get("short", totals.get("short_liq_notional")))))
-            fig_liq = go.Figure(data=go.Heatmap(
-                x=heatmap["x"], y=heatmap["y"], z=heatmap["z"],
-                colorscale="Turbo", colorbar={"title": "لیکوییدیشن"},
-            ))
-            fig_liq.update_layout(height=500, title="BTC — لیکوییدیشن‌های ۴ ساعت اخیر")
-            st.plotly_chart(fig_liq, use_container_width=True)
-        else:
-            st.info(f"نقشه فعلاً در دسترس نیست: {heatmap_error}")
-    except Exception as exc:
-        st.warning(f"دریافت نقشه ناموفق بود: {type(exc).__name__}: {str(exc)[:180]}")
-
-# ---------------------------------------------------------------------------
-if not selected_lbank_pair:
-    st.warning(f"تحلیل دفتر سفارش برای {selected_code} در دسترس نیست.")
-    st.stop()
-
-st.write(f"جفت‌ارز LBank: **{selected_lbank_pair}**")
-
-try:
-    with st.spinner("دریافت دفتر سفارش عمومی LBank..."):
-        book = fetch_lbank_book(selected_lbank_pair)
-        book_stats = analyze_book(book)
-except Exception as exc:
-    st.error(f"دریافت یا تحلیل دفتر سفارش ناموفق بود: {exc}")
-    st.stop()
-
-try:
-    with st.spinner("دریافت معاملات اخیر LBank..."):
-        trades = fetch_lbank_trades(selected_lbank_pair)
-        trade_stats = analyze_trades(trades)
-except Exception as exc:
-    trade_stats = analyze_trades([])
-    st.warning(f"معاملات اخیر قابل دریافت نبودند: {type(exc).__name__}: {str(exc)[:200]}")
-
-metrics = st.columns(4)
-metrics[0].metric("بهترین خرید", fmt_price(book_stats["best_bid"]))
-metrics[1].metric("بهترین فروش", fmt_price(book_stats["best_ask"]))
-metrics[2].metric("فاصله خرید و فروش", format_percent(book_stats["spread_pct"]))
-metrics[3].metric("عدم‌تعادل دفتر سفارش", f"{book_stats['imbalance'] * 100:+.2f}%")
-
-if book_stats["imbalance"] > 0:
-    st.info("ارزش سفارش‌های خریدِ قابل‌مشاهده بیشتر است؛ این به‌تنهایی به معنی رشد نیست.")
-elif book_stats["imbalance"] < 0:
-    st.info("ارزش سفارش‌های فروشِ قابل‌مشاهده بیشتر است؛ این به‌تنهایی به معنی افت نیست.")
-else:
-    st.info("عدم‌تعادل نزدیک به صفر است.")
-
-mid_price = number(book_stats.get("mid"))
-bid_zones = [z for z in book_stats.get("bid_walls", []) if number(z.get("price")) < mid_price]
-ask_zones = [z for z in book_stats.get("ask_walls", []) if number(z.get("price")) > mid_price]
-strongest_bid = max(bid_zones, key=lambda z: number(z.get("value")), default=None)
-strongest_ask = max(ask_zones, key=lambda z: number(z.get("value")), default=None)
-
-st.markdown("#### جمع‌بندی ساده نقدینگی")
-
-def format_wall_distance(distance):
-    if distance < 0.0001: return "<0.0001%"
-    if distance < 0.01: return f"{distance:.4f}%"
-    if distance < 1: return f"{distance:.3f}%"
-    return f"{distance:.2f}%"
-
-if strongest_bid and strongest_ask:
-    bid_distance = (mid_price - number(strongest_bid["price"])) / mid_price * 100
-    ask_distance = (number(strongest_ask["price"]) - mid_price) / mid_price * 100
-    liq_a, liq_b = st.columns(2)
-    liq_a.metric("قوی‌ترین ناحیه خرید زیر قیمت", fmt_price(strongest_bid["price"]),
-                 delta=f"{format_wall_distance(bid_distance)} پایین‌تر")
-    liq_b.metric("قوی‌ترین ناحیه فروش بالای قیمت", fmt_price(strongest_ask["price"]),
-                 delta=f"{format_wall_distance(ask_distance)} بالاتر")
-    st.write(f"ارزش: **خرید {fmt_usd(number(strongest_bid.get('value')))}** در برابر "
-             f"**فروش {fmt_usd(number(strongest_ask.get('value')))}**.")
-else:
-    st.info("ناحیه تجمیعی معناداری در یکی از دو سمت پیدا نشد.")
-
-flows = st.columns(4)
-flows[0].metric("حجم خرید اخیر", fmt_usd(trade_stats["buy_usd"]))
-flows[1].metric("حجم فروش اخیر", fmt_usd(trade_stats["sell_usd"]))
-flows[2].metric("جریان خالص", fmt_usd(trade_stats["net_flow"]))
-flows[3].metric("تعداد معاملات", trade_stats["total_count"])
-
-bid_df = pd.DataFrame()
-ask_df = pd.DataFrame()
-with st.expander("جزئیات دفتر سفارش: سطوح خرید و فروش"):
-    bid_col, ask_col = st.columns(2)
-    with bid_col:
-        st.markdown("**سطوح خرید**")
-        bid_df = pd.DataFrame(book_stats["bid_walls"]).rename(columns={
-            "price": "قیمت", "quantity": "مقدار", "value": "ارزش تقریبی USDT",
-            "classification": "نوع سطح",
-        })
-        if not bid_df.empty:
-            bid_df["قیمت"] = bid_df["قیمت"].map(fmt_price)
-            bid_df["مقدار"] = bid_df["مقدار"].map(lambda v: f"{v:,.6f}")
-            bid_df["ارزش تقریبی USDT"] = bid_df["ارزش تقریبی USDT"].map(fmt_usd)
-            st.dataframe(bid_df, use_container_width=True, hide_index=True)
-    with ask_col:
-        st.markdown("**سطوح فروش**")
-        ask_df = pd.DataFrame(book_stats["ask_walls"]).rename(columns={
-            "price": "قیمت", "quantity": "مقدار", "value": "ارزش تقریبی USDT",
-            "classification": "نوع سطح",
-        })
-        if not ask_df.empty:
-            ask_df["قیمت"] = ask_df["قیمت"].map(fmt_price)
-            ask_df["مقدار"] = ask_df["مقدار"].map(lambda v: f"{v:,.6f}")
-            ask_df["ارزش تقریبی USDT"] = ask_df["ارزش تقریبی USDT"].map(fmt_usd)
-            st.dataframe(ask_df, use_container_width=True, hide_index=True)
-
-# ---------------------------------------------------------------------------
-st.divider()
-st.subheader("۷. سناریوی احتمالی ورود و خروج")
-st.caption("محاسبه تقریبی بر پایه دفتر سفارش، نه سفارش واقعی یا توصیه خریدوفروش.")
-
-plan = calculate_trade_plan(book_stats, trade_stats)
-
-if plan["status"] == "ENTRY WATCH":
-    st.success("وضعیت: فرصت برای بررسی بیشتر")
-else:
-    st.warning("وضعیت: انتظار برای تأیید")
-
-st.write(plan["reason"])
-
-if "entry" in plan:
-    levels = st.columns(4)
-    levels[0].metric("ورود احتمالی", fmt_price(plan["entry"]))
-    levels[1].metric("هدف خروج", fmt_price(plan["target"]))
-    levels[2].metric("حد ابطال سناریو", fmt_price(plan["stop"]))
-    levels[3].metric("نسبت پاداش به ریسک", f"{plan['rr']:.2f}")
-
-# Position size calculator
-with st.expander("🧮 ماشین‌حساب حجم پوزیشن بر پایه ATR"):
-    col_a, col_b = st.columns(2)
-    capital = col_a.number_input("سرمایه کل (USDT)", min_value=10.0, value=1000.0, step=50.0)
-    risk_pct = col_b.number_input("درصد ریسک هر معامله", min_value=0.1, max_value=5.0, value=1.0, step=0.1)
-    plan_4h = timeframe_results.get("4 ساعت", {}).get("plan", {})
-    ref_close = plan_4h.get("close")
-    ref_stop = plan_4h.get("stop")
-    if ref_close and ref_stop:
-        risk_per_unit = abs(ref_close - ref_stop)
-        risk_amount = capital * (risk_pct / 100)
-        position_size = risk_amount / risk_per_unit if risk_per_unit > 0 else 0
-        notional = position_size * ref_close
-        st.markdown(
-            f"- **ریسک دلاری:** {fmt_usd(risk_amount)}\n"
-            f"- **حجم پیشنهادی:** {position_size:,.6f} واحد\n"
-            f"- **ارزش پوزیشن:** {fmt_usd(notional)}\n"
-            f"- **فاصله stop تا entry:** {fmt_price(risk_per_unit)}"
-        )
-        st.caption("بر پایه ATR تایم‌فریم ۴ساعته.")
-    else:
-        st.info("برای محاسبه، ابتدا تحلیل تایم‌فریم ۴ساعته باید کامل شود.")
-
-with st.expander("⚠️ آگاهی از ریسک ضرر زنجیره‌ای"):
-    table = pd.DataFrame({
-        "ریسک هر معامله": [f"{p}%" for p in [0.5, 1, 2, 3, 5]],
-        "۵ ضرر متوالی": [f"-{round((1-(1-p/100)**5)*100,1)}%" for p in [0.5, 1, 2, 3, 5]],
-        "۱۰ ضرر متوالی": [f"-{round((1-(1-p/100)**10)*100,1)}%" for p in [0.5, 1, 2, 3, 5]],
-    })
-    st.dataframe(table, hide_index=True, use_container_width=True)
-
-# ---------------------------------------------------------------------------
-st.divider()
-st.subheader("۸. جمع‌بندی تصمیم: طلا، رمزارز یا ترکیب؟")
-try:
-    allocation_ratio = get_btc_xau_metrics(lbank_pairs)
-    btc_trend = get_asset_trend_score("BTC", lbank_pairs, int(atr_period), float(ut_multiplier))
-    gold_trend = get_asset_trend_score("XAUT", lbank_pairs, int(atr_period), float(ut_multiplier))
-    ratio_week = allocation_ratio.get("change_7d")
-    ratio_day = allocation_ratio.get("change_1d")
-    btc_score = btc_trend.get("score")
-    gold_score = gold_trend.get("score")
-
-    if ratio_week is None or ratio_day is None or btc_score is None or gold_score is None:
-        raise ValueError("داده کافی برای تخصیص پویا وجود ندارد.")
-
-    ratio_signal = max(-1.0, min(1.0, (0.65 * ratio_week + 0.35 * ratio_day) / 5.0))
-    trend_signal = max(-1.0, min(1.0, (float(btc_score) - float(gold_score)) / 4.0))
-    crypto_edge = 0.65 * ratio_signal + 0.35 * trend_signal
-    crypto_pct = int(round(max(10.0, min(90.0, 50.0 + 40.0 * crypto_edge))))
-    gold_pct = 100 - crypto_pct
-
-    if crypto_edge >= 0.25:
-        allocation = f"تمایل به رمزارز: {crypto_pct}% رمزارز + {gold_pct}% طلا"
-        allocation_reason = "نسبت BTC/XAUT و/یا روند BTC برتری رمزارز را نشان می‌دهد."
-    elif crypto_edge <= -0.25:
-        allocation = f"تمایل به طلا: {gold_pct}% طلا + {crypto_pct}% رمزارز"
-        allocation_reason = "نسبت BTC/XAUT و/یا روند XAUT برتری طلا را نشان می‌دهد."
-    else:
-        allocation = f"سیگنال ترکیبی: {gold_pct}% طلا + {crypto_pct}% رمزارز"
-        allocation_reason = "شواهد متناقض یا نزدیک به هم‌اند."
-
-    st.subheader(f"پیشنهاد فعلی مدل: {allocation}")
-    ac1, ac2, ac3 = st.columns(3)
-    ac1.metric("سهم طلا (XAUT)", f"{gold_pct}%")
-    ac2.metric("سهم رمزارز", f"{crypto_pct}%")
-    ac3.metric("تغییر هفت‌روزه BTC/XAUT", f"{ratio_week:+.2f}%")
-    st.write(allocation_reason)
-    st.caption("کنترل‌های تأیید: " + "؛ ".join(
-        (btc_trend.get("notes") or []) + (gold_trend.get("notes") or [])))
-except Exception as exc:
-    allocation = None
-    allocation_reason = None
-    gold_pct = None
-    crypto_pct = None
-    st.warning(f"جمع‌بندی تخصیص کامل نشد: {type(exc).__name__}: {str(exc)[:180]}")
-
-st.warning(
-    "این برنامه از داده‌های عمومی بازار استفاده می‌کند و معامله‌ای ثبت نمی‌کند. "
-    "سیگنال‌ها، سطوح ATR و سطوح دفتر سفارش تخمینی هستند و سود را تضمین نمی‌کنند."
-)
-
-# ---------------------------------------------------------------------------
-# PDF download
-# ---------------------------------------------------------------------------
-try:
-    pdf_report_data = {
-        "selected_code": selected_code,
-        "selected_pair": selected_lbank_pair,
-        "btc_usd": fmt_usd(btc_usd),
-        "fetched_count": fetched_count,
-        "coin_count": len(coins),
-        "lbank_status": lbank_status,
-        "coins_df": display_df,
-        "comparison_df": comp_df,
-        "crypto_ranking": crypto_ranking,
-        "btc_xau_metrics": locals().get("allocation_ratio") or {},
-        "allocation": locals().get("allocation"),
-        "allocation_reason": locals().get("allocation_reason"),
-        "gold_pct": locals().get("gold_pct"),
-        "crypto_pct": locals().get("crypto_pct"),
-        "timeframe_results": timeframe_results,
-        "best_bid": fmt_price(book_stats.get("best_bid")),
-        "best_ask": fmt_price(book_stats.get("best_ask")),
-        "spread_pct": format_percent(book_stats.get("spread_pct", 0)),
-        "imbalance": f"{book_stats.get('imbalance', 0) * 100:+.2f}%",
-        "buy_usd": fmt_usd(trade_stats.get("buy_usd", 0)),
-        "sell_usd": fmt_usd(trade_stats.get("sell_usd", 0)),
-        "net_flow": fmt_usd(trade_stats.get("net_flow", 0)),
-        "trade_count": trade_stats.get("total_count", 0),
-        "bid_df": bid_df,
-        "ask_df": ask_df,
-        "order_plan": plan,
-    }
-    pdf_bytes = build_pdf_report(pdf_report_data)
-    safe_code = "".join(ch for ch in str(selected_code) if ch.isalnum() or ch in "-_") or "market"
-    pdf_download_placeholder.download_button(
-        label="📄 دانلود گزارش کامل PDF",
-        data=pdf_bytes,
-        file_name=f"SpotPilot_AI_{safe_code}_report.pdf",
-        mime="application/pdf",
-        use_container_width=True,
-    )
-except Exception as pdf_exc:
-    pdf_download_placeholder.error(
-        f"ساخت PDF ناموفق بود: {type(pdf_exc).__name__}: {str(pdf_exc)[:250]}"
-    )
+                            future_times = [t0 + pd.Timedelta(seconds=step_seconds * k) for k in
