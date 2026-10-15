@@ -1,7 +1,4 @@
-"""
-SpotPilot AI — Market analysis dashboard
-Full improved version: bug fixes, robustness, dynamic caching, better analytics.
-"""
+
 import statistics
 import math
 import time
