@@ -2397,7 +2397,7 @@ else:
                     st.warning(plan["reason"])
 
                 st.markdown("#### نمودار قیمت و میانگین‌ها")
-                elliott_enabled = st.checkbox("نمایش شمارش احتمالی امواج الیوت روی نمودار", value=True, key="elliott_overlay")
+                elliott_enabled = st.checkbox("نمایش شمارش احتمالی امواج الیوت روی نمودار", value=True, key=f"elliott_overlay_{tf_name}")
                 st.caption("شمارش موج‌ها با نقاط چرخش قیمت و قواعد اکتشافی تولید می‌شود؛ فرضیه‌ای برای بررسی دستی است، نه شمارش قطعی یا سیگنال مستقل.")
                 chart_df = indicators.tail(150).copy()
                 fig = go.Figure()
@@ -2464,6 +2464,33 @@ else:
                             textfont={"color": "#7c3aed", "size": 12},
                             hovertemplate="نقطه موجی احتمالی<br>زمان: %{x}<br>قیمت: %{y}<br>برچسب: %{text}<extra></extra>",
                         ))
+                        # Forward path: explicitly a scenario, not a confirmed Elliott count.
+                        piv = wave_points.tail(5).copy()
+                        if len(piv) >= 3 and len(chart_df) >= 15:
+                            last_price = float(chart_df["Close"].iloc[-1])
+                            recent_swings = piv["Price"].astype(float).diff().abs().dropna()
+                            swing = float(recent_swings.median()) if not recent_swings.empty else 0.0
+                            atr_est = float((chart_df["High"] - chart_df["Low"]).rolling(14).mean().iloc[-1])
+                            amplitude = max(swing, atr_est if math.isfinite(atr_est) else 0.0, last_price * 0.002)
+                            direction = 1 if float(piv["Price"].iloc[-1]) >= float(piv["Price"].iloc[-3]) else -1
+                            step_seconds = int(TIMEFRAMES.get(tf_name, {}).get("seconds", 4 * 3600))
+                            t0 = pd.to_datetime(chart_df["Time"].iloc[-1], utc=True)
+                            if direction > 0:
+                                future_prices = [last_price - 0.4*amplitude, last_price + 0.15*amplitude, last_price - 0.2*amplitude, last_price + 0.8*amplitude]
+                            else:
+                                future_prices = [last_price + 0.4*amplitude, last_price - 0.15*amplitude, last_price + 0.2*amplitude, last_price - 0.8*amplitude]
+                            future_labels = ["A? اصلاح", "B? برگشت", "C? اصلاح", "Impulse?"]
+                            future_times = [t0 + pd.Timedelta(seconds=step_seconds*k) for k in (2, 4, 7, 10)]
+                            fig.add_trace(go.Scatter(
+                                x=[t0] + future_times, y=[last_price] + future_prices,
+                                mode="lines+markers+text",
+                                text=["اکنون"] + future_labels, textposition="top center",
+                                name="سناریوی موج بعدی (فرضی)",
+                                line={"color": "#dc2626", "width": 3, "dash": "dash"},
+                                marker={"size": 8, "color": "#dc2626"},
+                                hovertemplate="سناریوی احتمالی<br>زمان: %{x}<br>قیمت: %{y}<br>%{text}<extra></extra>",
+                            ))
+                            st.caption(f"سناریوی موج بعدی صرفاً فرضیه است؛ هدف انتهایی تقریبی: {fmt_price(future_prices[-1])}. جهت یا هدف تضمین‌شده نیست.")
                     else:
                         st.info("برای شمارش اکتشافی موج‌ها، کندل یا نقاط چرخش کافی در این بازه وجود ندارد.")
                 fig.update_layout(
@@ -3042,22 +3069,24 @@ try:
     btc_score = btc_trend.get("score")
     gold_score = gold_trend.get("score")
 
+    # Continuous evidence score: no hard-coded 50/50 default.
+    # Positive BTC/XAUT change and stronger BTC trend favor crypto; the reverse favors gold.
     if ratio_week is None or ratio_day is None or btc_score is None or gold_score is None:
-        allocation = "ترکیب ۵۰٪ طلا + ۵۰٪ رمزارز"
-        allocation_reason = "داده کافی برای برتری معتبر یک طرف نداریم؛ پیش‌فرض محافظه‌کارانه‌ترِ این مدل ترکیب است، نه ۱۰۰٪ یک دارایی."
-        gold_pct, crypto_pct = 50, 50
-    elif ratio_week >= 2 and ratio_day > 0 and btc_score >= 1 and gold_score <= 0:
-        allocation = "۱۰۰٪ رمزارز"
-        allocation_reason = "BTC/XAUT در هفته تقویت شده، تغییر روزانه هم مثبت است و روند BTC از XAUT قوی‌تر است. در سبد رمزارز، BTC گزینه اصلی این سیگنال است؛ آلت‌کوین‌ها فقط با قدرت نسبی مثبت نسبت به BTC."
-        gold_pct, crypto_pct = 0, 100
-    elif ratio_week <= -2 and ratio_day < 0 and gold_score >= 1 and btc_score <= 0:
-        allocation = "۱۰۰٪ طلا (XAUT)"
-        allocation_reason = "BTC/XAUT در هفته افت کرده، تغییر روزانه هم منفی است و روند XAUT از BTC قوی‌تر است؛ این یعنی طلا در بازه بررسی‌شده قدرت نسبی بیشتری داشته است."
-        gold_pct, crypto_pct = 100, 0
+        raise ValueError("داده کافی برای تخصیص پویا وجود ندارد؛ از درصد ثابت به‌عنوان جایگزین استفاده نمی‌شود.")
+    ratio_signal = max(-1.0, min(1.0, (0.65 * ratio_week + 0.35 * ratio_day) / 5.0))
+    trend_signal = max(-1.0, min(1.0, (float(btc_score) - float(gold_score)) / 4.0))
+    crypto_edge = 0.65 * ratio_signal + 0.35 * trend_signal
+    crypto_pct = int(round(max(10.0, min(90.0, 50.0 + 40.0 * crypto_edge))))
+    gold_pct = 100 - crypto_pct
+    if crypto_edge >= 0.25:
+        allocation = f"تمایل به رمزارز: {crypto_pct}% رمزارز + {gold_pct}% طلا"
+        allocation_reason = "نسبت BTC/XAUT و/یا روند BTC برتری نسبی رمزارز را نشان می‌دهد؛ وزن پویا افزایش یافته، اما سقف ۹۰٪ برای محدودکردن تمرکز حفظ شده است."
+    elif crypto_edge <= -0.25:
+        allocation = f"تمایل به طلا: {gold_pct}% طلا + {crypto_pct}% رمزارز"
+        allocation_reason = "نسبت BTC/XAUT و/یا روند XAUT برتری نسبی طلا را نشان می‌دهد؛ وزن پویا به طلا متمایل شده، اما حداقل ۱۰٪ برای جلوگیری از تخصیص تمام سرمایه حفظ شده است."
     else:
-        allocation = "ترکیب ۵۰٪ طلا + ۵۰٪ رمزارز"
-        allocation_reason = "نسبت BTC/XAUT و روندهای تکنیکال تأیید هم‌زمان و قوی نمی‌دهند؛ بنابراین این مدل از شرط‌بندی ۱۰۰٪ روی یک سمت اجتناب می‌کند."
-        gold_pct, crypto_pct = 50, 50
+        allocation = f"سیگنال ترکیبی: {gold_pct}% طلا + {crypto_pct}% رمزارز"
+        allocation_reason = "شواهد متناقض یا نزدیک به هم‌اند؛ وزن از روی سیگنال‌های واقعی محاسبه شده و الزاماً ۵۰/۵۰ نیست."
 
     st.subheader(f"پیشنهاد فعلی مدل: {allocation}")
     ac1, ac2, ac3 = st.columns(3)
