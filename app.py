@@ -39,51 +39,133 @@ TIMEFRAMES = {
 
 
 def detect_elliott_candidates(frame, left=3, right=3, min_swing_pct=0.35):
-    """Return heuristic swing points for an Elliott-wave *candidate*, not a confirmed count."""
+    """Detect alternating, confirmed swing pivots; labels remain hypotheses until rules validate."""
+    columns = ["index", "Time", "Price", "Kind", "Label"]
     if frame is None or len(frame) < left + right + 8:
-        return pd.DataFrame(columns=["index", "Time", "Price", "Kind", "Label"])
-    data = frame.reset_index(drop=True)
+        return pd.DataFrame(columns=columns)
+    data = frame.reset_index(drop=True).copy()
     highs = pd.to_numeric(data["High"], errors="coerce").to_numpy()
     lows = pd.to_numeric(data["Low"], errors="coerce").to_numpy()
     raw = []
     for i in range(left, len(data) - right):
-        hi_window = highs[i-left:i+right+1]
-        lo_window = lows[i-left:i+right+1]
-        if pd.notna(highs[i]) and highs[i] >= hi_window.max() and (highs[i] > hi_window[:-1].max() or highs[i] > hi_window[-1]):
+        hw, lw = highs[i-left:i+right+1], lows[i-left:i+right+1]
+        if pd.notna(highs[i]) and highs[i] >= hw.max() and (highs[i] > hw[:-1].max() or highs[i] > hw[-1]):
             raw.append({"index": i, "Time": data.loc[i, "Time"], "Price": float(highs[i]), "Kind": "high"})
-        if pd.notna(lows[i]) and lows[i] <= lo_window.min() and (lows[i] < lo_window[:-1].min() or lows[i] < lo_window[-1]):
+        if pd.notna(lows[i]) and lows[i] <= lw.min() and (lows[i] < lw[:-1].min() or lows[i] < lw[-1]):
             raw.append({"index": i, "Time": data.loc[i, "Time"], "Price": float(lows[i]), "Kind": "low"})
-    raw.sort(key=lambda p: p["index"])
-    # Keep one pivot per direction, retaining the more extreme point when same-side pivots repeat.
+    raw.sort(key=lambda p: (p["index"], 0 if p["Kind"] == "low" else 1))
     pivots = []
     for point in raw:
         if pivots and point["Kind"] == pivots[-1]["Kind"]:
-            more_extreme = (point["Price"] > pivots[-1]["Price"]) if point["Kind"] == "high" else (point["Price"] < pivots[-1]["Price"])
+            more_extreme = point["Price"] > pivots[-1]["Price"] if point["Kind"] == "high" else point["Price"] < pivots[-1]["Price"]
             if more_extreme:
                 pivots[-1] = point
             continue
         if pivots:
-            move = abs(point["Price"] / pivots[-1]["Price"] - 1) * 100 if pivots[-1]["Price"] else 0
-            if move < min_swing_pct:
+            prev = pivots[-1]["Price"]
+            if not prev or abs(point["Price"] / prev - 1) * 100 < min_swing_pct:
                 continue
         pivots.append(point)
-    # Label recent pivots as a visual hypothesis only; do not assert rule validation.
-    recent = pivots[-9:]
-    labels = []
-    if len(recent) >= 6:
-        # The first point is the impulse origin; the next five are candidate turns 1–5.
-        selected = recent[-6:]
-        labels.append((selected[0], "شروع"))
-        for j, p in enumerate(selected[1:], start=1):
-            labels.append((p, f"({j})"))
-    elif len(recent) >= 3:
-        # A/B/C is a loose corrective-wave hypothesis, not a validated Elliott pattern.
-        for label, p in zip(("A", "B", "C"), recent[-3:]):
-            labels.append((p, label))
-    result = []
-    for p, label in labels:
-        result.append({**p, "Label": label})
-    return pd.DataFrame(result)
+    if len(pivots) < 2:
+        return pd.DataFrame(columns=columns)
+    # Plot the full alternating swing structure; never leave intermediate candles unexplained
+    # by connecting only a hand-picked subset of pivots.
+    out = pd.DataFrame(pivots)
+    out["Label"] = ""
+    recent_n = min(6, len(out))
+    labels = ["0", "1", "2", "3", "4", "5"][-recent_n:]
+    out.loc[out.index[-recent_n:], "Label"] = labels
+    return out
+
+
+def analyze_elliott_context(frame, pivots):
+    """Combine Elliott-rule checks with trend, volume, S/R and observable liquidity-sweep clues."""
+    result = {"direction": 0, "score": 0.0, "confidence": "کم", "notes": [], "invalid": [], "forecast": []}
+    if frame is None or len(frame) < 30 or pivots is None or len(pivots) < 5:
+        result["notes"].append("داده یا پیوت کافی برای شمارش معتبر وجود ندارد.")
+        return result
+    d = frame.reset_index(drop=True).copy()
+    p = pivots.tail(6).reset_index(drop=True)
+    prices = p["Price"].astype(float).tolist()
+    kinds = p["Kind"].tolist()
+    direction = 1 if prices[-1] > prices[-2] else -1
+    result["direction"] = direction
+    # Check a standard impulse only when six alternating points are available.
+    if len(p) == 6:
+        up = kinds[0] == "low" and kinds[1] == "high" and kinds[2] == "low" and kinds[3] == "high" and kinds[4] == "low" and kinds[5] == "high"
+        down = kinds[0] == "high" and kinds[1] == "low" and kinds[2] == "high" and kinds[3] == "low" and kinds[4] == "high" and kinds[5] == "low"
+        if up:
+            w1, w2, w3, w4, w5 = prices[1]-prices[0], prices[1]-prices[2], prices[3]-prices[2], prices[3]-prices[4], prices[5]-prices[4]
+            if prices[2] <= prices[0]: result["invalid"].append("موج ۲ از مبدأ موج ۱ عبور کرده")
+            if prices[3] <= prices[1]: result["invalid"].append("موج ۳ سقف موج ۱ را نشکسته")
+            if prices[4] < prices[1]: result["invalid"].append("هم‌پوشانی موج ۴ و ۱؛ مگر در قطر")
+            if w3 <= min(w1, w5): result["invalid"].append("موج ۳ کوتاه‌ترین موج محرک است")
+        elif down:
+            w1, w2, w3, w4, w5 = prices[0]-prices[1], prices[2]-prices[1], prices[2]-prices[3], prices[4]-prices[3], prices[4]-prices[5]
+            if prices[2] >= prices[0]: result["invalid"].append("موج ۲ از مبدأ موج ۱ عبور کرده")
+            if prices[3] >= prices[1]: result["invalid"].append("موج ۳ کف موج ۱ را نشکسته")
+            if prices[4] > prices[1]: result["invalid"].append("هم‌پوشانی موج ۴ و ۱؛ مگر در قطر")
+            if w3 <= min(w1, w5): result["invalid"].append("موج ۳ کوتاه‌ترین موج محرک است")
+        else:
+            result["invalid"].append("توالی پیوت‌ها با ایمپالس استاندارد هم‌جهت نیست")
+        if result["invalid"]:
+            result["notes"].append("شمارش ۵ موجی با یک یا چند قانون سخت سازگار نیست؛ برچسب‌ها قطعی نیستند.")
+        else:
+            result["score"] += 2
+            result["notes"].append("توالی اخیر با قواعد اصلی ایمپالس سازگار است؛ همچنان یک شمارش احتمالی است.")
+    close = pd.to_numeric(d["Close"], errors="coerce")
+    last = float(close.iloc[-1])
+    # Trend/momentum: use available indicators, without treating any one indicator as proof.
+    if "SMA 14" in d and "SMA 50" in d:
+        fast, slow = d["SMA 14"].iloc[-1], d["SMA 50"].iloc[-1]
+        if pd.notna(fast) and pd.notna(slow):
+            if last > fast > slow: result["score"] += 1; result["notes"].append("قیمت بالای SMA14 و SMA50 است")
+            elif last < fast < slow: result["score"] -= 1; result["notes"].append("قیمت زیر SMA14 و SMA50 است")
+    if "UT Buy" in d and bool(d["UT Buy"].iloc[-1]): result["score"] += 1; result["notes"].append("UT خرید اخیر را تأیید می‌کند")
+    if "UT Sell" in d and bool(d["UT Sell"].iloc[-1]): result["score"] -= 1; result["notes"].append("UT فروش اخیر را تأیید می‌کند")
+    # Relative volume and wick-based stop-run clues; these are proxies, not proof of manipulation.
+    if "Volume" in d:
+        vol = pd.to_numeric(d["Volume"], errors="coerce")
+        baseline = vol.rolling(20).median().iloc[-1]
+        if pd.notna(baseline) and baseline > 0 and vol.iloc[-1] > baseline * 1.5:
+            result["notes"].append("حجم آخرین کندل بیش از ۱٫۵ برابر میانه ۲۰ کندل است")
+            result["score"] += 0.5 if direction > 0 else -0.5
+    recent = d.tail(20)
+    support = float(pd.to_numeric(recent["Low"], errors="coerce").iloc[:-1].min())
+    resistance = float(pd.to_numeric(recent["High"], errors="coerce").iloc[:-1].max())
+    last_low, last_high = float(d["Low"].iloc[-1]), float(d["High"].iloc[-1])
+    sweep_down = last_low < support and last > support
+    sweep_up = last_high > resistance and last < resistance
+    if sweep_down: result["score"] += 1; result["notes"].append("سایه زیر حمایت و بازگشت قیمت: احتمال جمع‌آوری نقدینگی فروش")
+    if sweep_up: result["score"] -= 1; result["notes"].append("سایه بالای مقاومت و بازگشت قیمت: احتمال جمع‌آوری نقدینگی خرید")
+    result["score"] = max(-5, min(5, result["score"]))
+    result["direction"] = 1 if result["score"] > 0 else -1 if result["score"] < 0 else direction
+    result["confidence"] = "متوسط" if abs(result["score"]) >= 2 else "کم"
+    result["support"], result["resistance"] = support, resistance
+    # Build a continuous scenario from the actual last close, using ATR and nearby structure.
+    candle_range = (pd.to_numeric(d["High"], errors="coerce") - pd.to_numeric(d["Low"], errors="coerce"))
+    atr = float(candle_range.rolling(14).mean().iloc[-1])
+    if not math.isfinite(atr) or atr <= 0: atr = max(last * 0.005, 1e-8)
+    direction = result["direction"]
+    # Corrective leg first, then rebound, then continuation only if structure allows it.
+    pullback = max(atr * 0.8, abs(last-support) * 0.25 if direction > 0 else abs(resistance-last) * 0.25)
+    if direction > 0:
+        a = max(support, last - pullback)
+        b = min(resistance if resistance > last else last + atr, a + pullback * 0.62)
+        c = max(support, a - pullback * 0.15)
+        target = max(last + atr * 1.6, resistance + atr * 0.25)
+        labels = ["A? اصلاح", "B? بازگشت", "C? اصلاح", "ادامه احتمالی"]
+        forecast = [a, b, c, target]
+    else:
+        a = min(resistance, last + pullback)
+        b = max(support if support < last else last - atr, a - pullback * 0.62)
+        c = min(resistance, a + pullback * 0.15)
+        target = min(last - atr * 1.6, support - atr * 0.25)
+        labels = ["A? اصلاح", "B? بازگشت", "C? اصلاح", "ادامه احتمالی"]
+        forecast = [a, b, c, target]
+    result["forecast"] = forecast
+    result["forecast_labels"] = labels
+    return result
 
 
 st.set_page_config(page_title="SpotPilot AI", page_icon="📊", layout="wide")
@@ -2451,48 +2533,48 @@ else:
                     ))
                 if elliott_enabled:
                     wave_points = detect_elliott_candidates(chart_df)
+                    context = analyze_elliott_context(chart_df, wave_points)
                     if not wave_points.empty:
                         fig.add_trace(go.Scatter(
-                            x=wave_points["Time"],
-                            y=wave_points["Price"],
-                            mode="lines+markers+text",
-                            text=wave_points["Label"],
-                            textposition="top center",
-                            name="امواج الیوت — فرضیه",
-                            line={"color": "#7c3aed", "width": 2, "dash": "dot"},
-                            marker={"size": 8, "color": "#7c3aed", "symbol": "circle"},
-                            textfont={"color": "#7c3aed", "size": 12},
-                            hovertemplate="نقطه موجی احتمالی<br>زمان: %{x}<br>قیمت: %{y}<br>برچسب: %{text}<extra></extra>",
+                            x=wave_points["Time"], y=wave_points["Price"],
+                            mode="lines+markers+text", text=wave_points["Label"],
+                            textposition="top center", name="ساختار پیوت‌ها / شمارش احتمالی",
+                            line={"color": "#7c3aed", "width": 2},
+                            marker={"size": 7, "color": "#7c3aed", "symbol": "circle"},
+                            textfont={"color": "#7c3aed", "size": 11},
+                            connectgaps=False,
+                            hovertemplate="پیوت تأییدشده<br>زمان: %{x}<br>قیمت: %{y}<extra></extra>",
                         ))
-                        # Forward path: explicitly a scenario, not a confirmed Elliott count.
-                        piv = wave_points.tail(5).copy()
-                        if len(piv) >= 3 and len(chart_df) >= 15:
+                        if context.get("forecast") and len(chart_df):
                             last_price = float(chart_df["Close"].iloc[-1])
-                            recent_swings = piv["Price"].astype(float).diff().abs().dropna()
-                            swing = float(recent_swings.median()) if not recent_swings.empty else 0.0
-                            atr_est = float((chart_df["High"] - chart_df["Low"]).rolling(14).mean().iloc[-1])
-                            amplitude = max(swing, atr_est if math.isfinite(atr_est) else 0.0, last_price * 0.002)
-                            direction = 1 if float(piv["Price"].iloc[-1]) >= float(piv["Price"].iloc[-3]) else -1
-                            step_seconds = int(TIMEFRAMES.get(tf_name, {}).get("seconds", 4 * 3600))
                             t0 = pd.to_datetime(chart_df["Time"].iloc[-1], utc=True)
-                            if direction > 0:
-                                future_prices = [last_price - 0.4*amplitude, last_price + 0.15*amplitude, last_price - 0.2*amplitude, last_price + 0.8*amplitude]
-                            else:
-                                future_prices = [last_price + 0.4*amplitude, last_price - 0.15*amplitude, last_price + 0.2*amplitude, last_price - 0.8*amplitude]
-                            future_labels = ["A? اصلاح", "B? برگشت", "C? اصلاح", "Impulse?"]
-                            future_times = [t0 + pd.Timedelta(seconds=step_seconds*k) for k in (2, 4, 7, 10)]
+                            step_seconds = int(TIMEFRAMES.get(tf_name, {}).get("seconds", 14400))
+                            future_times = [t0 + pd.Timedelta(seconds=step_seconds*k) for k in (1, 2, 3, 4)]
+                            future_prices = context["forecast"]
+                            # One shared anchor at the final real candle close prevents gaps between
+                            # the observed series and the hypothetical path.
                             fig.add_trace(go.Scatter(
                                 x=[t0] + future_times, y=[last_price] + future_prices,
                                 mode="lines+markers+text",
-                                text=["اکنون"] + future_labels, textposition="top center",
-                                name="سناریوی موج بعدی (فرضی)",
-                                line={"color": "#dc2626", "width": 3, "dash": "dash"},
-                                marker={"size": 8, "color": "#dc2626"},
-                                hovertemplate="سناریوی احتمالی<br>زمان: %{x}<br>قیمت: %{y}<br>%{text}<extra></extra>",
+                                text=["آخرین بسته‌شدن"] + context["forecast_labels"],
+                                textposition="top center", name="سناریوی آینده — فرضیه",
+                                line={"color": "#dc2626", "width": 2.5, "dash": "dash"},
+                                marker={"size": 7, "color": "#dc2626"},
+                                connectgaps=False,
+                                hovertemplate="سناریو، نه قیمت واقعی<br>زمان: %{x}<br>قیمت: %{y}<br>%{text}<extra></extra>",
                             ))
-                            st.caption(f"سناریوی موج بعدی صرفاً فرضیه است؛ هدف انتهایی تقریبی: {fmt_price(future_prices[-1])}. جهت یا هدف تضمین‌شده نیست.")
+                            st.caption(
+                                f"جهت سناریو: {'صعودی' if context['direction'] > 0 else 'نزولی' if context['direction'] < 0 else 'خنثی'} | "
+                                f"اطمینان: {context['confidence']} | حمایت تقریبی: {fmt_price(context.get('support'))} | "
+                                f"مقاومت تقریبی: {fmt_price(context.get('resistance'))}"
+                            )
+                            if context["notes"]:
+                                st.write("**شواهد بررسی‌شده:** " + "؛ ".join(context["notes"]))
+                            if context["invalid"]:
+                                st.warning("قوانین ایمپالس تأیید نشده‌اند: " + "؛ ".join(context["invalid"]))
+                            st.caption("نقدینگی/دست‌کاری مستقیماً از روی کندل قابل اثبات نیست؛ سایه‌ها و جهش حجم فقط نشانه‌های احتمالی‌اند. مسیر آینده سناریو است، نه پیش‌بینی قطعی.")
                     else:
-                        st.info("برای شمارش اکتشافی موج‌ها، کندل یا نقاط چرخش کافی در این بازه وجود ندارد.")
+                        st.info("برای شمارش موج، پیوت‌های متناوب و داده کافی وجود ندارد؛ به‌جای ساخت موج مصنوعی، پیش‌بینی رسم نشد.")
                 fig.update_layout(
                     height=520,
                     margin={"l": 12, "r": 12, "t": 28, "b": 12},
