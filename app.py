@@ -142,29 +142,32 @@ def analyze_elliott_context(frame, pivots):
     result["direction"] = 1 if result["score"] > 0 else -1 if result["score"] < 0 else direction
     result["confidence"] = "متوسط" if abs(result["score"]) >= 2 else "کم"
     result["support"], result["resistance"] = support, resistance
-    # Build a continuous scenario from the actual last close, using ATR and nearby structure.
+    # Build a hypothesis from the latest impulse geometry, not from an arbitrary ATR-only path.
     candle_range = (pd.to_numeric(d["High"], errors="coerce") - pd.to_numeric(d["Low"], errors="coerce"))
     atr = float(candle_range.rolling(14).mean().iloc[-1])
-    if not math.isfinite(atr) or atr <= 0: atr = max(last * 0.005, 1e-8)
+    if not math.isfinite(atr) or atr <= 0:
+        atr = max(last * 0.005, 1e-8)
     direction = result["direction"]
-    # Corrective leg first, then rebound, then continuation only if structure allows it.
-    pullback = max(atr * 0.8, abs(last-support) * 0.25 if direction > 0 else abs(resistance-last) * 0.25)
+    recent_swings = []
+    if pivots is not None and len(pivots) >= 3:
+        recent_swings = pd.to_numeric(pivots.tail(6)["Price"], errors="coerce").dropna().astype(float).tolist()
+    impulse_size = max((max(recent_swings) - min(recent_swings)) if len(recent_swings) >= 3 else 0.0, atr * 1.5)
+    leg = max(atr * 0.65, min(impulse_size * 0.236, atr * 2.5))
+    # The last confirmed swing and impulse size set the scale; the latest close remains
+    # the live chart anchor because price may have moved since the pivot was confirmed.
     if direction > 0:
-        a = max(support, last - pullback)
-        b = min(resistance if resistance > last else last + atr, a + pullback * 0.62)
-        c = max(support, a - pullback * 0.15)
-        target = max(last + atr * 1.6, resistance + atr * 0.25)
-        labels = ["A? اصلاح", "B? بازگشت", "C? اصلاح", "ادامه احتمالی"]
-        forecast = [a, b, c, target]
+        a = max(support, last - leg)
+        b = min(last + leg * 0.62, resistance if resistance > last else last + leg * 0.62)
+        c = max(support, a - leg * 0.15)
+        target = max(last + impulse_size * 0.382, resistance + atr * 0.15)
     else:
-        a = min(resistance, last + pullback)
-        b = max(support if support < last else last - atr, a - pullback * 0.62)
-        c = min(resistance, a + pullback * 0.15)
-        target = min(last - atr * 1.6, support - atr * 0.25)
-        labels = ["A? اصلاح", "B? بازگشت", "C? اصلاح", "ادامه احتمالی"]
-        forecast = [a, b, c, target]
-    result["forecast"] = forecast
-    result["forecast_labels"] = labels
+        a = min(resistance, last + leg)
+        b = max(last - leg * 0.62, support if support < last else last - leg * 0.62)
+        c = min(resistance, a + leg * 0.15)
+        target = min(last - impulse_size * 0.382, support - atr * 0.15)
+    result["forecast"] = [a, b, c, target]
+    result["forecast_labels"] = ["A? اصلاح", "B? بازگشت", "C? اصلاح", "ادامه احتمالی"]
+    result["impulse_size"] = impulse_size
     return result
 
 
@@ -2586,16 +2589,28 @@ else:
                         ))
                         if context.get("forecast") and len(chart_df):
                             last_price = float(chart_df["Close"].iloc[-1])
-                            t0 = pd.to_datetime(chart_df["Time"].iloc[-1], utc=True)
+                            t0 = pd.to_datetime(chart_df["Time"].iloc[-1], utc=True, errors="coerce")
                             step_seconds = int(TIMEFRAMES.get(tf_name, {}).get("seconds", 14400))
-                            future_times = [t0 + pd.Timedelta(seconds=step_seconds*k) for k in (1, 2, 3, 4)]
+                            # Candle timestamps are candle-open times. Put the scenario's first
+                            # anchor on the NEXT candle, not on top of the last historical candle.
+                            next_time = t0 + pd.Timedelta(seconds=step_seconds)
+                            future_times = [t0 + pd.Timedelta(seconds=step_seconds*k) for k in (2, 3, 4, 5)]
                             future_prices = context["forecast"]
-                            # One shared anchor at the final real candle close prevents gaps between
-                            # the observed series and the hypothetical path.
+                            # Bridge the final confirmed pivot to the current close as observed price
+                            # movement; this prevents the pivot polyline appearing to float away.
+                            last_pivot = wave_points.iloc[-1]
+                            pivot_time = pd.to_datetime(last_pivot["Time"], utc=True, errors="coerce")
+                            if pd.notna(pivot_time) and pivot_time < t0:
+                                fig.add_trace(go.Scatter(
+                                    x=[pivot_time, t0], y=[float(last_pivot["Price"]), last_price],
+                                    mode="lines", name="پیوت تا قیمت فعلی (حرکت واقعی)",
+                                    line={"color": "#94a3b8", "width": 1.5, "dash": "dot"},
+                                    hovertemplate="حرکت واقعی پس از پیوت<br>زمان: %{x}<br>قیمت: %{y}<extra></extra>",
+                                ))
                             fig.add_trace(go.Scatter(
-                                x=[t0] + future_times, y=[last_price] + future_prices,
+                                x=[next_time] + future_times, y=[last_price] + future_prices,
                                 mode="lines+markers+text",
-                                text=["آخرین بسته‌شدن"] + context["forecast_labels"],
+                                text=["مبدأ سناریو (بسته‌شدن قبلی)"] + context["forecast_labels"],
                                 textposition="top center", name="سناریوی آینده — فرضیه",
                                 line={"color": "#dc2626", "width": 2.5, "dash": "dash"},
                                 marker={"size": 7, "color": "#dc2626"},
