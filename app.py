@@ -831,39 +831,61 @@ def get_json(url, params=None, timeout=20):
     return response.json()
 
 
-def lcw_post(endpoint, payload):
+def lcw_post(endpoint, payload, retries=3):
+    """Call LiveCoinWatch with bounded retries for transient gateway/rate-limit errors."""
     key = get_lcw_key()
     if not key:
         raise RuntimeError(
             "LIVECOINWATCH_API_KEY در Streamlit Secrets تنظیم نشده است."
         )
 
-    response = requests.post(
-        f"{LCW_URL}/{endpoint}",
-        headers={
-            "content-type": "application/json",
-            "x-api-key": key,
-        },
-        json=payload,
-        timeout=25,
-    )
-    response.raise_for_status()
-    return response.json()
+    last_error = None
+    for attempt in range(max(1, int(retries))):
+        try:
+            response = requests.post(
+                f"{LCW_URL}/{endpoint}",
+                headers={
+                    "content-type": "application/json",
+                    "x-api-key": key,
+                },
+                json=payload,
+                timeout=25,
+            )
+            # Retry only transient upstream/network conditions; do not mask auth or bad requests.
+            if response.status_code in (408, 425, 429, 500, 502, 503, 504):
+                last_error = RuntimeError(
+                    f"LiveCoinWatch موقتاً پاسخ مناسب نداد (HTTP {response.status_code})"
+                )
+                if attempt < max(1, int(retries)) - 1:
+                    retry_after = response.headers.get("Retry-After")
+                    try:
+                        delay = min(8.0, max(1.0, float(retry_after))) if retry_after else 1.5 * (2 ** attempt)
+                    except (TypeError, ValueError):
+                        delay = 1.5 * (2 ** attempt)
+                    time.sleep(delay)
+                    continue
+                response.raise_for_status()
+            response.raise_for_status()
+            return response.json()
+        except (requests.Timeout, requests.ConnectionError) as exc:
+            last_error = exc
+            if attempt >= max(1, int(retries)) - 1:
+                raise RuntimeError(
+                    f"اتصال به LiveCoinWatch پس از {attempt + 1} تلاش ناموفق بود: {type(exc).__name__}"
+                ) from exc
+            time.sleep(1.5 * (2 ** attempt))
+    if last_error:
+        raise last_error
+    raise RuntimeError("دریافت اطلاعات از LiveCoinWatch ناموفق بود.")
 
 
 # -------------------- LiveCoinWatch screening --------------------
 
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_lcw_market(min_btc_volume):
-    btc = lcw_post(
-        "coins/single",
-        {"currency": "USD", "code": "BTC", "meta": False},
-    )
-    btc_usd = number(btc.get("rate"))
-
-    if btc_usd <= 0:
-        raise RuntimeError("قیمت BTC از LiveCoinWatch معتبر نیست.")
-
+    # Prefer the list endpoint first: it already contains BTC and avoids making
+    # the entire scanner depend on a separate /coins/single request.
+    btc_usd = None
     all_coins = []
 
     for offset in range(0, 2000, 100):
@@ -884,8 +906,25 @@ def fetch_lcw_market(min_btc_volume):
 
         all_coins.extend(batch)
 
+        # Use BTC's USD rate from the same successful response whenever available.
+        if btc_usd is None:
+            for item in batch:
+                if str(item.get("code", "")).upper() == "BTC":
+                    btc_usd = number(item.get("rate"), None)
+                    break
+
         if len(batch) < 100:
             break
+
+    if btc_usd is None or btc_usd <= 0:
+        # Fallback to the dedicated endpoint only if the list endpoint omitted BTC.
+        btc = lcw_post(
+            "coins/single",
+            {"currency": "USD", "code": "BTC", "meta": False},
+        )
+        btc_usd = number(btc.get("rate"), None)
+    if btc_usd is None or btc_usd <= 0:
+        raise RuntimeError("قیمت BTC از LiveCoinWatch معتبر نیست؛ بعداً دوباره تلاش کنید.")
 
     min_usd_volume = min_btc_volume * btc_usd
     rows = []
