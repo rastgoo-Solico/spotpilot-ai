@@ -2530,13 +2530,14 @@ if "entry" in plan:
     levels[3].metric("ریوارد به ریسک", f"{plan['rr']:.2f}R")
     risk_per_unit = max(0.0, number(plan["entry"]) - number(plan["stop"]))
     risk_budget = capital * max_risk_pct / 100.0
-    position_units = risk_budget / risk_per_unit if risk_per_unit > 0 else 0.0
+    position_units = min(risk_budget / risk_per_unit, capital / number(plan["entry"])) if risk_per_unit > 0 and number(plan["entry"]) > 0 else 0.0
     notional = position_units * number(plan["entry"])
+    actual_risk = position_units * risk_per_unit
     m = st.columns(3)
-    m[0].metric("حداکثر زیان مجاز", fmt_usd(risk_budget))
+    m[0].metric("زیان برآوردی در حدضرر", fmt_usd(actual_risk), help=f"سقف مجاز: {fmt_usd(risk_budget)}")
     m[1].metric("حجم تقریبی پوزیشن", f"{position_units:,.6f}")
     m[2].metric("ارزش تقریبی پوزیشن", fmt_usd(notional))
-    st.caption("حجم با فاصله ورود تا حدضرر محاسبه شده و کارمزد، اسلیپیج و گپ قیمت می‌تواند زیان واقعی را از مقدار مدل بیشتر کند.")
+    st.caption("حجم با فاصله ورود تا حدضرر محاسبه و برای معامله اسپات به سرمایه قابل استفاده محدود شده است. کارمزد، اسلیپیج و گپ قیمت می‌تواند زیان واقعی را از مقدار مدل بیشتر کند.")
 else:
     st.info("قیمت ورود/حدضرر/هدف قابل اتکا از دفتر سفارش فعلی ساخته نشد؛ داده کافی برای تعیین حجم پوزیشن نداریم.")
 
