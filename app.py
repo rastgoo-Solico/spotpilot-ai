@@ -2164,12 +2164,6 @@ for tab, tf_name in zip(tf_tabs, tf_names):
             else:
                 st.info("وضعیت UT نامشخص است.")
 
-            a, b, c, d = st.columns(4)
-            a.metric("آخرین قیمت بسته‌شده", fmt_price(summary["close"]))
-            b.metric("ATR", fmt_price(summary["atr"]))
-            c.metric("حد متحرک UT", fmt_price(summary["ut_stop"]))
-            d.metric("وضعیت", plan["status"])
-
             st.caption(f"زمان شروع آخرین کندل بسته‌شده (UTC): "
                        f"{summary['time'].strftime('%Y-%m-%d %H:%M')}")
 
@@ -2182,6 +2176,22 @@ for tab, tf_name in zip(tf_tabs, tf_names):
                     pass
 
             fresh = freshness_report(summary, tf_name, source_name, live_price)
+            price_gap_pct = None
+            if live_price and summary.get("close", 0) > 0:
+                price_gap_pct = (float(live_price) / float(summary["close"]) - 1.0) * 100.0
+            if source_name and str(source_name).upper() != "LBANK" and price_gap_pct is not None and abs(price_gap_pct) >= 1.0:
+                mismatch_reason = (
+                    f"اختلاف قیمت منبع نمودار ({source_name}) با قیمت زنده LBank برابر "
+                    f"{price_gap_pct:+.2f}% است؛ سناریوی معاملاتی تا بررسی دستی غیرفعال شد."
+                )
+                if isinstance(plan, dict):
+                    plan.update({"status": "WAIT", "reason": mismatch_reason})
+                st.error("⚠️ " + mismatch_reason)
+            else:
+                st.caption(
+                    f"مقایسه قیمت: منبع نمودار {source_name or 'نامشخص'} | "
+                    + (f"اختلاف با LBank: {price_gap_pct:+.2f}%" if price_gap_pct is not None else "قیمت زنده LBank در دسترس نیست")
+                )
             if fresh["stale"]:
                 st.warning(f"⚠️ داده این تایم‌فریم قدیمی است: {fresh['message']}")
                 if fresh.get("ticker_note"):
@@ -2194,6 +2204,12 @@ for tab, tf_name in zip(tf_tabs, tf_names):
             else:
                 st.caption(f"✓ تازگی داده مناسب | پایان آخرین کندل: "
                            f"{fresh['last_candle_close'].strftime('%Y-%m-%d %H:%M UTC')}")
+
+            a, b, c, d = st.columns(4)
+            a.metric("آخرین قیمت بسته‌شده", fmt_price(summary["close"]))
+            b.metric("ATR", fmt_price(summary["atr"]))
+            c.metric("حد متحرک UT", fmt_price(summary["ut_stop"]))
+            d.metric("وضعیت", plan["status"])
 
             last = indicators.iloc[-1]
             st.markdown("#### میانگین‌های متحرک")
@@ -2243,8 +2259,7 @@ for tab, tf_name in zip(tf_tabs, tf_names):
             st.markdown("#### نمودار قیمت و میانگین‌ها")
             elliott_enabled = st.checkbox("نمایش شمارش احتمالی امواج الیوت",
                                           value=False, key=f"elliott_overlay_{tf_name}")
-            st.caption("⚠️ شمارش الیوت ذهنی است. الگوریتم فقط پیوت‌های متناوب را برچسب می‌زند. "
-                       "مسیر فرضی است، نه پیش‌بینی.")
+            st.caption("⚠️ پیوت‌ها با تأخیر تأیید می‌شوند. پیش‌بینی جهت‌دار فقط در صورت وجود ۶ پیوت، اعتبارسنجی اولیه ایمپالس و هم‌جهتی با وضعیت UT نمایش داده می‌شود.")
 
             chart_df = indicators.tail(150).copy()
             fig = go.Figure()
@@ -2289,48 +2304,53 @@ for tab, tf_name in zip(tf_tabs, tf_names):
             if elliott_enabled:
                 wave_points = detect_elliott_candidates(chart_df)
                 context = analyze_elliott_context(chart_df, wave_points)
+                valid_impulse = len(wave_points) >= 6 and not context.get("invalid")
+                ut_now = ut_status(chart_df)
+                direction_matches_ut = (
+                    (context.get("direction", 0) > 0 and ut_now.get("trend", 0) > 0)
+                    or (context.get("direction", 0) < 0 and ut_now.get("trend", 0) < 0)
+                )
                 if not wave_points.empty:
+                    wave_points = wave_points.copy()
+                    if not valid_impulse:
+                        wave_points["Label"] = [f"S{i + 1}" for i in range(len(wave_points))]
                     fig.add_trace(go.Scatter(
                         x=wave_points["Time"], y=wave_points["Price"],
                         mode="lines+markers+text", text=wave_points["Label"],
-                        textposition="top center", name="پیوت‌ها",
+                        textposition="top center", name="پیوت‌های تأییدشده",
                         line={"color": "#7c3aed", "width": 2},
                         marker={"size": 7, "color": "#7c3aed"},
                         textfont={"color": "#7c3aed", "size": 11},
                         connectgaps=False,
                     ))
-                    if context.get("forecast") and len(chart_df):
+                    if valid_impulse and direction_matches_ut and context.get("forecast") and len(chart_df):
                         last_price = float(chart_df["Close"].iloc[-1])
                         t0 = pd.to_datetime(chart_df["Time"].iloc[-1], utc=True, errors="coerce")
                         step_seconds = int(TIMEFRAMES.get(tf_name, {}).get("seconds", 14400))
-                        next_time = t0 + pd.Timedelta(seconds=step_seconds)
-                        future_times = [t0 + pd.Timedelta(seconds=step_seconds * k) for k in (2, 3, 4, 5)]
+                        future_times = [t0 + pd.Timedelta(seconds=step_seconds * k) for k in (1, 2, 3, 4)]
                         future_prices = context["forecast"]
-                        last_pivot = wave_points.iloc[-1]
-                        pivot_time = pd.to_datetime(last_pivot["Time"], utc=True, errors="coerce")
-                        if pd.notna(pivot_time) and pivot_time < t0:
+                        if pd.notna(t0) and len(future_prices) == 4:
                             fig.add_trace(go.Scatter(
-                                x=[pivot_time, t0], y=[float(last_pivot["Price"]), last_price],
-                                mode="lines", name="پیوت تا قیمت فعلی",
-                                line={"color": "#94a3b8", "width": 1.5, "dash": "dot"},
+                                x=[t0] + future_times, y=[last_price] + future_prices,
+                                mode="lines+markers+text",
+                                text=["آخرین قیمت واقعی"] + context["forecast_labels"],
+                                textposition="top center", name="سناریوی احتمالی (مشروط)",
+                                line={"color": "#dc2626", "width": 2.5, "dash": "dash"},
+                                marker={"size": 7, "color": "#dc2626"},
+                                connectgaps=False,
                             ))
-                        fig.add_trace(go.Scatter(
-                            x=[next_time] + future_times, y=[last_price] + future_prices,
-                            mode="lines+markers+text",
-                            text=["مبدأ سناریو"] + context["forecast_labels"],
-                            textposition="top center", name="سناریو — فرضیه",
-                            line={"color": "#dc2626", "width": 2.5, "dash": "dash"},
-                            marker={"size": 7, "color": "#dc2626"},
-                            connectgaps=False,
-                        ))
-                        st.caption(
-                            f"جهت: {'صعودی' if context['direction'] > 0 else 'نزولی' if context['direction'] < 0 else 'خنثی'} | "
-                            f"اطمینان: {context['confidence']}"
-                        )
-                        if context["notes"]:
-                            st.write("**شواهد:** " + "؛ ".join(context["notes"]))
-                        if context["invalid"]:
-                            st.warning("قوانین ایمپالس تأیید نشده: " + "؛ ".join(context["invalid"]))
+                    elif not valid_impulse:
+                        st.info("ساختار ایمپالس معتبر تأیید نشد؛ پیوت‌ها با S1…Sn نمایش داده شده‌اند و پیش‌بینی جهت‌دار مخفی است.")
+                    elif not direction_matches_ut:
+                        st.warning("جهت ساختار الیوت با وضعیت فعلی UT هم‌جهت نیست؛ پیش‌بینی جهت‌دار مخفی است.")
+                    st.caption(
+                        f"جهت ساختار: {'صعودی' if context['direction'] > 0 else 'نزولی' if context['direction'] < 0 else 'خنثی'} | "
+                        f"اطمینان الگوریتمی: {context['confidence']} (نه احتمال آماری)"
+                    )
+                    if context.get("notes"):
+                        st.write("**شواهد:** " + "؛ ".join(context["notes"]))
+                    if context.get("invalid"):
+                        st.warning("قوانین ایمپالس تأیید نشده: " + "؛ ".join(context["invalid"]))
                 else:
                     st.info("برای شمارش موج، پیوت کافی وجود ندارد.")
 
@@ -2621,6 +2641,11 @@ st.caption(
     "این بخش حول نسبت BTC/XAUT می‌چرخد — سؤال اصلی «آیا طلا نسبت به بیت‌کوین قوی‌تر شده؟» است. "
     "روند مطلق BTC و XAUT فقط یک تِلْت کوچک (۱۵٪) اثر می‌گذارد."
 )
+use_hard_cap = st.checkbox(
+    "اعمال سقف ۵۰٪ برای رمزارز وقتی BTC/XAUT در هر دو بازه ۱روزه و ۷روزه منفی است",
+    value=True, key="use_hard_cap"
+)
+st.caption("اگر این گزینه خاموش باشد، قانون سقف سخت اعمال نمی‌شود؛ تخصیص همچنان تابع فرمول اصلی است.")
 try:
     allocation_ratio = get_btc_xau_metrics(lbank_pairs)
     btc_trend = get_asset_trend_score("BTC", lbank_pairs, int(atr_period), float(ut_multiplier))
@@ -2638,7 +2663,7 @@ try:
     trend_signal = max(-1.0, min(1.0, (float(btc_score) - float(gold_score)) / 8.0))
     crypto_edge = 0.85 * ratio_signal + 0.15 * trend_signal
 
-    if ratio_week < 0 and ratio_day < 0:
+    if use_hard_cap and ratio_week < 0 and ratio_day < 0:
         crypto_edge = min(crypto_edge, 0.0)
     elif ratio_week > 0 and ratio_day > 0:
         crypto_edge = max(crypto_edge, 0.0)
@@ -2704,11 +2729,13 @@ try:
             {"پارامتر": "منبع", "مقدار": allocation_ratio.get("source", "—")},
         ])
         st.dataframe(raw_info, use_container_width=True, hide_index=True)
-        if ratio_week < 0 and ratio_day < 0:
+        if use_hard_cap and ratio_week < 0 and ratio_day < 0:
             st.info(
                 "قاعدهٔ سخت اعمال شد: چون هر دو بازهٔ زمانی BTC/XAUT منفی‌اند، "
                 "سهم رمزارز به ۵۰٪ یا کمتر محدود شده."
             )
+        elif not use_hard_cap:
+            st.caption("سقف سخت تخصیص خاموش است؛ سهم رمزارز ممکن است از ۵۰٪ بیشتر شود حتی وقتی BTC/XAUT در هر دو بازه منفی است.")
 
     st.caption(
         "کنترل‌های تأیید — "
@@ -2750,7 +2777,7 @@ try:
         "best_bid": fmt_price(book_stats.get("best_bid")),
         "best_ask": fmt_price(book_stats.get("best_ask")),
         "spread_pct": format_percent(book_stats.get("spread_pct", 0)),
-        "imbalance": f"{book_stats.get('imbalance', 0) * 100:+.2f}%",
+        "imbalance": (f"{book_stats['imbalance'] * 100:+.2f}%" if book_stats.get("imbalance") is not None else "ناموجود"),
         "buy_usd": fmt_usd(trade_stats.get("buy_usd", 0)),
         "sell_usd": fmt_usd(trade_stats.get("sell_usd", 0)),
         "net_flow": fmt_usd(trade_stats.get("net_flow", 0)),
