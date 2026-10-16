@@ -971,7 +971,7 @@ def detect_elliott_candidates(frame, left=3, right=3, min_swing_pct=0.35):
         direction = 1 if up else -1
         w = [direction * (p[i+1]-p[i]) for i in range(5)]
         w1,w2,w3,w4,w5 = w
-        if min(w) <= 0 or w2 >= w1 or w3 <= w1 or w3 <= min(w1,w5): continue
+        if min(w) <= 0 or w2 > w1 or w3 <= min(w1,w5): continue
         if (up and (p[2] <= p[0] or p[3] <= p[1] or p[4] < p[1])) or (down and (p[2] >= p[0] or p[3] >= p[1] or p[4] > p[1])): continue
         fib_penalty = abs(w2/w1 - 0.5) + abs(w4/w3 - 0.382) + abs(w3/w1 - 1.618) * 0.35
         recency_penalty = (len(pivots) - 1 - start - 5) * 0.08
@@ -1002,7 +1002,7 @@ def analyze_elliott_context(frame, pivots):
     direction = 1 if up else -1
     w = [direction * (prices[i+1]-prices[i]) for i in range(5)]
     w1,w2,w3,w4,w5 = w
-    if min(w) <= 0 or w2 >= w1 or w3 <= w1 or w3 <= min(w1,w5):
+    if min(w) <= 0 or w2 > w1 or w3 <= min(w1,w5):
         out["invalid"].append("قواعد طول موج‌های ۱ تا ۵ نقض شده است."); return out
     if (up and (prices[2] <= prices[0] or prices[3] <= prices[1] or prices[4] < prices[1])) or (down and (prices[2] >= prices[0] or prices[3] >= prices[1] or prices[4] > prices[1])):
         out["invalid"].append("قواعد مبدأ موج ۲، شکست موج ۳ یا هم‌پوشانی موج ۴ نقض شده است."); return out
@@ -2178,8 +2178,9 @@ for tab, tf_name in zip(tf_tabs, tf_names):
                 wave_points = detect_elliott_candidates(chart_df)
                 context = analyze_elliott_context(chart_df, wave_points)
                 ut_now = ut_status(chart_df)
-                direction_matches_ut = ((context.get("direction", 0) > 0 and ut_now.get("trend", 0) > 0)
-                                        or (context.get("direction", 0) < 0 and ut_now.get("trend", 0) < 0))
+                forecast_direction = -context.get("direction", 0)
+                direction_matches_ut = ((forecast_direction > 0 and ut_now.get("trend", 0) > 0)
+                                        or (forecast_direction < 0 and ut_now.get("trend", 0) < 0))
                 if not wave_points.empty and context.get("phase") in ("abc_correction_scenario", "post_impulse_unconfirmed"):
                     fig.add_trace(go.Scatter(
                         x=wave_points["Time"], y=wave_points["Price"], mode="lines+markers+text",
@@ -2188,11 +2189,12 @@ for tab, tf_name in zip(tf_tabs, tf_names):
                         textfont={"color": "#7c3aed", "size": 12}, connectgaps=False,
                     ))
                     if context.get("phase") == "abc_correction_scenario" and context.get("forecast") and direction_matches_ut:
-                        t0 = pd.to_datetime(wave_points["Time"].iloc[-1], utc=True, errors="coerce")
+                        t0 = pd.to_datetime(chart_df["Time"].iloc[-1], utc=True, errors="coerce")
+                        current_close = float(chart_df["Close"].iloc[-1])
                         step = int(TIMEFRAMES.get(tf_name, {}).get("seconds", 14400))
                         future_times = [t0 + pd.Timedelta(seconds=step*k) for k in (1,2,3)]
                         fig.add_trace(go.Scatter(
-                            x=[t0]+future_times, y=[float(wave_points["Price"].iloc[-1])]+context["forecast"],
+                            x=[t0]+future_times, y=[current_close]+context["forecast"],
                             mode="lines+markers+text", text=["پایان موج ۵"]+context["forecast_labels"],
                             textposition="top center", name="سناریوی اصلاح ABC",
                             line={"color": "#dc2626", "width": 2.5, "dash": "dash"},
