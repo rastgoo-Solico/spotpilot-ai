@@ -1,9 +1,11 @@
 """
 SpotPilot AI — Market analysis dashboard
-Full single-file version.
-- Multi-source klines (Binance/Bybit/OKX/KuCoin/LBank) with automatic fallback
-- State-aware UT Bot signal display
-- Fixed allocation formula (ratio-dominant)
+Version: v2.4-reviewed
+- Multi-source klines with exchange-time candle validation
+- UT Bot ATR(1) defaults aligned with the requested TradingView setup
+- ATR(14) daily volatility normalization for ranking (separate from UT ATR)
+- State-aware scoring without double-counting the same UT trend
+- Per-timeframe candle freshness and order-book age visibility
 """
 import statistics
 import math
@@ -165,6 +167,7 @@ def is_success(payload):
 
 
 def tiered_score(pct, thresholds=(0.5, 3.0)):
+    """Fixed percentage tiering, retained as fallback when ATR is unavailable."""
     try:
         if pct is None or not pd.notna(pct):
             return 0
@@ -176,6 +179,26 @@ def tiered_score(pct, thresholds=(0.5, 3.0)):
     if pct >= low:  return 1
     if pct <= -high: return -2
     if pct <= -low:  return -1
+    return 0
+
+
+def tiered_score_atr(pct, atr_pct, z_thresholds=(1.0, 3.0)):
+    """Volatility-adjusted tiered score using daily ATR(14) percentage."""
+    if atr_pct is None or not pd.notna(atr_pct) or atr_pct <= 0:
+        return tiered_score(pct, thresholds=(0.5, 3.0))
+    try:
+        pct = float(pct)
+        atr_pct = float(atr_pct)
+        if not pd.notna(pct) or atr_pct <= 0:
+            return 0
+        z = pct / atr_pct
+    except (TypeError, ValueError):
+        return 0
+    low, high = z_thresholds
+    if z >= high: return 2
+    if z >= low: return 1
+    if z <= -high: return -2
+    if z <= -low: return -1
     return 0
 
 
@@ -377,6 +400,7 @@ def fetch_lbank_pairs():
 
 @st.cache_data(ttl=15, show_spinner=False)
 def fetch_lbank_book(pair):
+    """Fetch the LBank order book and record exchange and local receive timestamps."""
     payload = get_json(f"{LBANK_URL}/depth.do", params={"symbol": pair, "size": 100})
     if not is_success(payload):
         raise RuntimeError(f"LBank depth API error: {payload.get('msg', payload)}")
@@ -385,7 +409,14 @@ def fetch_lbank_book(pair):
     asks = data.get("asks") or []
     if not bids or not asks:
         raise RuntimeError(f"دفتر سفارش {pair} خالی است.")
-    return {"bids": bids, "asks": asks, "timestamp": data.get("timestamp") or payload.get("ts")}
+    exchange_ts = data.get("timestamp") or payload.get("ts")
+    try:
+        exchange_ts = float(exchange_ts)
+        if exchange_ts > 1e12:
+            exchange_ts /= 1000.0
+    except (TypeError, ValueError):
+        exchange_ts = None
+    return {"bids": bids, "asks": asks, "timestamp": exchange_ts, "fetched_at": time.time()}
 
 
 @st.cache_data(ttl=15, show_spinner=False)
@@ -538,24 +569,44 @@ def fetch_lbank_klines(pair, timeframe, size=300):
 # ===========================================================================
 # MULTI-SOURCE KLINES
 # ===========================================================================
-def _normalize_ccxt_ohlcv(raw, timeframe):
-    """Convert CCXT OHLCV list to the standard internal DataFrame."""
+def _exchange_now_seconds(exchange):
+    """Prefer exchange server time; fall back to local UTC time if unavailable."""
+    try:
+        if getattr(exchange, "has", {}).get("fetchTime"):
+            server_ms = exchange.fetch_time()
+            if server_ms:
+                return int(server_ms // 1000)
+    except Exception:
+        pass
+    try:
+        server_ms = exchange.milliseconds()
+        if server_ms:
+            return int(server_ms // 1000)
+    except Exception:
+        pass
+    return int(time.time())
+
+
+def _normalize_ccxt_ohlcv(raw, timeframe, now_seconds=None):
+    """Normalize OHLCV, validate candle geometry, and discard unfinished candles."""
     if not raw:
         return None
     df = pd.DataFrame(raw, columns=["timestamp_ms", "Open", "High", "Low", "Close", "Volume"])
-    df["timestamp"] = (pd.to_numeric(df["timestamp_ms"], errors="coerce") // 1000)
+    df["timestamp"] = pd.to_numeric(df["timestamp_ms"], errors="coerce") // 1000
     df = df.dropna(subset=["timestamp"])
     df["timestamp"] = df["timestamp"].astype("int64")
-
     for col in ["Open", "High", "Low", "Close", "Volume"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
-    df = df.dropna(subset=["Open", "High", "Low", "Close"])
-    df = df[(df["Open"] > 0) & (df["High"] > 0) & (df["Low"] > 0) & (df["Close"] > 0)]
-
+    df = df.dropna(subset=["Open", "High", "Low", "Close", "Volume"])
+    df = df[(df["Open"] > 0) & (df["High"] > 0) & (df["Low"] > 0)
+            & (df["Close"] > 0) & (df["Volume"] >= 0)]
+    df = df[(df["High"] >= df[["Open", "Close", "Low"]].max(axis=1))
+            & (df["Low"] <= df[["Open", "Close", "High"]].min(axis=1))]
     interval_seconds = int(TIMEFRAMES[timeframe]["seconds"])
-    now_seconds = int(time.time())
-    df = df[(df["timestamp"] + interval_seconds) <= now_seconds]
-    df = df.drop_duplicates(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+    if now_seconds is None:
+        now_seconds = int(time.time())
+    df = df[(df["timestamp"] + interval_seconds) <= int(now_seconds)]
+    df = df.sort_values("timestamp").drop_duplicates(subset=["timestamp"], keep="last").reset_index(drop=True)
     df["Time"] = pd.to_datetime(df["timestamp"], unit="s", utc=True)
     return df
 
@@ -586,7 +637,7 @@ def fetch_klines_multi_source(code, timeframe, size=300, quote="USDT"):
             if not raw or len(raw) < 50:
                 errors.append(f"{ex_id}: فقط {len(raw) if raw else 0} کندل")
                 continue
-            df = _normalize_ccxt_ohlcv(raw, timeframe)
+            df = _normalize_ccxt_ohlcv(raw, timeframe, now_seconds=_exchange_now_seconds(exchange))
             if df is None or df.empty:
                 errors.append(f"{ex_id}: داده نامعتبر")
                 continue
@@ -613,17 +664,33 @@ def fetch_klines_multi_source(code, timeframe, size=300, quote="USDT"):
 # ===========================================================================
 # INDICATORS
 # ===========================================================================
-def calculate_atr(df, period=14):
-    period = max(int(period), 2)
-    high = df["High"]; low = df["Low"]; close = df["Close"]
+def calculate_atr(df, period=1):
+    """True Range for period=1; Wilder ATR with an SMA seed for longer periods."""
+    period = max(int(period), 1)
+    high = pd.to_numeric(df["High"], errors="coerce")
+    low = pd.to_numeric(df["Low"], errors="coerce")
+    close = pd.to_numeric(df["Close"], errors="coerce")
     prev_close = close.shift(1)
     true_range = pd.concat([
         high - low, (high - prev_close).abs(), (low - prev_close).abs(),
-    ], axis=1).max(axis=1)
-    return true_range.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean()
+    ], axis=1).max(axis=1, skipna=True)
+    true_range = true_range.where(np.isfinite(true_range) & (true_range >= 0))
+    if period == 1:
+        return true_range.rename("ATR")
+    values = true_range.to_numpy(dtype=float)
+    result = np.full(len(values), np.nan, dtype=float)
+    for end in range(period - 1, len(values)):
+        window = values[end - period + 1:end + 1]
+        if not np.isfinite(window).all():
+            continue
+        if end == period - 1 or not np.isfinite(result[end - 1]):
+            result[end] = float(np.mean(window))
+        else:
+            result[end] = ((result[end - 1] * (period - 1)) + values[end]) / period
+    return pd.Series(result, index=df.index, name="ATR")
 
 
-def calculate_ut_bot(df, atr_period=14, key_value=2.0):
+def calculate_ut_bot(df, atr_period=1, key_value=2.0):
     out = df.copy()
     close = out["Close"]
     atr = calculate_atr(out, atr_period)
@@ -661,7 +728,7 @@ def calculate_ut_bot(df, atr_period=14, key_value=2.0):
     return out
 
 
-def add_market_indicators(df, atr_period=14, key_value=2.0):
+def add_market_indicators(df, atr_period=1, key_value=2.0):
     out = calculate_ut_bot(df, atr_period, key_value)
     for period in (14, 50, 200):
         out[f"SMA {period}"] = out["Close"].rolling(window=period, min_periods=period).mean()
@@ -834,39 +901,30 @@ def freshness_report(summary, timeframe, source_name=None, ticker_price=None):
     if not interval_seconds:
         return {"stale": False, "age_minutes": 0.0, "last_candle_close": None,
                 "message": "تایم‌فریم نامشخص.", "ticker_note": None, "source": source_name}
-
     last_open = summary.get("time")
     if last_open is None or pd.isna(last_open):
         return {"stale": True, "age_minutes": float("inf"), "last_candle_close": None,
                 "message": "زمان آخرین کندل نامشخص است.", "ticker_note": None, "source": source_name}
-
     candle_close = pd.to_datetime(last_open, utc=True) + pd.Timedelta(seconds=interval_seconds)
-    age_minutes = max(0.0, (pd.Timestamp.now(tz="UTC") - candle_close).total_seconds() / 60)
-    stale = age_minutes > (interval_seconds / 60) * 2
-
+    age_minutes = max(0.0, (pd.Timestamp.now(tz="UTC") - candle_close).total_seconds() / 60.0)
+    stale_limits = {"15 دقیقه": 30.0, "4 ساعت": 480.0, "روزانه": 2160.0}
+    stale_limit = stale_limits.get(timeframe, (interval_seconds / 60.0) * 2.0)
+    stale = age_minutes > stale_limit
     ticker_note = None
     if stale and ticker_price:
         try:
-            gap_pct = (ticker_price / summary.get("close", 1) - 1) * 100
+            close = number(summary.get("close"))
+            gap_pct = (ticker_price / close - 1) * 100 if close > 0 else float("nan")
             ticker_note = (f"آخرین قیمت زنده LBank: {fmt_price(ticker_price)} "
                            f"({gap_pct:+.3f}% نسبت به آخرین کندل بسته)")
         except Exception:
             ticker_note = f"آخرین قیمت زنده LBank: {fmt_price(ticker_price)}"
-
     src_part = f" | منبع: {source_name}" if source_name else ""
-    message = (
-        f"آخرین کندل بسته‌شده: {candle_close.strftime('%Y-%m-%d %H:%M UTC')} | "
-        f"فاصله: {age_minutes:.0f} دقیقه | "
-        f"انتظار: ~{int(interval_seconds/60)} دقیقه{src_part}"
-    )
-    return {
-        "stale": stale,
-        "age_minutes": age_minutes,
-        "last_candle_close": candle_close,
-        "message": message,
-        "ticker_note": ticker_note,
-        "source": source_name,
-    }
+    message = (f"آخرین کندل بسته‌شده: {candle_close.strftime('%Y-%m-%d %H:%M UTC')} | "
+               f"فاصله: {age_minutes:.0f} دقیقه | هشدار stale پس از {stale_limit:.0f} دقیقه{src_part}")
+    return {"stale": stale, "age_minutes": age_minutes,
+            "last_candle_close": candle_close, "message": message,
+            "ticker_note": ticker_note, "source": source_name}
 
 
 # ===========================================================================
@@ -1100,12 +1158,14 @@ def get_btc_xau_metrics(lbank_pairs):
 
 
 @st.cache_data(ttl=180, show_spinner=False)
-def get_asset_trend_score(code, lbank_pairs, atr_period=14, ut_multiplier=2.0):
+def get_asset_trend_score(code, lbank_pairs, atr_period=1, ut_multiplier=2.0):
     """
-    Per timeframe score in range -3..+3, total -6..+6.
+    UT crossover: +/-2 when fresh and aligned; existing aligned state: +/-1.
+    MA alignment: +/-1. ATR% is independent daily ATR(14), not UT ATR(1).
     """
     score = 0
     notes = []
+    atr_pct_latest = None
     for timeframe in ("4 ساعت", "روزانه"):
         try:
             candles, src, errs = fetch_klines_multi_source(code, timeframe, 260)
@@ -1114,32 +1174,43 @@ def get_asset_trend_score(code, lbank_pairs, atr_period=14, ut_multiplier=2.0):
                 continue
             indicators = add_market_indicators(candles, atr_period, ut_multiplier)
             ut = ut_status(indicators)
-
-            if ut["trend"] > 0:
-                score += 1; notes.append(f"{timeframe}: قیمت بالای حد UT ({src})")
-            elif ut["trend"] < 0:
-                score -= 1; notes.append(f"{timeframe}: قیمت زیر حد UT ({src})")
-
-            if ut["fresh"] and ut["last_signal"] == "buy":
-                score += 1; notes.append(f"{timeframe}: سیگنال خرید تازه UT")
-            elif ut["fresh"] and ut["last_signal"] == "sell":
-                score -= 1; notes.append(f"{timeframe}: سیگنال فروش تازه UT")
-
+            if ut["fresh"] and ut["last_signal"] == "buy" and ut["trend"] > 0:
+                score += 2
+                notes.append(f"{timeframe}: سیگنال خرید تازه UT هم‌جهت با وضعیت فعلی ({src})")
+            elif ut["fresh"] and ut["last_signal"] == "sell" and ut["trend"] < 0:
+                score -= 2
+                notes.append(f"{timeframe}: سیگنال فروش تازه UT هم‌جهت با وضعیت فعلی ({src})")
+            elif ut["last_signal"] == "buy" and ut["trend"] > 0:
+                score += 1
+                notes.append(f"{timeframe}: حالت خرید UT فعال ({src})")
+            elif ut["last_signal"] == "sell" and ut["trend"] < 0:
+                score -= 1
+                notes.append(f"{timeframe}: حالت فروش UT فعال ({src})")
+            elif ut["last_signal"] is not None:
+                notes.append(f"{timeframe}: تعارض سیگنال آخر با وضعیت UT؛ بدون امتیاز UT ({src})")
+            elif ut["trend"] != 0:
+                notes.append(f"{timeframe}: وضعیت UT بدون سیگنال ثبت‌شده؛ بدون امتیاز کراس ({src})")
             last = indicators.iloc[-1]
-            close = number(last["Close"])
+            close = number(last.get("Close"))
             ma50 = number(last.get("SMA 50"), float("nan"))
             ma200 = number(last.get("SMA 200"), float("nan"))
             if pd.notna(ma50) and pd.notna(ma200):
                 if close > ma50 > ma200:
-                    score += 1; notes.append(f"{timeframe}: روند MA صعودی")
+                    score += 1
+                    notes.append(f"{timeframe}: روند MA صعودی")
                 elif close < ma50 < ma200:
-                    score -= 1; notes.append(f"{timeframe}: روند MA نزولی")
+                    score -= 1
+                    notes.append(f"{timeframe}: روند MA نزولی")
+            if timeframe == "روزانه" and close > 0:
+                atr14 = calculate_atr(candles, 14).iloc[-1]
+                if pd.notna(atr14) and float(atr14) > 0:
+                    atr_pct_latest = float(atr14) / close * 100.0
         except Exception as exc:
             notes.append(f"{timeframe}: خطا ({type(exc).__name__})")
-    return {"score": score, "notes": notes}
+    return {"score": score, "atr_pct": atr_pct_latest, "notes": notes}
 
 
-def rank_crypto_candidates(coins_df, lbank_pairs, atr_period=14, ut_multiplier=2.0):
+def rank_crypto_candidates(coins_df, lbank_pairs, atr_period=1, ut_multiplier=2.0):
     excluded = {"XAUT", "USDT", "USDC", "FDUSD", "TUSD", "DAI", "USDE",
                 "USDD", "USDP", "PYUSD", "EURC", "USD1", "USTC"}
     eligible = coins_df[
@@ -1148,18 +1219,18 @@ def rank_crypto_candidates(coins_df, lbank_pairs, atr_period=14, ut_multiplier=2
     if eligible.empty:
         return []
     eligible["Volume USD"] = pd.to_numeric(eligible["Volume USD"], errors="coerce").fillna(0)
+    eligible["Code"] = eligible["Code"].astype(str).str.upper()
     core = ["BTC", "ETH", "SOL"]
-    selected_codes = [c for c in core if c in set(eligible["Code"].astype(str).str.upper())]
-    by_volume = eligible.sort_values("Volume USD", ascending=False)["Code"].astype(str).str.upper().tolist()
+    selected_codes = [x for x in core if x in set(eligible["Code"])]
+    by_volume = eligible.sort_values("Volume USD", ascending=False)["Code"].tolist()
     for code in by_volume:
         if code not in selected_codes:
             selected_codes.append(code)
-        if len(selected_codes) >= 7:
+        if len(selected_codes) >= 50:
             break
-
     rows = []
-    for code in selected_codes[:7]:
-        coin_rows = eligible[eligible["Code"].astype(str).str.upper() == code]
+    for code in selected_codes[:50]:
+        coin_rows = eligible[eligible["Code"] == code]
         if coin_rows.empty:
             continue
         coin = coin_rows.iloc[0]
@@ -1167,38 +1238,36 @@ def rank_crypto_candidates(coins_df, lbank_pairs, atr_period=14, ut_multiplier=2
         trend = get_asset_trend_score(code, lbank_pairs, int(atr_period), float(ut_multiplier))
         relative = get_btc_relative_metrics(code, lbank_pairs)
         trend_score = trend.get("score")
+        atr_pct = trend.get("atr_pct")
         relative_change = relative.get("change_pct")
-
-        if trend_score is None and relative_change is None:
+        if trend_score is None and relative_change is None and not pd.notna(day_change):
             score = None
         else:
             score = int(trend_score or 0)
-            score += tiered_score(relative_change, thresholds=(0.5, 3.0))
-            score += tiered_score(day_change if pd.notna(day_change) else None, thresholds=(0.5, 3.0))
-
+            score += tiered_score_atr(relative_change, atr_pct)
+            score += tiered_score_atr(day_change if pd.notna(day_change) else None, atr_pct)
         if score is None:
             label, reason = "داده ناکافی", "داده کافی نیست"
         elif score >= 5:
-            label, reason = "اولویت ۱: بررسی خرید", "روند و قدرت نسبی قوی؛ منتظر تأیید ورود"
+            label, reason = "اولویت ۱: بررسی خرید", "نشانه‌های روند و قدرت نسبی قوی؛ ورود همچنان نیازمند تأیید است"
         elif score >= 2:
-            label, reason = "اولویت ۲: انتظار برای تأیید", "نشانه‌های مثبت محدود"
+            label, reason = "اولویت ۲: انتظار برای تأیید", "نشانه‌های مثبت محدود؛ ورود قطعی نیست"
         elif score <= -3:
             label, reason = "فعلاً اولویت پایین", "روند یا قدرت نسبی ضعیف"
         else:
             label, reason = "خنثی: صبر", "مزیت روشن دیده نمی‌شود"
-
         rows.append({
             "Code": code, "Score": score, "Priority": label,
             "24h Change %": day_change if pd.notna(day_change) else None,
-            "BTC Relative %": relative_change,
-            "Volume USD": number(coin.get("Volume USD")),
-            "Reason": reason,
+            "BTC Relative %": relative_change, "Volume USD": number(coin.get("Volume USD")),
+            "ATR%": atr_pct, "Reason": reason,
             "Trend notes": trend.get("notes") or [],
             "Relative method": relative.get("method", ""),
         })
     rows.sort(key=lambda row: (
         row["Score"] is None,
         -(row["Score"] if row["Score"] is not None else -999),
+        -number(row["24h Change %"], float("-inf")),
         -row["Volume USD"],
     ))
     return rows
@@ -1807,8 +1876,8 @@ with st.sidebar:
     with st.expander("تنظیمات پیشرفته UT Bot"):
         st.caption("اگر با این پارامترها آشنا نیستی، مقدار پیش‌فرض را تغییر نده.")
         atr_period = st.number_input(
-            "دوره ATR", min_value=2, max_value=100, value=14, step=1,
-            help="تعداد کندل‌های برآورد نوسان. پیش‌فرض ۱۴ استاندارد Wilder است.",
+            "دوره ATR برای UT Bot", min_value=1, max_value=100, value=1, step=1,
+            help="پیش‌فرض ۱ برای تطبیق با تنظیم TradingView شماست؛ رتبه‌بندی نوسان از ATR روزانه ۱۴ دوره‌ای مستقل استفاده می‌کند.",
         )
         ut_multiplier = st.number_input(
             "ضریب ATR (Key Value)", min_value=0.1, max_value=20.0, value=2.0, step=0.1,
@@ -2409,11 +2478,24 @@ except Exception as exc:
     trade_stats = analyze_trades([])
     st.warning(f"معاملات اخیر قابل دریافت نبودند: {type(exc).__name__}")
 
+book_age_seconds = max(0.0, time.time() - float(book.get("fetched_at", time.time())))
+exchange_book_ts = book.get("timestamp")
+if exchange_book_ts:
+    exchange_age_seconds = max(0.0, time.time() - float(exchange_book_ts))
+    st.caption(f"دفتر سفارش دریافت‌شده: {book_age_seconds:.0f} ثانیه قبل | timestamp صرافی: {exchange_age_seconds:.0f} ثانیه قبل")
+else:
+    st.caption(f"دفتر سفارش دریافت‌شده: {book_age_seconds:.0f} ثانیه قبل | timestamp صرافی در دسترس نیست")
+if book_age_seconds > 300:
+    st.error("دفتر سفارش بیش از ۵ دقیقه قدیمی است؛ تحلیل ورود را معتبر فرض نکنید.")
+elif book_age_seconds > 120:
+    st.warning("دفتر سفارش بیش از ۲ دقیقه قدیمی است؛ قبل از تصمیم، داده را تازه کنید.")
+
 metrics = st.columns(4)
 metrics[0].metric("بهترین خرید", fmt_price(book_stats["best_bid"]))
 metrics[1].metric("بهترین فروش", fmt_price(book_stats["best_ask"]))
 metrics[2].metric("فاصله خرید و فروش", format_percent(book_stats["spread_pct"]))
-metrics[3].metric("عدم‌تعادل دفتر سفارش", f"{book_stats['imbalance'] * 100:+.2f}%")
+metrics[3].metric("عدم‌تعادل دفتر سفارش",
+                  f"{book_stats['imbalance'] * 100:+.2f}%" if book_stats.get("imbalance") is not None else "ناموجود")
 
 mid_price = number(book_stats.get("mid"))
 bid_zones = [z for z in book_stats.get("bid_walls", []) if number(z.get("price")) < mid_price]
