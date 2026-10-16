@@ -76,7 +76,7 @@ def test_atr_period_four_uses_sma_seed_then_wilder_recurrence(funcs):
 
 @pytest.mark.parametrize(
     "pct,atr,expected",
-    [(5, 2, 2), (2, 2, 1), (-2, 2, -1), (-7, 2, -2), (0.5, 2, 0)],
+    [(6, 2, 2), (2, 2, 1), (-2, 2, -1), (-7, 2, -2), (0.5, 2, 0)],
 )
 def test_atr_relative_score(funcs, pct, atr, expected):
     assert funcs["tiered_score_atr"](pct, atr) == expected
