@@ -931,233 +931,106 @@ def freshness_report(summary, timeframe, source_name=None, ticker_price=None):
 # ELLIOTT
 # ===========================================================================
 def detect_elliott_candidates(frame, left=3, right=3, min_swing_pct=0.35):
+    """Return one recent rule-valid five-wave impulse, never a raw ZigZag."""
     columns = ["index", "Time", "Price", "Kind", "Label"]
-    if frame is None or len(frame) < left + right + 8:
-        return pd.DataFrame(columns=columns)
-
+    empty = pd.DataFrame(columns=columns)
+    if frame is None or len(frame) < max(40, left + right + 12):
+        return empty
     data = frame.reset_index(drop=True).copy()
-    highs = pd.to_numeric(data["High"], errors="coerce").to_numpy()
-    lows = pd.to_numeric(data["Low"], errors="coerce").to_numpy()
-    n = len(data)
+    highs = pd.to_numeric(data["High"], errors="coerce").to_numpy(dtype=float)
+    lows = pd.to_numeric(data["Low"], errors="coerce").to_numpy(dtype=float)
     raw = []
-
-    for i in range(left, n - right):
-        h_window = highs[i - left:i + right + 1]
-        l_window = lows[i - left:i + right + 1]
-        h_val, l_val = highs[i], lows[i]
-        if pd.notna(h_val) and h_val == np.nanmax(h_window):
-            left_side = highs[i - left:i]
-            if len(left_side) == 0 or h_val > np.nanmax(left_side):
-                raw.append({"index": i, "Time": data.loc[i, "Time"],
-                            "Price": float(h_val), "Kind": "high"})
-        if pd.notna(l_val) and l_val == np.nanmin(l_window):
-            left_side = lows[i - left:i]
-            if len(left_side) == 0 or l_val < np.nanmin(left_side):
-                raw.append({"index": i, "Time": data.loc[i, "Time"],
-                            "Price": float(l_val), "Kind": "low"})
-
+    for i in range(left, len(data) - right):
+        hw, lw = highs[i-left:i+right+1], lows[i-left:i+right+1]
+        if not np.isfinite(highs[i]) or not np.isfinite(lows[i]):
+            continue
+        if np.isfinite(hw).any() and highs[i] >= np.nanmax(hw) and highs[i] > np.nanmax(highs[i-left:i]):
+            raw.append({"index": i, "Time": data.loc[i, "Time"], "Price": float(highs[i]), "Kind": "high"})
+        if np.isfinite(lw).any() and lows[i] <= np.nanmin(lw) and lows[i] < np.nanmin(lows[i-left:i]):
+            raw.append({"index": i, "Time": data.loc[i, "Time"], "Price": float(lows[i]), "Kind": "low"})
     raw.sort(key=lambda p: (p["index"], 0 if p["Kind"] == "low" else 1))
     pivots = []
     for point in raw:
         if pivots and point["Kind"] == pivots[-1]["Kind"]:
-            more_extreme = (point["Price"] > pivots[-1]["Price"] if point["Kind"] == "high"
-                            else point["Price"] < pivots[-1]["Price"])
-            if more_extreme:
-                pivots[-1] = point
+            more_extreme = point["Price"] > pivots[-1]["Price"] if point["Kind"] == "high" else point["Price"] < pivots[-1]["Price"]
+            if more_extreme: pivots[-1] = point
             continue
         if pivots:
             prev = pivots[-1]["Price"]
-            if not prev or abs(point["Price"] / prev - 1) * 100 < min_swing_pct:
-                continue
+            if prev <= 0 or abs(point["Price"] / prev - 1) * 100 < min_swing_pct: continue
         pivots.append(point)
-
-    if len(pivots) < 2:
-        return pd.DataFrame(columns=columns)
-
-    out = pd.DataFrame(pivots)
-    out["Label"] = ""
-    recent_n = min(6, len(out))
-    labels = ["0", "1", "2", "3", "4", "5"][-recent_n:]
-    out.loc[out.index[-recent_n:], "Label"] = labels
+    if len(pivots) < 6: return empty
+    candidates = []
+    for start in range(len(pivots) - 5):
+        pts = pivots[start:start+6]
+        p = [x["Price"] for x in pts]
+        kinds = [x["Kind"] for x in pts]
+        up = kinds == ["low","high","low","high","low","high"]
+        down = kinds == ["high","low","high","low","high","low"]
+        if not (up or down): continue
+        direction = 1 if up else -1
+        w = [direction * (p[i+1]-p[i]) for i in range(5)]
+        w1,w2,w3,w4,w5 = w
+        if min(w) <= 0 or w2 > w1 or w3 <= min(w1,w5): continue
+        if (up and (p[2] <= p[0] or p[3] <= p[1] or p[4] < p[1])) or (down and (p[2] >= p[0] or p[3] >= p[1] or p[4] > p[1])): continue
+        fib_penalty = abs(w2/w1 - 0.5) + abs(w4/w3 - 0.382) + abs(w3/w1 - 1.618) * 0.35
+        recency_penalty = (len(pivots) - 1 - start - 5) * 0.08
+        candidates.append((fib_penalty + recency_penalty, pts, fib_penalty))
+    if not candidates: return empty
+    candidates.sort(key=lambda item: (item[0], -item[1][-1]["index"]))
+    _, chosen, fib_penalty = candidates[0]
+    out = pd.DataFrame(chosen)
+    out["Label"] = ["0","1","2","3","4","5"]
+    out.attrs["fib_penalty"] = float(fib_penalty)
+    out.attrs["count_quality"] = "higher" if fib_penalty < 0.75 else "moderate"
     return out
 
-
 def analyze_elliott_context(frame, pivots):
-    result = {"direction": 0, "score": 0.0, "confidence": "کم",
-              "notes": [], "invalid": [], "forecast": []}
-    if frame is None or len(frame) < 30 or pivots is None or len(pivots) < 5:
-        result["notes"].append("داده یا پیوت کافی برای شمارش معتبر وجود ندارد.")
-        return result
+    """Validate the selected impulse and project a conditional ABC correction."""
+    out = {"direction": 0, "score": 0.0, "confidence": "کم", "notes": [], "invalid": [],
+           "forecast": [], "forecast_labels": [], "phase": "no_valid_impulse"}
+    if frame is None or len(frame) < 30 or pivots is None or len(pivots) != 6:
+        out["notes"].append("ایمپالس معتبر پنج‌موجی پیدا نشد؛ شمارش زیگزاگی نمایش داده نمی‌شود.")
+        return out
+    pivots = pivots.reset_index(drop=True)
+    prices = pd.to_numeric(pivots["Price"], errors="coerce").astype(float).tolist()
+    kinds = pivots["Kind"].tolist()
+    up = kinds == ["low","high","low","high","low","high"]
+    down = kinds == ["high","low","high","low","high","low"]
+    if not (up or down):
+        out["invalid"].append("توالی پیوت‌ها با ایمپالس سازگار نیست."); return out
+    direction = 1 if up else -1
+    w = [direction * (prices[i+1]-prices[i]) for i in range(5)]
+    w1,w2,w3,w4,w5 = w
+    if min(w) <= 0 or w2 > w1 or w3 <= min(w1,w5):
+        out["invalid"].append("قواعد طول موج‌های ۱ تا ۵ نقض شده است."); return out
+    if (up and (prices[2] <= prices[0] or prices[3] <= prices[1] or prices[4] < prices[1])) or (down and (prices[2] >= prices[0] or prices[3] >= prices[1] or prices[4] > prices[1])):
+        out["invalid"].append("قواعد مبدأ موج ۲، شکست موج ۳ یا هم‌پوشانی موج ۴ نقض شده است."); return out
+    data = frame.reset_index(drop=True)
+    last = number(data["Close"].iloc[-1], prices[5])
+    end_index = int(pivots["index"].iloc[-1])
+    impulse_size = abs(prices[5]-prices[0])
+    ranges = pd.to_numeric(data["High"], errors="coerce") - pd.to_numeric(data["Low"], errors="coerce")
+    atr = float(ranges.rolling(14).mean().iloc[-1]) if len(ranges) >= 14 else float("nan")
+    if not math.isfinite(atr) or atr <= 0: atr = max(abs(last)*0.005, 1e-8)
+    out.update({"direction": direction, "score": 2.0, "phase": "abc_correction_scenario",
+                "confidence": "متوسط" if pivots.attrs.get("count_quality") == "higher" else "کم",
+                "wave5_price": prices[5], "impulse_size": impulse_size})
+    out["notes"].append("یک شمارش پنج‌موجی از قواعد اصلی ایمپالس عبور کرده است.")
+    out["notes"].append("فیبوناچی فقط برای رتبه‌بندی سناریو استفاده شده و اثبات موج نیست.")
+    if end_index < len(data)-1 and abs(last-prices[5]) > max(atr*1.5, impulse_size*0.12):
+        out["phase"] = "post_impulse_unconfirmed"
+        out["notes"].append("قیمت از انتهای موج ۵ فاصله گرفته؛ پیش‌بینی کهنه صادر نمی‌شود.")
+        return out
+    sign = -direction
+    a = prices[5] + sign*impulse_size*0.382
+    b = a - sign*impulse_size*0.191
+    cc = b + sign*impulse_size*0.382
+    out["forecast"] = [a,b,cc]
+    out["forecast_labels"] = ["A احتمالی (0.382)", "B احتمالی (بازگشت 0.5 از A)", "C احتمالی (امتداد)"]
+    out["notes"].append("سناریوی اصلاح ABC از انتهای موج ۵ و اندازه ایمپالس محاسبه شده است.")
+    return out
 
-    d = frame.reset_index(drop=True).copy()
-    p = pivots.tail(6).reset_index(drop=True)
-    prices = p["Price"].astype(float).tolist()
-    kinds = p["Kind"].tolist()
-    direction = 1 if prices[-1] > prices[-2] else -1
-    result["direction"] = direction
-
-    if len(p) == 6:
-        up = kinds == ["low", "high", "low", "high", "low", "high"]
-        down = kinds == ["high", "low", "high", "low", "high", "low"]
-        if up:
-            w1, w2, w3, w4, w5 = (prices[1]-prices[0], prices[1]-prices[2],
-                                  prices[3]-prices[2], prices[3]-prices[4],
-                                  prices[5]-prices[4])
-            if prices[2] <= prices[0]: result["invalid"].append("موج ۲ از مبدأ موج ۱ عبور کرده")
-            if prices[3] <= prices[1]: result["invalid"].append("موج ۳ سقف موج ۱ را نشکسته")
-            if prices[4] < prices[1]: result["invalid"].append("هم‌پوشانی موج ۴ و ۱")
-            if w3 <= min(w1, w5): result["invalid"].append("موج ۳ کوتاه‌ترین موج محرک است")
-        elif down:
-            w1, w2, w3, w4, w5 = (prices[0]-prices[1], prices[2]-prices[1],
-                                  prices[2]-prices[3], prices[4]-prices[3],
-                                  prices[4]-prices[5])
-            if prices[2] >= prices[0]: result["invalid"].append("موج ۲ از مبدأ موج ۱ عبور کرده")
-            if prices[3] >= prices[1]: result["invalid"].append("موج ۳ کف موج ۱ را نشکسته")
-            if prices[4] > prices[1]: result["invalid"].append("هم‌پوشانی موج ۴ و ۱")
-            if w3 <= min(w1, w5): result["invalid"].append("موج ۳ کوتاه‌ترین موج محرک است")
-        else:
-            result["invalid"].append("توالی پیوت‌ها با ایمپالس استاندارد هم‌جهت نیست")
-        if result["invalid"]:
-            result["notes"].append("شمارش ۵ موجی با قوانین سخت سازگار نیست.")
-        else:
-            result["score"] += 2
-            result["notes"].append("توالی اخیر با قواعد ایمپالس سازگار است.")
-
-    close = pd.to_numeric(d["Close"], errors="coerce")
-    last = float(close.iloc[-1])
-    if "SMA 14" in d and "SMA 50" in d:
-        fast, slow = d["SMA 14"].iloc[-1], d["SMA 50"].iloc[-1]
-        if pd.notna(fast) and pd.notna(slow):
-            if last > fast > slow: result["score"] += 1; result["notes"].append("قیمت بالای SMA14 و SMA50")
-            elif last < fast < slow: result["score"] -= 1; result["notes"].append("قیمت زیر SMA14 و SMA50")
-
-    if "UT Buy" in d and bool(d["UT Buy"].iloc[-1]):
-        result["score"] += 1; result["notes"].append("سیگنال خرید UT")
-    if "UT Sell" in d and bool(d["UT Sell"].iloc[-1]):
-        result["score"] -= 1; result["notes"].append("سیگنال فروش UT")
-
-    if "Volume" in d:
-        vol = pd.to_numeric(d["Volume"], errors="coerce")
-        baseline = vol.rolling(20).median().iloc[-1]
-        if pd.notna(baseline) and baseline > 0 and vol.iloc[-1] > baseline * 1.5:
-            result["notes"].append("حجم آخرین کندل > ۱٫۵× میانه")
-            result["score"] += 0.5 if direction > 0 else -0.5
-
-    recent = d.tail(20)
-    support = float(pd.to_numeric(recent["Low"], errors="coerce").iloc[:-1].min())
-    resistance = float(pd.to_numeric(recent["High"], errors="coerce").iloc[:-1].max())
-    last_low, last_high = float(d["Low"].iloc[-1]), float(d["High"].iloc[-1])
-    sweep_down = last_low < support and last > support
-    sweep_up = last_high > resistance and last < resistance
-    if sweep_down: result["score"] += 1; result["notes"].append("سایه زیر حمایت + بازگشت")
-    if sweep_up: result["score"] -= 1; result["notes"].append("سایه بالای مقاومت + بازگشت")
-
-    result["score"] = max(-5, min(5, result["score"]))
-    result["direction"] = 1 if result["score"] > 0 else -1 if result["score"] < 0 else direction
-    result["confidence"] = "متوسط" if abs(result["score"]) >= 2 else "کم"
-    result["support"], result["resistance"] = support, resistance
-
-    candle_range = (pd.to_numeric(d["High"], errors="coerce")
-                    - pd.to_numeric(d["Low"], errors="coerce"))
-    avg_range = float(candle_range.rolling(14).mean().iloc[-1])
-    if not math.isfinite(avg_range) or avg_range <= 0:
-        avg_range = max(last * 0.005, 1e-8)
-
-    direction = result["direction"]
-    recent_swings = []
-    if pivots is not None and len(pivots) >= 3:
-        recent_swings = pd.to_numeric(pivots.tail(6)["Price"], errors="coerce").dropna().astype(float).tolist()
-    impulse_size = max((max(recent_swings) - min(recent_swings)) if len(recent_swings) >= 3 else 0.0,
-                       avg_range * 1.5)
-    leg = max(avg_range * 0.65, min(impulse_size * 0.236, avg_range * 2.5))
-    if direction > 0:
-        a = max(support, last - leg)
-        b = min(last + leg * 0.62, resistance if resistance > last else last + leg * 0.62)
-        c = max(support, a - leg * 0.15)
-        target = max(last + impulse_size * 0.382, resistance + avg_range * 0.15)
-    else:
-        a = min(resistance, last + leg)
-        b = max(last - leg * 0.62, support if support < last else last - leg * 0.62)
-        c = min(resistance, a + leg * 0.15)
-        target = min(last - impulse_size * 0.382, support - avg_range * 0.15)
-    result["forecast"] = [a, b, c, target]
-    result["forecast_labels"] = ["A? اصلاح", "B? بازگشت", "C? اصلاح", "ادامه احتمالی"]
-    result["impulse_size"] = impulse_size
-    return result
-
-
-# ===========================================================================
-# BTC-relative & trend score (multi-source)
-# ===========================================================================
-def get_btc_relative_metrics(code, lbank_pairs):
-    """Return asset value in BTC and 24h relative change using best available source."""
-    code = str(code).upper()
-    if code == "BTC":
-        return {"btc_value": 1.0, "change_pct": 0.0,
-                "source_pair": "BTC/BTC", "method": "خودِ بیت‌کوین"}
-
-    # Direct BTC pair if available (on major exchanges)
-    df, src, _ = fetch_klines_multi_source(code, "روزانه", 4, quote="BTC")
-    if df is not None and len(df) >= 2:
-        current = number(df.iloc[-1]["Close"])
-        previous = number(df.iloc[-2]["Close"])
-        change = (current / previous - 1) * 100 if previous > 0 else None
-        return {"btc_value": current, "change_pct": change,
-                "source_pair": f"{code}/BTC",
-                "method": f"جفت‌ارز مستقیم (منبع: {src})"}
-
-    # Derive from USDT pairs
-    asset_df, asset_src, _ = fetch_klines_multi_source(code, "روزانه", 4, quote="USDT")
-    btc_df, btc_src, _ = fetch_klines_multi_source("BTC", "روزانه", 4, quote="USDT")
-    if asset_df is not None and btc_df is not None and len(asset_df) >= 2 and len(btc_df) >= 2:
-        asset_now = number(asset_df.iloc[-1]["Close"]); asset_prev = number(asset_df.iloc[-2]["Close"])
-        btc_now = number(btc_df.iloc[-1]["Close"]); btc_prev = number(btc_df.iloc[-2]["Close"])
-        if min(asset_now, asset_prev, btc_now, btc_prev) > 0:
-            current_ratio = asset_now / btc_now
-            previous_ratio = asset_prev / btc_prev
-            return {"btc_value": current_ratio,
-                    "change_pct": (current_ratio / previous_ratio - 1) * 100,
-                    "source_pair": f"{code}/USDT ÷ BTC/USDT",
-                    "method": f"نرخ متقاطع ({asset_src}/{btc_src})"}
-    return {"btc_value": None, "change_pct": None, "source_pair": f"{code}/BTC",
-            "method": "داده کافی در دسترس نیست"}
-
-
-@st.cache_data(ttl=300, show_spinner=False)
-def get_btc_xau_metrics(lbank_pairs):
-    btc_df, btc_src, btc_err = fetch_klines_multi_source("BTC", "روزانه", 40, quote="USDT")
-    gold_df, gold_src, gold_err = fetch_klines_multi_source("XAUT", "روزانه", 40, quote="USDT")
-
-    if btc_df is None or gold_df is None:
-        return {"current": None, "change_1d": None, "change_7d": None,
-                "source": "BTC/USDT + XAUT/USDT",
-                "joined_count": 0,
-                "method": (f"داده کافی نیست. BTC: {btc_err[-1] if btc_err else '?'} | "
-                           f"XAUT: {gold_err[-1] if gold_err else '?'}")}
-
-    joined = pd.merge(
-        btc_df[["timestamp", "Close"]].rename(columns={"Close": "btc_usdt"}),
-        gold_df[["timestamp", "Close"]].rename(columns={"Close": "xaut_usdt"}),
-        on="timestamp", how="inner",
-    )
-    joined = joined[(joined["btc_usdt"] > 0) & (joined["xaut_usdt"] > 0)]
-    if len(joined) < 8:
-        return {"current": None, "change_1d": None, "change_7d": None,
-                "source": f"{btc_src} + {gold_src}", "joined_count": len(joined),
-                "method": "کندل بسته مشترک کافی نیست."}
-    ratio = joined["btc_usdt"] / joined["xaut_usdt"]
-    current = float(ratio.iloc[-1])
-    prev = float(ratio.iloc[-2])
-    week_ago = float(ratio.iloc[-8])
-    return {"current": current,
-            "change_1d": (current / prev - 1) * 100 if prev > 0 else None,
-            "change_7d": (current / week_ago - 1) * 100 if week_ago > 0 else None,
-            "source": f"BTC:{btc_src} / XAUT:{gold_src}",
-            "joined_count": len(joined),
-            "method": "نرخ متقاطع BTC/XAUT = BTC/USDT ÷ XAUT/USDT"}
-
-
-@st.cache_data(ttl=180, show_spinner=False)
 def get_asset_trend_score(code, lbank_pairs, atr_period=1, ut_multiplier=2.0):
     """
     UT crossover: +/-2 when fresh and aligned; existing aligned state: +/-1.
@@ -2304,55 +2177,37 @@ for tab, tf_name in zip(tf_tabs, tf_names):
             if elliott_enabled:
                 wave_points = detect_elliott_candidates(chart_df)
                 context = analyze_elliott_context(chart_df, wave_points)
-                valid_impulse = len(wave_points) >= 6 and not context.get("invalid")
                 ut_now = ut_status(chart_df)
-                direction_matches_ut = (
-                    (context.get("direction", 0) > 0 and ut_now.get("trend", 0) > 0)
-                    or (context.get("direction", 0) < 0 and ut_now.get("trend", 0) < 0)
-                )
-                if not wave_points.empty:
-                    wave_points = wave_points.copy()
-                    if not valid_impulse:
-                        wave_points["Label"] = [f"S{i + 1}" for i in range(len(wave_points))]
+                forecast_direction = -context.get("direction", 0)
+                direction_matches_ut = ((forecast_direction > 0 and ut_now.get("trend", 0) > 0)
+                                        or (forecast_direction < 0 and ut_now.get("trend", 0) < 0))
+                if not wave_points.empty and context.get("phase") in ("abc_correction_scenario", "post_impulse_unconfirmed"):
                     fig.add_trace(go.Scatter(
-                        x=wave_points["Time"], y=wave_points["Price"],
-                        mode="lines+markers+text", text=wave_points["Label"],
-                        textposition="top center", name="پیوت‌های تأییدشده",
-                        line={"color": "#7c3aed", "width": 2},
-                        marker={"size": 7, "color": "#7c3aed"},
-                        textfont={"color": "#7c3aed", "size": 11},
-                        connectgaps=False,
+                        x=wave_points["Time"], y=wave_points["Price"], mode="lines+markers+text",
+                        text=wave_points["Label"], textposition="top center", name="آخرین ایمپالس معتبر ۰–۵",
+                        line={"color": "#7c3aed", "width": 2.5}, marker={"size": 8, "color": "#7c3aed"},
+                        textfont={"color": "#7c3aed", "size": 12}, connectgaps=False,
                     ))
-                    if valid_impulse and direction_matches_ut and context.get("forecast") and len(chart_df):
-                        last_price = float(chart_df["Close"].iloc[-1])
+                    if context.get("phase") == "abc_correction_scenario" and context.get("forecast") and direction_matches_ut:
                         t0 = pd.to_datetime(chart_df["Time"].iloc[-1], utc=True, errors="coerce")
-                        step_seconds = int(TIMEFRAMES.get(tf_name, {}).get("seconds", 14400))
-                        future_times = [t0 + pd.Timedelta(seconds=step_seconds * k) for k in (1, 2, 3, 4)]
-                        future_prices = context["forecast"]
-                        if pd.notna(t0) and len(future_prices) == 4:
-                            fig.add_trace(go.Scatter(
-                                x=[t0] + future_times, y=[last_price] + future_prices,
-                                mode="lines+markers+text",
-                                text=["آخرین قیمت واقعی"] + context["forecast_labels"],
-                                textposition="top center", name="سناریوی احتمالی (مشروط)",
-                                line={"color": "#dc2626", "width": 2.5, "dash": "dash"},
-                                marker={"size": 7, "color": "#dc2626"},
-                                connectgaps=False,
-                            ))
-                    elif not valid_impulse:
-                        st.info("ساختار ایمپالس معتبر تأیید نشد؛ پیوت‌ها با S1…Sn نمایش داده شده‌اند و پیش‌بینی جهت‌دار مخفی است.")
+                        current_close = float(chart_df["Close"].iloc[-1])
+                        step = int(TIMEFRAMES.get(tf_name, {}).get("seconds", 14400))
+                        future_times = [t0 + pd.Timedelta(seconds=step*k) for k in (1,2,3)]
+                        fig.add_trace(go.Scatter(
+                            x=[t0]+future_times, y=[current_close]+context["forecast"],
+                            mode="lines+markers+text", text=["پایان موج ۵"]+context["forecast_labels"],
+                            textposition="top center", name="سناریوی اصلاح ABC",
+                            line={"color": "#dc2626", "width": 2.5, "dash": "dash"},
+                            marker={"size": 8, "color": "#dc2626"}, connectgaps=False,
+                        ))
+                    elif context.get("phase") == "post_impulse_unconfirmed":
+                        st.warning("ایمپالس قبلی پیدا شد، اما قیمت از انتهای موج ۵ فاصله گرفته؛ پیش‌بینی جدید پنهان است.")
                     elif not direction_matches_ut:
-                        st.warning("جهت ساختار الیوت با وضعیت فعلی UT هم‌جهت نیست؛ پیش‌بینی جهت‌دار مخفی است.")
-                    st.caption(
-                        f"جهت ساختار: {'صعودی' if context['direction'] > 0 else 'نزولی' if context['direction'] < 0 else 'خنثی'} | "
-                        f"اطمینان الگوریتمی: {context['confidence']} (نه احتمال آماری)"
-                    )
-                    if context.get("notes"):
-                        st.write("**شواهد:** " + "؛ ".join(context["notes"]))
-                    if context.get("invalid"):
-                        st.warning("قوانین ایمپالس تأیید نشده: " + "؛ ".join(context["invalid"]))
+                        st.warning("شمارش الیوت با وضعیت UT هم‌جهت نیست؛ پیش‌بینی جهت‌دار مخفی است.")
+                    st.caption(f"آخرین ایمپالس معتبر | جهت: {'صعودی' if context['direction'] > 0 else 'نزولی'} | کیفیت فیبوناچی: {context['confidence']}")
+                    if context.get("notes"): st.write("**منطق سناریو:** " + "؛ ".join(context["notes"]))
                 else:
-                    st.info("برای شمارش موج، پیوت کافی وجود ندارد.")
+                    st.info("ایمپالس پنج‌موجی قابل‌قبولی تأیید نشد؛ عمداً سقف‌ها و کف‌ها را به‌صورت زیگزاگ برچسب نمی‌زنیم.")
 
             fig.update_layout(
                 height=520, margin={"l": 12, "r": 12, "t": 28, "b": 12},
@@ -2459,7 +2314,10 @@ with st.expander("جریان نقدینگی — CryptoMeter.io", expanded=False)
         except Exception as exc:
             st.warning(f"CryptoMeter ناموفق: {type(exc).__name__}: {str(exc)[:180]}")
 
-with st.expander("نقشه رایگان لیکوییدیشن BTC", expanded=False):
+with st.expander("نقشه رایگان لیکوییدیشن BTC — راهنمای خواندن", expanded=False):
+    st.markdown("**محورها:** افقی = زمان ۴ ساعت اخیر؛ عمودی = سطح قیمت BTC. رنگ روشن‌تر یعنی شدت نسبی بیشتری در داده‌ای که منبع ارائه کرده، نه لزوماً دلار دقیق.")
+    st.markdown("**چطور بخوانی؟** ابتدا قیمت فعلی را پیدا کن. نواحی روشن بالاتر/پایین‌تر از قیمت را فقط به‌عنوان مناطق احتمالی تمرکز لیکوییدیشن بررسی کن؛ به‌تنهایی سیگنال خرید/فروش نیستند و ممکن است داده ناقص یا تأخیردار باشد.")
+    st.markdown("**محدودیت مهم:** تا وقتی قرارداد API مشخص نکند رنگ‌ها مقدار واقعی دلاری‌اند یا امتیاز نرمال‌شده، از شدت رنگ فقط برای مقایسه نسبی استفاده کن. این نقشه پیش‌بینی قطعی قیمت نیست.")
     try:
         heatmap, heatmap_error = fetch_free_liquidation_heatmap("BTC", 240, 50)
         if heatmap and heatmap.get("z"):
@@ -2470,10 +2328,21 @@ with st.expander("نقشه رایگان لیکوییدیشن BTC", expanded=Fals
             m2.metric("لانگ", fmt_usd(number(sides.get("long", totals.get("long_liq_notional")))))
             m3.metric("شورت", fmt_usd(number(sides.get("short", totals.get("short_liq_notional")))))
             fig_liq = go.Figure(data=go.Heatmap(
-                x=heatmap["x"], y=heatmap["y"], z=heatmap["z"],
-                colorscale="Turbo", colorbar={"title": "لیکوییدیشن"},
+                x=heatmap["x"], y=heatmap["y"], z=heatmap["z"], colorscale="Turbo",
+                colorbar={"title": "شدت نسبی"},
+                hovertemplate="زمان: %{x}<br>قیمت: %{y}<br>شدت داده: %{z}<extra></extra>",
             ))
-            fig_liq.update_layout(height=500, title="BTC — لیکوییدیشن ۴ ساعت اخیر")
+            try:
+                btc_frame, btc_source, _ = fetch_klines_multi_source("BTC", "15 دقیقه", 60)
+                if btc_frame is not None and not btc_frame.empty:
+                    current_btc = float(btc_frame["Close"].iloc[-1])
+                    fig_liq.add_hline(y=current_btc, line_dash="dash", line_color="white",
+                                      annotation_text=f"آخرین بسته‌شدن BTC: {current_btc:,.2f}")
+                    st.caption(f"خط افقی = آخرین کندل بسته‌شده از {btc_source}؛ قیمت زنده نیست.")
+            except Exception:
+                st.caption("قیمت مرجع BTC در دسترس نیست؛ نقشه بدون خط قیمت مرجع نمایش داده می‌شود.")
+            fig_liq.update_layout(height=500, title="BTC — نقشه لیکوییدیشن برآوردی، ۴ ساعت اخیر",
+                                  xaxis_title="زمان (UTC)", yaxis_title="قیمت BTC در منبع نقشه")
             st.plotly_chart(fig_liq, use_container_width=True)
         else:
             st.info(f"نقشه فعلاً در دسترس نیست: {heatmap_error}")
