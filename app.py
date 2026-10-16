@@ -1031,6 +1031,92 @@ def analyze_elliott_context(frame, pivots):
     out["notes"].append("سناریوی اصلاح ABC از انتهای موج ۵ و اندازه ایمپالس محاسبه شده است.")
     return out
 
+def get_btc_relative_metrics(code, lbank_pairs):
+    """Return asset BTC value and 24h relative move from real LBank candles."""
+    direct_pair = lbank_btc_symbol_from_code(code)
+    btc_usdt_pair = "btc_usdt"
+    asset_usdt_pair = lbank_symbol_from_code(code)
+
+    if direct_pair in lbank_pairs:
+        candles = fetch_lbank_klines(direct_pair, "روزانه", 4)
+        if len(candles) >= 2:
+            current = number(candles.iloc[-1]["Close"])
+            previous = number(candles.iloc[-2]["Close"])
+            change = (current / previous - 1) * 100 if previous > 0 else None
+            return {
+                "btc_value": current, "change_pct": change,
+                "source_pair": direct_pair,
+                "method": "جفت‌ارز مستقیم در بازار LBank",
+            }
+
+    # Derive the cross-rate only from actual asset/USDT and BTC/USDT candles.
+    if asset_usdt_pair in lbank_pairs and btc_usdt_pair in lbank_pairs:
+        asset = fetch_lbank_klines(asset_usdt_pair, "روزانه", 4)
+        btc = fetch_lbank_klines(btc_usdt_pair, "روزانه", 4)
+        if len(asset) >= 2 and len(btc) >= 2:
+            asset_now = number(asset.iloc[-1]["Close"])
+            asset_prev = number(asset.iloc[-2]["Close"])
+            btc_now = number(btc.iloc[-1]["Close"])
+            btc_prev = number(btc.iloc[-2]["Close"])
+            if min(asset_now, asset_prev, btc_now, btc_prev) > 0:
+                current_ratio = asset_now / btc_now
+                previous_ratio = asset_prev / btc_prev
+                return {
+                    "btc_value": current_ratio,
+                    "change_pct": (current_ratio / previous_ratio - 1) * 100,
+                    "source_pair": f"{asset_usdt_pair} + {btc_usdt_pair}",
+                    "method": "نرخ متقاطع محاسبه‌شده از کندل‌های واقعی USDT؛ بازار مستقیم BTC موجود نیست",
+                }
+
+    return {
+        "btc_value": None, "change_pct": None,
+        "source_pair": direct_pair,
+        "method": "داده کافی در LBank در دسترس نیست",
+    }
+
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def get_btc_xau_metrics(lbank_pairs):
+    """Synthetic BTC/XAUT cross-rate calculated only from real LBank BTC/USDT and XAUT/USDT candles."""
+    btc_pair = "btc_usdt"
+    gold_pair = "xaut_usdt"
+    if btc_pair not in lbank_pairs or gold_pair not in lbank_pairs:
+        return {
+            "current": None, "change_1d": None, "change_7d": None,
+            "source": f"{btc_pair} + {gold_pair}",
+            "method": "برای ساخت نرخ متقاطع، داده واقعی BTC/USDT و XAUT/USDT در LBank لازم است.",
+        }
+
+    btc = fetch_lbank_klines(btc_pair, "روزانه", 40)
+    gold = fetch_lbank_klines(gold_pair, "روزانه", 40)
+    joined = pd.merge(
+        btc[["timestamp", "Close"]].rename(columns={"Close": "btc_usdt"}),
+        gold[["timestamp", "Close"]].rename(columns={"Close": "xaut_usdt"}),
+        on="timestamp", how="inner",
+    )
+    joined = joined[(joined["btc_usdt"] > 0) & (joined["xaut_usdt"] > 0)]
+    if len(joined) < 8:
+        return {
+            "current": None, "change_1d": None, "change_7d": None,
+            "source": f"{btc_pair} + {gold_pair}",
+            "method": "برای محاسبه تغییر یک‌روزه و هفت‌روزه، کندل بسته‌شده کافی نیست.",
+        }
+
+    ratio = joined["btc_usdt"] / joined["xaut_usdt"]
+    current = float(ratio.iloc[-1])
+    prev = float(ratio.iloc[-2])
+    week_ago = float(ratio.iloc[-8])
+    return {
+        "current": current,
+        "change_1d": (current / prev - 1) * 100 if prev > 0 else None,
+        "change_7d": (current / week_ago - 1) * 100 if week_ago > 0 else None,
+        "source": f"{btc_pair} + {gold_pair}",
+        "method": "نرخ متقاطع مصنوعی BTC/XAUT = قیمت BTC/USDT ÷ قیمت XAUT/USDT؛ قیمت جفت مستقیم ادعا نمی‌شود.",
+    }
+
+
+
 def get_asset_trend_score(code, lbank_pairs, atr_period=1, ut_multiplier=2.0):
     """
     UT crossover: +/-2 when fresh and aligned; existing aligned state: +/-1.
