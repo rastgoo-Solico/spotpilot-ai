@@ -1,6 +1,6 @@
 """
 SpotPilot AI — Market analysis dashboard
-Version: v2.4-reviewed
+Version: v2.6-early-flow-risk
 - Multi-source klines with exchange-time candle validation
 - UT Bot ATR(1) defaults aligned with the requested TradingView setup
 - ATR(14) daily volatility normalization for ranking (separate from UT ATR)
@@ -1301,82 +1301,71 @@ def analyze_trades(trades):
 
 
 def calculate_trade_plan(book_stats, trade_stats):
-    mid = book_stats["mid"]
+    """Long-only setup candidate. A trade is actionable only at >=3R."""
+    mid = number(book_stats.get("mid"))
+    if mid <= 0:
+        return {"status": "WAIT", "reason": "قیمت میانی دفتر سفارش معتبر نیست."}
 
-    def nearest_significant(walls, side):
-        candidates = [w for w in walls
-                      if (w["price"] < mid if side == "bid" else w["price"] > mid)]
+    def nearest(walls, side):
+        candidates = [w for w in walls if
+                      (number(w.get("price")) < mid if side == "bid" else number(w.get("price")) > mid)]
         if not candidates:
             return None
-        sig = [w for w in candidates if w.get("significant")]
-        pool = sig if sig else candidates
-        pool.sort(key=lambda w: abs(w["price"] - mid))
-        return pool[0]
+        significant = [w for w in candidates if w.get("significant")]
+        return min(significant or candidates, key=lambda w: abs(number(w.get("price")) - mid))
 
-    support = nearest_significant(book_stats["bid_walls"], "bid")
-    resistance = nearest_significant(book_stats["ask_walls"], "ask")
-
+    support = nearest(book_stats.get("bid_walls", []), "bid")
+    resistance = nearest(book_stats.get("ask_walls", []), "ask")
     if not support or not resistance:
-        return {"status": "WAIT", "reason": "برای تعیین سطوح، دفتر سفارش داده کافی ندارد."}
+        return {"status": "WAIT", "reason": "سطح حمایت یا مقاومت قابل اتکا در دفتر سفارش موجود نیست."}
 
-    entry = support["price"] * 1.001
-    target = resistance["price"] * 0.999
-    stop = support["price"] * 0.995
-
-    if entry >= mid or target <= entry:
-        return {"status": "WAIT",
-                "reason": "سطوح فعلی هدف بالاتری از ورود ایجاد نمی‌کنند.",
-                "support": support, "resistance": resistance}
-
+    support_price = number(support.get("price"))
+    resistance_price = number(resistance.get("price"))
+    entry = max(number(book_stats.get("best_ask")), support_price * 1.001)
+    stop = support_price * 0.995
     risk = entry - stop
-    reward = target - entry
-    if risk <= 0 or reward <= 0:
-        return {"status": "WAIT", "reason": "حد ضرر یا هدف در سمت معتبر ورود قرار ندارد.",
+    target = resistance_price * 0.999
+    if entry <= 0 or stop <= 0 or risk <= 0 or target <= entry:
+        return {"status": "WAIT", "reason": "ساختار فعلی قیمت، ورود لانگ با حدضرر و هدف معتبر نمی‌سازد.",
                 "support": support, "resistance": resistance}
+
+    reward = target - entry
     rr = reward / risk
-    support_distance_pct = (mid - support["price"]) / mid * 100
-
-    confirmations, warnings = [], []
-    imbalance_value = book_stats.get("imbalance")
-    imbalance_meaningful = imbalance_value is not None and imbalance_value > 0.05
-    net_flow_positive = trade_stats["net_flow"] > 0
-
-    if imbalance_meaningful:
-        confirmations.append(f"عدم‌تعادل معنادار ({imbalance_value*100:+.1f}%) به نفع خریداران.")
-    elif imbalance_value is not None and imbalance_value > 0:
-        warnings.append(f"عدم‌تعادل ضعیف ({imbalance_value*100:+.1f}%).")
-    elif imbalance_value is None:
-        warnings.append("عدم‌تعادل دفتر سفارش قابل محاسبه نیست.")
+    support_distance_pct = max(0.0, (mid - support_price) / mid * 100)
+    imbalance = book_stats.get("imbalance")
+    flow = number(trade_stats.get("net_flow"))
+    spread = number(book_stats.get("spread_pct"), 999)
+    confirmations = []
+    warnings = []
+    if imbalance is not None and imbalance > 0.05:
+        confirmations.append("دفتر سفارش به نفع خریداران است")
     else:
-        warnings.append("عدم‌تعادل به نفع خریداران نیست.")
-
-    if net_flow_positive:
-        confirmations.append("جریان خالص معاملات مثبت.")
-    elif trade_stats["net_flow"] < 0:
-        warnings.append("جریان خالص معاملات منفی.")
+        warnings.append("عدم‌تعادل دفتر سفارش خرید را تأیید نمی‌کند")
+    if flow > 0:
+        confirmations.append("جریان خالص معاملات اخیر مثبت است")
     else:
-        warnings.append("جریان خالص خرید تأیید نشده.")
-
+        warnings.append("جریان خالص معاملات اخیر مثبت نیست")
+    if spread > 0.5:
+        warnings.append("اسپرد بالاتر از ۰٫۵٪ است")
     if support_distance_pct > 3:
-        warnings.append("نزدیک‌ترین ناحیه خرید بیش از ۳٪ پایین‌تر از قیمت است.")
-    if book_stats["spread_pct"] > 0.5:
-        warnings.append("فاصله خرید و فروش بالاست.")
-    if rr < 1.2:
-        warnings.append("نسبت سود به ریسک < ۱٫۲.")
+        warnings.append("حمایت بیش از ۳٪ پایین‌تر از قیمت فعلی است")
+    if rr < 3:
+        warnings.append(f"مقاومت فعلی فقط نسبت سود به ریسک {rr:.2f}R می‌دهد؛ شرط حداقل 3R تأمین نیست")
 
-    confirmed = (
-        support_distance_pct <= 3
-        and book_stats["spread_pct"] <= 0.5
-        and rr >= 1.2
-        and (imbalance_meaningful or net_flow_positive)
-    )
+    data_ok = spread <= 0.5 and support_distance_pct <= 3 and rr >= 3
+    flow_ok = (imbalance is not None and imbalance > 0.05) or flow > 0
+    actionable = data_ok and flow_ok
     return {
-        "status": "ENTRY WATCH" if confirmed else "WAIT",
-        "reason": " ".join(warnings + confirmations),
+        "status": "LONG SETUP" if actionable else "WAIT",
+        "reason": "؛ ".join(confirmations + warnings) or "شرایط اولیه بررسی لانگ برقرار است.",
         "entry": entry, "target": target, "stop": stop, "rr": rr,
         "support": support, "resistance": resistance,
         "support_distance_pct": support_distance_pct,
+        "risk_per_unit": risk,
+        "reward_per_unit": reward,
+        "actionable": actionable,
     }
+
 
 
 # ===========================================================================
@@ -1909,6 +1898,56 @@ except Exception as exc:
 
 # ---------------------------------------------------------------------------
 st.divider()
+st.subheader("۲٫۵. هشدار زودهنگام ورود پول و فعالیت غیرعادی")
+st.caption("هدف این بخش پیدا کردن حرکت‌های اولیه است، نه معرفی ارزی که قبلاً جهش بزرگی کرده. فیلتر بازار عمومی به‌تنهایی اثبات فعالیت نهنگ نیست؛ دادهٔ مستقیم نهنگ/آن‌چین فقط در صورت ارائه توسط منبع داده قابل تأیید است.")
+
+early_rows = []
+for coin in coins:
+    code = str(coin.get("Code", "")).upper()
+    change = number(coin.get("24h Change %"), None)
+    volume_btc = number(coin.get("Volume BTC equivalent"))
+    if not code or change is None or volume_btc < max(100.0, float(min_btc_volume)):
+        continue
+    # Early watch: activity/volume is meaningful, but avoid coins already extended.
+    if 0.25 <= change <= 8.0:
+        early_rows.append({
+            "رمزارز": code,
+            "تغییر ۲۴ساعته": change,
+            "حجم ۲۴ساعته (BTC)": volume_btc,
+            "قیمت (USD)": number(coin.get("Price USD")),
+            "منبع": "LiveCoinWatch",
+            "وضعیت": "پایش زودهنگام؛ تأیید جریان پول لازم است",
+        })
+early_rows.sort(key=lambda row: (row["حجم ۲۴ساعته (BTC)"], row["تغییر ۲۴ساعته"]), reverse=True)
+if early_rows:
+    early_df = pd.DataFrame(early_rows[:30])
+    early_df["تغییر ۲۴ساعته"] = early_df["تغییر ۲۴ساعته"].map(lambda x: f"{x:+.2f}%")
+    early_df["حجم ۲۴ساعته (BTC)"] = early_df["حجم ۲۴ساعته (BTC)"].map(lambda x: f"{x:,.0f}")
+    early_df["قیمت (USD)"] = early_df["قیمت (USD)"].map(fmt_price)
+    st.dataframe(early_df, use_container_width=True, hide_index=True)
+else:
+    st.info("در داده فعلی، ارزی با حجم کافی و رشد محدود ۰٫۲۵٪ تا ۸٪ برای پایش اولیه پیدا نشد. این به معنی نبود جریان پول نیست؛ منبع عمومی ممکن است داده کافی نداشته باشد.")
+
+cryptometer_key_early = get_cryptometer_key()
+if cryptometer_key_early:
+    with st.expander("سیگنال‌های حرکت سریع CryptoMeter (در صورت پشتیبانی پلن API)", expanded=False):
+        try:
+            rapid_data = fetch_cryptometer_endpoint("rapid-movements", cryptometer_key_early, {})
+            rapid_rows = rapid_data if isinstance(rapid_data, list) else (
+                [rapid_data] if isinstance(rapid_data, dict) else [])
+            rapid_rows = [row for row in rapid_rows if isinstance(row, dict)]
+            if rapid_rows:
+                rapid_df = pd.json_normalize(rapid_rows).head(50)
+                st.dataframe(rapid_df, use_container_width=True, hide_index=True)
+                st.caption("فیلدها مطابق پاسخ خام CryptoMeter نمایش داده می‌شوند؛ نام‌گذاری فیلدها به‌تنهایی به‌معنی تأیید نهنگ یا ورود قطعی سرمایه نیست.")
+            else:
+                st.info("CryptoMeter در این پاسخ رکورد قابل نمایش برنگرداند.")
+        except Exception as exc:
+            st.warning(f"داده حرکت سریع CryptoMeter دریافت نشد: {type(exc).__name__}: {str(exc)[:160]}")
+else:
+    st.info("برای دریافت سیگنال‌های اضافه CryptoMeter، کلید CRYPTOMETER_API_KEY را در Streamlit Secrets تنظیم کن. هشدار فعلی فقط از حجم و تغییر قیمت LiveCoinWatch ساخته می‌شود و ادعای ردیابی مستقیم نهنگ‌ها ندارد.")
+
+st.divider()
 st.subheader(f"۳. مقایسه قیمت {selected_code}")
 
 selected_lbank_pair = lbank_symbol_from_code(selected_code)
@@ -2316,7 +2355,7 @@ with st.expander("جریان نقدینگی — CryptoMeter.io", expanded=False)
 
 with st.expander("نقشه رایگان لیکوییدیشن BTC — راهنمای خواندن", expanded=False):
     st.markdown("**محورها:** افقی = زمان ۴ ساعت اخیر؛ عمودی = سطح قیمت BTC. رنگ روشن‌تر یعنی شدت نسبی بیشتری در داده‌ای که منبع ارائه کرده، نه لزوماً دلار دقیق.")
-    st.markdown("**چطور بخوانی؟** ابتدا قیمت فعلی را پیدا کن. نواحی روشن بالاتر/پایین‌تر از قیمت را فقط به‌عنوان مناطق احتمالی تمرکز لیکوییدیشن بررسی کن؛ به‌تنهایی سیگنال خرید/فروش نیستند و ممکن است داده ناقص یا تأخیردار باشد.")
+    st.markdown("**راهنمای عملی:** خط افقی سفید قیمت آخرین کندل بسته‌شده است. نواحی روشن بالای خط = تمرکز احتمالی لیکوییدیشن شورت؛ نواحی روشن پایین خط = تمرکز احتمالی لیکوییدیشن لانگ. نزدیک‌شدن قیمت به یک ناحیه به‌تنهایی تضمین نمی‌کند که قیمت به آن برسد.")
     st.markdown("**محدودیت مهم:** تا وقتی قرارداد API مشخص نکند رنگ‌ها مقدار واقعی دلاری‌اند یا امتیاز نرمال‌شده، از شدت رنگ فقط برای مقایسه نسبی استفاده کن. این نقشه پیش‌بینی قطعی قیمت نیست.")
     try:
         heatmap, heatmap_error = fetch_free_liquidation_heatmap("BTC", 240, 50)
@@ -2327,10 +2366,21 @@ with st.expander("نقشه رایگان لیکوییدیشن BTC — راهنم�
             m1.metric("مجموع لیکوییدیشن", fmt_usd(number(totals.get("total_notional"))))
             m2.metric("لانگ", fmt_usd(number(sides.get("long", totals.get("long_liq_notional")))))
             m3.metric("شورت", fmt_usd(number(sides.get("short", totals.get("short_liq_notional")))))
+            # Normalize outlier-heavy provider values for legibility while preserving relative intensity.
+            heat_values = np.asarray(heatmap["z"], dtype=float)
+            heat_values = np.nan_to_num(heat_values, nan=0.0, posinf=0.0, neginf=0.0)
+            positive = heat_values[heat_values > 0]
+            if positive.size:
+                upper = float(np.percentile(positive, 98))
+                if upper > 0:
+                    heat_values = np.clip(heat_values, 0, upper) / upper * 100.0
             fig_liq = go.Figure(data=go.Heatmap(
-                x=heatmap["x"], y=heatmap["y"], z=heatmap["z"], colorscale="Turbo",
-                colorbar={"title": "شدت نسبی"},
-                hovertemplate="زمان: %{x}<br>قیمت: %{y}<br>شدت داده: %{z}<extra></extra>",
+                x=heatmap["x"], y=heatmap["y"], z=heat_values.tolist(),
+                colorscale=[[0.0, "#0b1220"], [0.12, "#172554"], [0.3, "#1d4ed8"],
+                            [0.52, "#06b6d4"], [0.72, "#facc15"], [0.88, "#f97316"], [1.0, "#f8fafc"]],
+                zmin=0, zmax=100, connectgaps=False,
+                colorbar={"title": "شدت نسبی", "ticksuffix": "%"},
+                hovertemplate="زمان: %{x}<br>سطح قیمت: %{y}<br>شدت نسبی (نرمال‌شده): %{z:.1f}%<extra></extra>",
             ))
             try:
                 btc_frame, btc_source, _ = fetch_klines_multi_source("BTC", "15 دقیقه", 60)
@@ -2341,8 +2391,12 @@ with st.expander("نقشه رایگان لیکوییدیشن BTC — راهنم�
                     st.caption(f"خط افقی = آخرین کندل بسته‌شده از {btc_source}؛ قیمت زنده نیست.")
             except Exception:
                 st.caption("قیمت مرجع BTC در دسترس نیست؛ نقشه بدون خط قیمت مرجع نمایش داده می‌شود.")
-            fig_liq.update_layout(height=500, title="BTC — نقشه لیکوییدیشن برآوردی، ۴ ساعت اخیر",
-                                  xaxis_title="زمان (UTC)", yaxis_title="قیمت BTC در منبع نقشه")
+            fig_liq.update_layout(height=650, title="BTC — تمرکز نسبی لیکوییدیشن، ۴ ساعت اخیر",
+                                  xaxis_title="زمان (UTC)", yaxis_title="قیمت BTC در منبع نقشه",
+                                  template="plotly_dark", hovermode="closest",
+                                  margin={"l": 15, "r": 15, "t": 55, "b": 35},
+                                  xaxis={"showgrid": True, "gridcolor": "#263244", "tickformat": "%H:%M"},
+                                  yaxis={"side": "right", "showgrid": True, "gridcolor": "#263244", "tickformat": ",.2f"})
             st.plotly_chart(fig_liq, use_container_width=True)
         else:
             st.info(f"نقشه فعلاً در دسترس نیست: {heatmap_error}")
@@ -2454,45 +2508,38 @@ with st.expander("جزئیات دفتر سفارش"):
 
 # ---------------------------------------------------------------------------
 st.divider()
-st.subheader("۷. سناریوی احتمالی ورود و خروج")
-st.caption("محاسبه تقریبی بر پایه دفتر سفارش LBank.")
+st.subheader("۷. سناریوی احتمالی ورود و خروج — لانگ با کنترل ریسک")
+st.caption("این بخش دیگر به تازه‌بودن سیگنال UT وابسته نیست؛ از قیمت، حمایت/مقاومت دفتر سفارش و جریان معاملات استفاده می‌کند. فقط وقتی نسبت سود به ریسک حداقل 3R باشد، وضعیت به‌عنوان ستاپ لانگ معتبر نشان داده می‌شود.")
 
 plan = calculate_trade_plan(book_stats, trade_stats)
+capital = st.number_input("سرمایه کل حساب (USDT)", min_value=10.0, value=1000.0, step=50.0, key="long_capital")
+max_risk_pct = st.number_input("حداکثر ریسک سرمایه در این معامله (%)", min_value=0.1, max_value=3.0, value=3.0, step=0.1, key="long_risk_pct")
+st.caption("سقف ۳٪ یعنی حداکثر زیان دلاری در صورت اجرای حدضرر؛ به معنی قرار دادن stop دقیقاً ۳٪ زیر قیمت نیست.")
 
-if plan["status"] == "ENTRY WATCH":
-    st.success("وضعیت: فرصت برای بررسی بیشتر")
+if plan["status"] == "LONG SETUP":
+    st.success("🟢 ستاپ لانگ اولیه پیدا شد؛ پیش از سفارش، تازگی قیمت و لغزش اجرا را بررسی کن.")
 else:
-    st.warning("وضعیت: انتظار برای تأیید")
+    st.warning("🟠 فعلاً ستاپ لانگ با تمام شروط ریسک تأیید نشده؛ دلیل دقیق پایین نمایش داده می‌شود.")
 
 st.write(plan["reason"])
-
 if "entry" in plan:
     levels = st.columns(4)
-    levels[0].metric("ورود احتمالی", fmt_price(plan["entry"]))
+    levels[0].metric("ورود پیشنهادی", fmt_price(plan["entry"]))
     levels[1].metric("هدف خروج", fmt_price(plan["target"]))
-    levels[2].metric("حد ابطال سناریو", fmt_price(plan["stop"]))
-    levels[3].metric("نسبت پاداش به ریسک", f"{plan['rr']:.2f}")
-
-with st.expander("🧮 ماشین‌حساب حجم پوزیشن بر پایه ATR"):
-    col_a, col_b = st.columns(2)
-    capital = col_a.number_input("سرمایه کل (USDT)", min_value=10.0, value=1000.0, step=50.0)
-    risk_pct = col_b.number_input("درصد ریسک هر معامله", min_value=0.1, max_value=5.0, value=1.0, step=0.1)
-    plan_4h = timeframe_results.get("4 ساعت", {}).get("plan", {})
-    ref_close = plan_4h.get("close")
-    ref_stop = plan_4h.get("stop")
-    if ref_close and ref_stop:
-        risk_per_unit = abs(ref_close - ref_stop)
-        risk_amount = capital * (risk_pct / 100)
-        position_size = risk_amount / risk_per_unit if risk_per_unit > 0 else 0
-        notional = position_size * ref_close
-        st.markdown(
-            f"- **ریسک دلاری:** {fmt_usd(risk_amount)}\n"
-            f"- **حجم پیشنهادی:** {position_size:,.6f} واحد\n"
-            f"- **ارزش پوزیشن:** {fmt_usd(notional)}\n"
-            f"- **فاصله stop تا entry:** {fmt_price(risk_per_unit)}"
-        )
-    else:
-        st.info("ابتدا تحلیل تایم‌فریم ۴ساعته باید کامل شود.")
+    levels[2].metric("حد ضرر", fmt_price(plan["stop"]))
+    levels[3].metric("ریوارد به ریسک", f"{plan['rr']:.2f}R")
+    risk_per_unit = max(0.0, number(plan["entry"]) - number(plan["stop"]))
+    risk_budget = capital * max_risk_pct / 100.0
+    position_units = min(risk_budget / risk_per_unit, capital / number(plan["entry"])) if risk_per_unit > 0 and number(plan["entry"]) > 0 else 0.0
+    notional = position_units * number(plan["entry"])
+    actual_risk = position_units * risk_per_unit
+    m = st.columns(3)
+    m[0].metric("زیان برآوردی در حدضرر", fmt_usd(actual_risk), help=f"سقف مجاز: {fmt_usd(risk_budget)}")
+    m[1].metric("حجم تقریبی پوزیشن", f"{position_units:,.6f}")
+    m[2].metric("ارزش تقریبی پوزیشن", fmt_usd(notional))
+    st.caption("حجم با فاصله ورود تا حدضرر محاسبه و برای معامله اسپات به سرمایه قابل استفاده محدود شده است. کارمزد، اسلیپیج و گپ قیمت می‌تواند زیان واقعی را از مقدار مدل بیشتر کند.")
+else:
+    st.info("قیمت ورود/حدضرر/هدف قابل اتکا از دفتر سفارش فعلی ساخته نشد؛ داده کافی برای تعیین حجم پوزیشن نداریم.")
 
 with st.expander("⚠️ آگاهی از ریسک ضرر زنجیره‌ای"):
     table = pd.DataFrame({
