@@ -1,6 +1,6 @@
 """
 SpotPilot AI — Market analysis dashboard
-Version: v2.5-early-flow-risk
+Version: v2.6-early-flow-risk
 - Multi-source klines with exchange-time candle validation
 - UT Bot ATR(1) defaults aligned with the requested TradingView setup
 - ATR(14) daily volatility normalization for ranking (separate from UT ATR)
@@ -1898,6 +1898,56 @@ except Exception as exc:
 
 # ---------------------------------------------------------------------------
 st.divider()
+st.subheader("۲٫۵. هشدار زودهنگام ورود پول و فعالیت غیرعادی")
+st.caption("هدف این بخش پیدا کردن حرکت‌های اولیه است، نه معرفی ارزی که قبلاً جهش بزرگی کرده. فیلتر بازار عمومی به‌تنهایی اثبات فعالیت نهنگ نیست؛ دادهٔ مستقیم نهنگ/آن‌چین فقط در صورت ارائه توسط منبع داده قابل تأیید است.")
+
+early_rows = []
+for coin in coins:
+    code = str(coin.get("Code", "")).upper()
+    change = number(coin.get("24h Change %"), None)
+    volume_btc = number(coin.get("Volume BTC equivalent"))
+    if not code or change is None or volume_btc < max(100.0, float(min_btc_volume)):
+        continue
+    # Early watch: activity/volume is meaningful, but avoid coins already extended.
+    if 0.25 <= change <= 8.0:
+        early_rows.append({
+            "رمزارز": code,
+            "تغییر ۲۴ساعته": change,
+            "حجم ۲۴ساعته (BTC)": volume_btc,
+            "قیمت (USD)": number(coin.get("Price USD")),
+            "منبع": "LiveCoinWatch",
+            "وضعیت": "پایش زودهنگام؛ تأیید جریان پول لازم است",
+        })
+early_rows.sort(key=lambda row: (row["حجم ۲۴ساعته (BTC)"], row["تغییر ۲۴ساعته"]), reverse=True)
+if early_rows:
+    early_df = pd.DataFrame(early_rows[:30])
+    early_df["تغییر ۲۴ساعته"] = early_df["تغییر ۲۴ساعته"].map(lambda x: f"{x:+.2f}%")
+    early_df["حجم ۲۴ساعته (BTC)"] = early_df["حجم ۲۴ساعته (BTC)"].map(lambda x: f"{x:,.0f}")
+    early_df["قیمت (USD)"] = early_df["قیمت (USD)"].map(fmt_price)
+    st.dataframe(early_df, use_container_width=True, hide_index=True)
+else:
+    st.info("در داده فعلی، ارزی با حجم کافی و رشد محدود ۰٫۲۵٪ تا ۸٪ برای پایش اولیه پیدا نشد. این به معنی نبود جریان پول نیست؛ منبع عمومی ممکن است داده کافی نداشته باشد.")
+
+cryptometer_key_early = get_cryptometer_key()
+if cryptometer_key_early:
+    with st.expander("سیگنال‌های حرکت سریع CryptoMeter (در صورت پشتیبانی پلن API)", expanded=False):
+        try:
+            rapid_data = fetch_cryptometer_endpoint("rapid-movements", cryptometer_key_early, {})
+            rapid_rows = rapid_data if isinstance(rapid_data, list) else (
+                [rapid_data] if isinstance(rapid_data, dict) else [])
+            rapid_rows = [row for row in rapid_rows if isinstance(row, dict)]
+            if rapid_rows:
+                rapid_df = pd.json_normalize(rapid_rows).head(50)
+                st.dataframe(rapid_df, use_container_width=True, hide_index=True)
+                st.caption("فیلدها مطابق پاسخ خام CryptoMeter نمایش داده می‌شوند؛ نام‌گذاری فیلدها به‌تنهایی به‌معنی تأیید نهنگ یا ورود قطعی سرمایه نیست.")
+            else:
+                st.info("CryptoMeter در این پاسخ رکورد قابل نمایش برنگرداند.")
+        except Exception as exc:
+            st.warning(f"داده حرکت سریع CryptoMeter دریافت نشد: {type(exc).__name__}: {str(exc)[:160]}")
+else:
+    st.info("برای دریافت سیگنال‌های اضافه CryptoMeter، کلید CRYPTOMETER_API_KEY را در Streamlit Secrets تنظیم کن. هشدار فعلی فقط از حجم و تغییر قیمت LiveCoinWatch ساخته می‌شود و ادعای ردیابی مستقیم نهنگ‌ها ندارد.")
+
+st.divider()
 st.subheader(f"۳. مقایسه قیمت {selected_code}")
 
 selected_lbank_pair = lbank_symbol_from_code(selected_code)
@@ -2305,7 +2355,7 @@ with st.expander("جریان نقدینگی — CryptoMeter.io", expanded=False)
 
 with st.expander("نقشه رایگان لیکوییدیشن BTC — راهنمای خواندن", expanded=False):
     st.markdown("**محورها:** افقی = زمان ۴ ساعت اخیر؛ عمودی = سطح قیمت BTC. رنگ روشن‌تر یعنی شدت نسبی بیشتری در داده‌ای که منبع ارائه کرده، نه لزوماً دلار دقیق.")
-    st.markdown("**چطور بخوانی؟** ابتدا قیمت فعلی را پیدا کن. نواحی روشن بالاتر/پایین‌تر از قیمت را فقط به‌عنوان مناطق احتمالی تمرکز لیکوییدیشن بررسی کن؛ به‌تنهایی سیگنال خرید/فروش نیستند و ممکن است داده ناقص یا تأخیردار باشد.")
+    st.markdown("**راهنمای عملی:** خط افقی سفید قیمت آخرین کندل بسته‌شده است. نواحی روشن بالای خط = تمرکز احتمالی لیکوییدیشن شورت؛ نواحی روشن پایین خط = تمرکز احتمالی لیکوییدیشن لانگ. نزدیک‌شدن قیمت به یک ناحیه به‌تنهایی تضمین نمی‌کند که قیمت به آن برسد.")
     st.markdown("**محدودیت مهم:** تا وقتی قرارداد API مشخص نکند رنگ‌ها مقدار واقعی دلاری‌اند یا امتیاز نرمال‌شده، از شدت رنگ فقط برای مقایسه نسبی استفاده کن. این نقشه پیش‌بینی قطعی قیمت نیست.")
     try:
         heatmap, heatmap_error = fetch_free_liquidation_heatmap("BTC", 240, 50)
@@ -2316,10 +2366,21 @@ with st.expander("نقشه رایگان لیکوییدیشن BTC — راهنم�
             m1.metric("مجموع لیکوییدیشن", fmt_usd(number(totals.get("total_notional"))))
             m2.metric("لانگ", fmt_usd(number(sides.get("long", totals.get("long_liq_notional")))))
             m3.metric("شورت", fmt_usd(number(sides.get("short", totals.get("short_liq_notional")))))
+            # Normalize outlier-heavy provider values for legibility while preserving relative intensity.
+            heat_values = np.asarray(heatmap["z"], dtype=float)
+            heat_values = np.nan_to_num(heat_values, nan=0.0, posinf=0.0, neginf=0.0)
+            positive = heat_values[heat_values > 0]
+            if positive.size:
+                upper = float(np.percentile(positive, 98))
+                if upper > 0:
+                    heat_values = np.clip(heat_values, 0, upper) / upper * 100.0
             fig_liq = go.Figure(data=go.Heatmap(
-                x=heatmap["x"], y=heatmap["y"], z=heatmap["z"], colorscale="Turbo",
-                colorbar={"title": "شدت نسبی"},
-                hovertemplate="زمان: %{x}<br>قیمت: %{y}<br>شدت داده: %{z}<extra></extra>",
+                x=heatmap["x"], y=heatmap["y"], z=heat_values.tolist(),
+                colorscale=[[0.0, "#0b1220"], [0.12, "#172554"], [0.3, "#1d4ed8"],
+                            [0.52, "#06b6d4"], [0.72, "#facc15"], [0.88, "#f97316"], [1.0, "#f8fafc"]],
+                zmin=0, zmax=100, connectgaps=False,
+                colorbar={"title": "شدت نسبی", "ticksuffix": "%"},
+                hovertemplate="زمان: %{x}<br>سطح قیمت: %{y}<br>شدت نسبی (نرمال‌شده): %{z:.1f}%<extra></extra>",
             ))
             try:
                 btc_frame, btc_source, _ = fetch_klines_multi_source("BTC", "15 دقیقه", 60)
@@ -2330,8 +2391,12 @@ with st.expander("نقشه رایگان لیکوییدیشن BTC — راهنم�
                     st.caption(f"خط افقی = آخرین کندل بسته‌شده از {btc_source}؛ قیمت زنده نیست.")
             except Exception:
                 st.caption("قیمت مرجع BTC در دسترس نیست؛ نقشه بدون خط قیمت مرجع نمایش داده می‌شود.")
-            fig_liq.update_layout(height=500, title="BTC — نقشه لیکوییدیشن برآوردی، ۴ ساعت اخیر",
-                                  xaxis_title="زمان (UTC)", yaxis_title="قیمت BTC در منبع نقشه")
+            fig_liq.update_layout(height=650, title="BTC — تمرکز نسبی لیکوییدیشن، ۴ ساعت اخیر",
+                                  xaxis_title="زمان (UTC)", yaxis_title="قیمت BTC در منبع نقشه",
+                                  template="plotly_dark", hovermode="closest",
+                                  margin={"l": 15, "r": 15, "t": 55, "b": 35},
+                                  xaxis={"showgrid": True, "gridcolor": "#263244", "tickformat": "%H:%M"},
+                                  yaxis={"side": "right", "showgrid": True, "gridcolor": "#263244", "tickformat": ",.2f"})
             st.plotly_chart(fig_liq, use_container_width=True)
         else:
             st.info(f"نقشه فعلاً در دسترس نیست: {heatmap_error}")
