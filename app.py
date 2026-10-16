@@ -1349,7 +1349,7 @@ def analyze_book(book):
     bid_usd = sum(p * q for p, q in bids)
     ask_usd = sum(p * q for p, q in asks)
     total_usd = bid_usd + ask_usd
-    imbalance = (bid_usd - ask_usd) / total_usd if total_usd > 0 else 0
+    imbalance = (bid_usd - ask_usd) / total_usd if total_usd > 0 else None
 
     band_width = max(mid * 0.001, 1e-12)
 
@@ -1457,17 +1457,23 @@ def calculate_trade_plan(book_stats, trade_stats):
 
     risk = entry - stop
     reward = target - entry
-    rr = reward / risk if risk > 0 else 0
+    if risk <= 0 or reward <= 0:
+        return {"status": "WAIT", "reason": "حد ضرر یا هدف در سمت معتبر ورود قرار ندارد.",
+                "support": support, "resistance": resistance}
+    rr = reward / risk
     support_distance_pct = (mid - support["price"]) / mid * 100
 
     confirmations, warnings = [], []
-    imbalance_meaningful = book_stats["imbalance"] > 0.05
+    imbalance_value = book_stats.get("imbalance")
+    imbalance_meaningful = imbalance_value is not None and imbalance_value > 0.05
     net_flow_positive = trade_stats["net_flow"] > 0
 
     if imbalance_meaningful:
-        confirmations.append(f"عدم‌تعادل معنادار ({book_stats['imbalance']*100:+.1f}%) به نفع خریداران.")
-    elif book_stats["imbalance"] > 0:
-        warnings.append(f"عدم‌تعادل ضعیف ({book_stats['imbalance']*100:+.1f}%).")
+        confirmations.append(f"عدم‌تعادل معنادار ({imbalance_value*100:+.1f}%) به نفع خریداران.")
+    elif imbalance_value is not None and imbalance_value > 0:
+        warnings.append(f"عدم‌تعادل ضعیف ({imbalance_value*100:+.1f}%).")
+    elif imbalance_value is None:
+        warnings.append("عدم‌تعادل دفتر سفارش قابل محاسبه نیست.")
     else:
         warnings.append("عدم‌تعادل به نفع خریداران نیست.")
 
