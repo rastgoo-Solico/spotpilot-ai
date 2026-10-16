@@ -1,6 +1,6 @@
 """
 SpotPilot AI — Market analysis dashboard
-Version: v2.4-reviewed
+Version: v2.5-early-flow-risk
 - Multi-source klines with exchange-time candle validation
 - UT Bot ATR(1) defaults aligned with the requested TradingView setup
 - ATR(14) daily volatility normalization for ranking (separate from UT ATR)
@@ -1301,82 +1301,71 @@ def analyze_trades(trades):
 
 
 def calculate_trade_plan(book_stats, trade_stats):
-    mid = book_stats["mid"]
+    """Long-only setup candidate. A trade is actionable only at >=3R."""
+    mid = number(book_stats.get("mid"))
+    if mid <= 0:
+        return {"status": "WAIT", "reason": "قیمت میانی دفتر سفارش معتبر نیست."}
 
-    def nearest_significant(walls, side):
-        candidates = [w for w in walls
-                      if (w["price"] < mid if side == "bid" else w["price"] > mid)]
+    def nearest(walls, side):
+        candidates = [w for w in walls if
+                      (number(w.get("price")) < mid if side == "bid" else number(w.get("price")) > mid)]
         if not candidates:
             return None
-        sig = [w for w in candidates if w.get("significant")]
-        pool = sig if sig else candidates
-        pool.sort(key=lambda w: abs(w["price"] - mid))
-        return pool[0]
+        significant = [w for w in candidates if w.get("significant")]
+        return min(significant or candidates, key=lambda w: abs(number(w.get("price")) - mid))
 
-    support = nearest_significant(book_stats["bid_walls"], "bid")
-    resistance = nearest_significant(book_stats["ask_walls"], "ask")
-
+    support = nearest(book_stats.get("bid_walls", []), "bid")
+    resistance = nearest(book_stats.get("ask_walls", []), "ask")
     if not support or not resistance:
-        return {"status": "WAIT", "reason": "برای تعیین سطوح، دفتر سفارش داده کافی ندارد."}
+        return {"status": "WAIT", "reason": "سطح حمایت یا مقاومت قابل اتکا در دفتر سفارش موجود نیست."}
 
-    entry = support["price"] * 1.001
-    target = resistance["price"] * 0.999
-    stop = support["price"] * 0.995
-
-    if entry >= mid or target <= entry:
-        return {"status": "WAIT",
-                "reason": "سطوح فعلی هدف بالاتری از ورود ایجاد نمی‌کنند.",
-                "support": support, "resistance": resistance}
-
+    support_price = number(support.get("price"))
+    resistance_price = number(resistance.get("price"))
+    entry = max(number(book_stats.get("best_ask")), support_price * 1.001)
+    stop = support_price * 0.995
     risk = entry - stop
-    reward = target - entry
-    if risk <= 0 or reward <= 0:
-        return {"status": "WAIT", "reason": "حد ضرر یا هدف در سمت معتبر ورود قرار ندارد.",
+    target = resistance_price * 0.999
+    if entry <= 0 or stop <= 0 or risk <= 0 or target <= entry:
+        return {"status": "WAIT", "reason": "ساختار فعلی قیمت، ورود لانگ با حدضرر و هدف معتبر نمی‌سازد.",
                 "support": support, "resistance": resistance}
+
+    reward = target - entry
     rr = reward / risk
-    support_distance_pct = (mid - support["price"]) / mid * 100
-
-    confirmations, warnings = [], []
-    imbalance_value = book_stats.get("imbalance")
-    imbalance_meaningful = imbalance_value is not None and imbalance_value > 0.05
-    net_flow_positive = trade_stats["net_flow"] > 0
-
-    if imbalance_meaningful:
-        confirmations.append(f"عدم‌تعادل معنادار ({imbalance_value*100:+.1f}%) به نفع خریداران.")
-    elif imbalance_value is not None and imbalance_value > 0:
-        warnings.append(f"عدم‌تعادل ضعیف ({imbalance_value*100:+.1f}%).")
-    elif imbalance_value is None:
-        warnings.append("عدم‌تعادل دفتر سفارش قابل محاسبه نیست.")
+    support_distance_pct = max(0.0, (mid - support_price) / mid * 100)
+    imbalance = book_stats.get("imbalance")
+    flow = number(trade_stats.get("net_flow"))
+    spread = number(book_stats.get("spread_pct"), 999)
+    confirmations = []
+    warnings = []
+    if imbalance is not None and imbalance > 0.05:
+        confirmations.append("دفتر سفارش به نفع خریداران است")
     else:
-        warnings.append("عدم‌تعادل به نفع خریداران نیست.")
-
-    if net_flow_positive:
-        confirmations.append("جریان خالص معاملات مثبت.")
-    elif trade_stats["net_flow"] < 0:
-        warnings.append("جریان خالص معاملات منفی.")
+        warnings.append("عدم‌تعادل دفتر سفارش خرید را تأیید نمی‌کند")
+    if flow > 0:
+        confirmations.append("جریان خالص معاملات اخیر مثبت است")
     else:
-        warnings.append("جریان خالص خرید تأیید نشده.")
-
+        warnings.append("جریان خالص معاملات اخیر مثبت نیست")
+    if spread > 0.5:
+        warnings.append("اسپرد بالاتر از ۰٫۵٪ است")
     if support_distance_pct > 3:
-        warnings.append("نزدیک‌ترین ناحیه خرید بیش از ۳٪ پایین‌تر از قیمت است.")
-    if book_stats["spread_pct"] > 0.5:
-        warnings.append("فاصله خرید و فروش بالاست.")
-    if rr < 1.2:
-        warnings.append("نسبت سود به ریسک < ۱٫۲.")
+        warnings.append("حمایت بیش از ۳٪ پایین‌تر از قیمت فعلی است")
+    if rr < 3:
+        warnings.append(f"مقاومت فعلی فقط نسبت سود به ریسک {rr:.2f}R می‌دهد؛ شرط حداقل 3R تأمین نیست")
 
-    confirmed = (
-        support_distance_pct <= 3
-        and book_stats["spread_pct"] <= 0.5
-        and rr >= 1.2
-        and (imbalance_meaningful or net_flow_positive)
-    )
+    data_ok = spread <= 0.5 and support_distance_pct <= 3 and rr >= 3
+    flow_ok = (imbalance is not None and imbalance > 0.05) or flow > 0
+    actionable = data_ok and flow_ok
     return {
-        "status": "ENTRY WATCH" if confirmed else "WAIT",
-        "reason": " ".join(warnings + confirmations),
+        "status": "LONG SETUP" if actionable else "WAIT",
+        "reason": "؛ ".join(confirmations + warnings) or "شرایط اولیه بررسی لانگ برقرار است.",
         "entry": entry, "target": target, "stop": stop, "rr": rr,
         "support": support, "resistance": resistance,
         "support_distance_pct": support_distance_pct,
+        "risk_per_unit": risk,
+        "reward_per_unit": reward,
+        "actionable": actionable,
     }
+
 
 
 # ===========================================================================
@@ -2454,45 +2443,37 @@ with st.expander("جزئیات دفتر سفارش"):
 
 # ---------------------------------------------------------------------------
 st.divider()
-st.subheader("۷. سناریوی احتمالی ورود و خروج")
-st.caption("محاسبه تقریبی بر پایه دفتر سفارش LBank.")
+st.subheader("۷. سناریوی احتمالی ورود و خروج — لانگ با کنترل ریسک")
+st.caption("این بخش دیگر به تازه‌بودن سیگنال UT وابسته نیست؛ از قیمت، حمایت/مقاومت دفتر سفارش و جریان معاملات استفاده می‌کند. فقط وقتی نسبت سود به ریسک حداقل 3R باشد، وضعیت به‌عنوان ستاپ لانگ معتبر نشان داده می‌شود.")
 
 plan = calculate_trade_plan(book_stats, trade_stats)
+capital = st.number_input("سرمایه کل حساب (USDT)", min_value=10.0, value=1000.0, step=50.0, key="long_capital")
+max_risk_pct = st.number_input("حداکثر ریسک سرمایه در این معامله (%)", min_value=0.1, max_value=3.0, value=3.0, step=0.1, key="long_risk_pct")
+st.caption("سقف ۳٪ یعنی حداکثر زیان دلاری در صورت اجرای حدضرر؛ به معنی قرار دادن stop دقیقاً ۳٪ زیر قیمت نیست.")
 
-if plan["status"] == "ENTRY WATCH":
-    st.success("وضعیت: فرصت برای بررسی بیشتر")
+if plan["status"] == "LONG SETUP":
+    st.success("🟢 ستاپ لانگ اولیه پیدا شد؛ پیش از سفارش، تازگی قیمت و لغزش اجرا را بررسی کن.")
 else:
-    st.warning("وضعیت: انتظار برای تأیید")
+    st.warning("🟠 فعلاً ستاپ لانگ با تمام شروط ریسک تأیید نشده؛ دلیل دقیق پایین نمایش داده می‌شود.")
 
 st.write(plan["reason"])
-
 if "entry" in plan:
     levels = st.columns(4)
-    levels[0].metric("ورود احتمالی", fmt_price(plan["entry"]))
+    levels[0].metric("ورود پیشنهادی", fmt_price(plan["entry"]))
     levels[1].metric("هدف خروج", fmt_price(plan["target"]))
-    levels[2].metric("حد ابطال سناریو", fmt_price(plan["stop"]))
-    levels[3].metric("نسبت پاداش به ریسک", f"{plan['rr']:.2f}")
-
-with st.expander("🧮 ماشین‌حساب حجم پوزیشن بر پایه ATR"):
-    col_a, col_b = st.columns(2)
-    capital = col_a.number_input("سرمایه کل (USDT)", min_value=10.0, value=1000.0, step=50.0)
-    risk_pct = col_b.number_input("درصد ریسک هر معامله", min_value=0.1, max_value=5.0, value=1.0, step=0.1)
-    plan_4h = timeframe_results.get("4 ساعت", {}).get("plan", {})
-    ref_close = plan_4h.get("close")
-    ref_stop = plan_4h.get("stop")
-    if ref_close and ref_stop:
-        risk_per_unit = abs(ref_close - ref_stop)
-        risk_amount = capital * (risk_pct / 100)
-        position_size = risk_amount / risk_per_unit if risk_per_unit > 0 else 0
-        notional = position_size * ref_close
-        st.markdown(
-            f"- **ریسک دلاری:** {fmt_usd(risk_amount)}\n"
-            f"- **حجم پیشنهادی:** {position_size:,.6f} واحد\n"
-            f"- **ارزش پوزیشن:** {fmt_usd(notional)}\n"
-            f"- **فاصله stop تا entry:** {fmt_price(risk_per_unit)}"
-        )
-    else:
-        st.info("ابتدا تحلیل تایم‌فریم ۴ساعته باید کامل شود.")
+    levels[2].metric("حد ضرر", fmt_price(plan["stop"]))
+    levels[3].metric("ریوارد به ریسک", f"{plan['rr']:.2f}R")
+    risk_per_unit = max(0.0, number(plan["entry"]) - number(plan["stop"]))
+    risk_budget = capital * max_risk_pct / 100.0
+    position_units = risk_budget / risk_per_unit if risk_per_unit > 0 else 0.0
+    notional = position_units * number(plan["entry"])
+    m = st.columns(3)
+    m[0].metric("حداکثر زیان مجاز", fmt_usd(risk_budget))
+    m[1].metric("حجم تقریبی پوزیشن", f"{position_units:,.6f}")
+    m[2].metric("ارزش تقریبی پوزیشن", fmt_usd(notional))
+    st.caption("حجم با فاصله ورود تا حدضرر محاسبه شده و کارمزد، اسلیپیج و گپ قیمت می‌تواند زیان واقعی را از مقدار مدل بیشتر کند.")
+else:
+    st.info("قیمت ورود/حدضرر/هدف قابل اتکا از دفتر سفارش فعلی ساخته نشد؛ داده کافی برای تعیین حجم پوزیشن نداریم.")
 
 with st.expander("⚠️ آگاهی از ریسک ضرر زنجیره‌ای"):
     table = pd.DataFrame({
