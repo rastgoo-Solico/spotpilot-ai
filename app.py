@@ -2,7 +2,6 @@ import streamlit as st
 import pytse_client as tse
 import pandas as pd
 import json
-import os
 import time
 from datetime import datetime
 from pathlib import Path
@@ -88,7 +87,7 @@ def get_symbol_list():
 
 
 def fetch_shares_for(symbols, progress_bar, already_done, total):
-    """دریافت تعداد سهام برای یک لیست از نمادها."""
+    """دریافت تعداد سهام و گروه صنعتی برای یک لیست از نمادها."""
     rows = []
     for i, sym in enumerate(symbols):
         try:
@@ -97,6 +96,7 @@ def fetch_shares_for(symbols, progress_bar, already_done, total):
             rows.append({
                 "نماد": sym,
                 "نام شرکت": getattr(t, 'title', ''),
+                "گروه": getattr(t, 'group_name', 'نامشخص') or 'نامشخص',
                 "تعداد سهام": shares,
             })
         except Exception:
@@ -150,38 +150,105 @@ if 'symbols' not in st.session_state:
 df = st.session_state.df
 
 if df is not None and not df.empty:
+
+    # اگر دیتافریم قدیمی ستون گروه را نداشت، هشدار می‌دهیم
+    if 'گروه' not in df.columns:
+        st.warning(
+            "⚠️ داده‌های کش‌شده قدیمی هستند و ستون «گروه» را ندارند. "
+            "لطفاً از سایدبار کش را پاک کرده و داده‌ها را دوباره دریافت کنید."
+        )
+
     st.success(f"✅ {len(df)} شرکت در پایگاه داده")
 
     # ---- فیلترها ----
-    col1, col2 = st.columns([3, 1])
+    col1, col2, col3 = st.columns([2, 2, 2])
+
     with col1:
         search = st.text_input("🔍 جستجو:", placeholder="نام نماد یا شرکت...")
-    with col2:
-        sort_by = st.selectbox("مرتب‌سازی:", ["—", "نماد", "نام شرکت", "تعداد سهام"])
 
+    with col2:
+        if 'گروه' in df.columns:
+            available_groups = sorted(
+                [g for g in df['گروه'].dropna().unique().tolist() if g and g != 'نامشخص']
+            )
+        else:
+            available_groups = []
+        selected_groups = st.multiselect(
+            "🏷️ فیلتر گروه صنعتی:",
+            options=available_groups,
+            default=[],
+            help="اگر خالی باشد، همه گروه‌ها نمایش داده می‌شوند"
+        )
+
+    with col3:
+        max_shares = st.number_input(
+            "📉 حداکثر تعداد سهام:",
+            min_value=0,
+            value=0,
+            step=1_000_000,
+            help="مقدار ۰ به معنای عدم اعمال فیلتر است"
+        )
+
+    # ---- اعمال فیلترها ----
     df_view = df.copy()
+
+    # فیلتر جستجو
     if search:
-        mask = (
+        mask_search = (
             df_view['نماد'].astype(str).str.contains(search, case=False, na=False) |
             df_view['نام شرکت'].astype(str).str.contains(search, case=False, na=False)
         )
-        df_view = df_view[mask]
+        df_view = df_view[mask_search]
+
+    # فیلتر گروه صنعتی
+    if selected_groups and 'گروه' in df_view.columns:
+        df_view = df_view[df_view['گروه'].isin(selected_groups)]
+
+    # فیلتر حداکثر تعداد سهام
+    if max_shares > 0:
+        shares_numeric = pd.to_numeric(df_view['تعداد سهام'], errors='coerce')
+        df_view = df_view[shares_numeric.notna() & (shares_numeric <= max_shares)]
+
+    # ---- مرتب‌سازی ----
+    sort_col, sort_dir = st.columns([2, 1])
+    with sort_col:
+        sort_by = st.selectbox(
+            "مرتب‌سازی بر اساس:",
+            ["—", "نماد", "نام شرکت", "گروه", "تعداد سهام"]
+        )
+    with sort_dir:
+        ascending = st.radio(
+            "ترتیب:", ["صعودی", "نزولی"], horizontal=True, label_visibility="collapsed"
+        ) == "صعودی"
 
     if sort_by != "—" and sort_by in df_view.columns:
-        df_view = df_view.sort_values(sort_by, na_position='last')
+        df_view = df_view.sort_values(sort_by, ascending=ascending, na_position='last')
+
+    # ---- خلاصه فیلتر ----
+    st.caption(f"📊 {len(df_view)} رکورد از {len(df)} رکورد مطابق فیلترها یافت شد.")
 
     # ---- صفحه‌بندی ----
     total = len(df_view)
-    total_pages = max(1, (total - 1) // PAGE_SIZE + 1)
-    page = st.number_input("صفحه", min_value=1, max_value=total_pages, value=1, step=1)
-    start = (page - 1) * PAGE_SIZE
-    end = start + PAGE_SIZE
+    if total > 0:
+        total_pages = max(1, (total - 1) // PAGE_SIZE + 1)
+        page = st.number_input(
+            "صفحه", min_value=1, max_value=total_pages, value=1, step=1
+        )
+        start = (page - 1) * PAGE_SIZE
+        end = start + PAGE_SIZE
 
-    st.caption(f"نمایش {start+1} تا {min(end, total)} از {total} رکورد")
-    st.dataframe(df_view.iloc[start:end], use_container_width=True, hide_index=True)
+        st.caption(f"نمایش {start+1} تا {min(end, total)} از {total} رکورد")
+        st.dataframe(
+            df_view.iloc[start:end], use_container_width=True, hide_index=True
+        )
+    else:
+        st.info("هیچ رکوردی با فیلترهای انتخابی یافت نشد.")
 
     csv = df_view.to_csv(index=False).encode('utf-8-sig')
-    st.download_button("📥 دانلود CSV", csv, "tsetmc_data.csv", "text/csv")
+    st.download_button(
+        "📥 دانلود CSV (بر اساس فیلتر فعلی)",
+        csv, "tsetmc_data_filtered.csv", "text/csv"
+    )
 
     st.markdown("---")
 
@@ -193,7 +260,10 @@ if df is not None and not df.empty:
     remaining = total_symbols - len(df) if total_symbols else 0
 
     if remaining > 0:
-        st.info(f"📊 {len(df)} از {total_symbols} نماد دریافت شده. {remaining} نماد باقی مانده.")
+        st.info(
+            f"📊 {len(df)} از {total_symbols} نماد دریافت شده. "
+            f"{remaining} نماد باقی مانده."
+        )
         if st.button(f"⬇️ دریافت {min(batch_size, remaining)} نماد بعدی", type="primary"):
             next_symbols = st.session_state.symbols[len(df):len(df) + batch_size]
             progress = st.progress(0, text="شروع...")
@@ -268,8 +338,14 @@ else:
 
 # ==================== راهنما ====================
 st.markdown("---")
-with st.expander("💡 چگونه از Throttle جلوگیری کنیم؟"):
+with st.expander("💡 راهنما و نکات"):
     st.markdown("""
+    **فیلترها:**
+    - **جستجو**: در نماد و نام شرکت جستجو می‌کند.
+    - **گروه صنعتی**: می‌توانید چند گروه (مثلاً بانکی و دارویی) را همزمان انتخاب کنید. اگر خالی باشد، همه گروه‌ها نمایش داده می‌شوند.
+    - **حداکثر تعداد سهام**: اگر عددی بزرگ‌تر از صفر وارد کنید، فقط شرکت‌هایی نمایش داده می‌شوند که تعداد سهام آن‌ها کمتر یا مساوی این عدد باشد.
+
+    **جلوگیری از Throttle:**
     - **از کش استفاده کنید**: داده‌ها در پوشه `cache/` ذخیره می‌شوند و فقط با کلیک شما بروزرسانی می‌شوند.
     - **دسته‌های کوچک**: با ۵۰ نماد شروع کنید و به تدریج اضافه کنید.
     - **وقفه بین دسته‌ها**: بین هر دسته ۰.۸ ثانیه وقفه وجود دارد تا CPU نفس بکشد.
