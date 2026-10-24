@@ -1,4 +1,8 @@
 streamlit
 pandas
-lxml>=4.9.4
-pytse-client
+pyarrow
+git+https://github.com/mshojaei77/pytsetmc-api.git@main
+xlsxwriter
+reportlab
+arabic-reshaper
+python-bidi
