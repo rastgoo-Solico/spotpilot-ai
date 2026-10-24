@@ -12,15 +12,41 @@ CACHE_DIR.mkdir(exist_ok=True)
 DATA_FILE = CACHE_DIR / "shares_data.parquet"
 META_FILE = CACHE_DIR / "meta.json"
 SYMBOLS_FILE = CACHE_DIR / "symbols.json"
-CACHE_TTL_HOURS = 12          # کش به مدت ۱۲ ساعت معتبر است
-PAGE_SIZE = 50                # تعداد ردیف در هر صفحه
-BATCH_PAUSE_SECONDS = 0.8     # وقفه بین دسته‌ها (کاهش فشار روی CPU)
+CACHE_TTL_HOURS = 12
+PAGE_SIZE = 50
+BATCH_PAUSE_SECONDS = 0.8
 
 st.set_page_config(page_title="داشبورد بورس", page_icon="📊", layout="wide")
 st.title("📊 داشبورد تحلیل بازار بورس ایران")
 
 
-# ==================== توابع کش ====================
+# ==================== توابع کمکی ====================
+
+def safe_attr_extract(obj, candidate_names, default='نامشخص'):
+    """
+    تلاش می‌کند مقدار یک ویژگی را با چند نام مختلف بخواند.
+    حتی اگر ویژگی یک property باشد که Exception بدهد، مدیریت می‌شود.
+    """
+    for name in candidate_names:
+        try:
+            val = getattr(obj, name, None)
+            if val is None:
+                continue
+            # اگر val یک dict بود، سعی می‌کنیم name را از داخلش بکشیم
+            if isinstance(val, dict):
+                for key in ('name', 'title', 'sector_name', 'group_name'):
+                    if key in val and val[key]:
+                        val = val[key]
+                        break
+                else:
+                    continue
+            val = str(val).strip()
+            if val and val.lower() not in ('none', 'nan', 'null', ''):
+                return val
+        except Exception:
+            continue
+    return default
+
 
 def _read_meta():
     if not META_FILE.exists():
@@ -42,15 +68,36 @@ def cache_age_hours():
 
 
 def load_cache():
+    """
+    فقط کشی را معتبر می‌داند که:
+    - قدیمی نباشد
+    - ستون «گروه» را داشته باشد
+    - حداقل دو گروه یکتا داشته باشد (نه همه نامشخص)
+    """
     if not DATA_FILE.exists():
         return None
+
     age = cache_age_hours()
     if age is None or age > CACHE_TTL_HOURS:
         return None
+
     try:
-        return pd.read_parquet(DATA_FILE)
+        df = pd.read_parquet(DATA_FILE)
     except Exception:
         return None
+
+    # اعتبارسنجی ساختار
+    if 'گروه' not in df.columns:
+        return None  # کش قدیمی است، دوباره ساخته می‌شود
+
+    # اگر همه گروه‌ها نامشخص بودند، کش بی‌فایده است
+    unique_groups = df['گروه'].dropna().unique()
+    if len(unique_groups) == 0:
+        return None
+    if len(unique_groups) == 1 and unique_groups[0] == 'نامشخص':
+        return None
+
+    return df
 
 
 def save_cache(df):
@@ -64,13 +111,15 @@ def save_cache(df):
 def clear_all_cache():
     for f in [DATA_FILE, META_FILE, SYMBOLS_FILE]:
         if f.exists():
-            f.unlink()
+            try:
+                f.unlink()
+            except Exception:
+                pass
 
 
 # ==================== دریافت داده ====================
 
 def get_symbol_list():
-    """دریافت لیست کامل نمادها فقط یک‌بار و کش کردن آن."""
     if SYMBOLS_FILE.exists():
         try:
             return json.loads(SYMBOLS_FILE.read_text())
@@ -87,21 +136,34 @@ def get_symbol_list():
 
 
 def fetch_shares_for(symbols, progress_bar, already_done, total):
-    """دریافت تعداد سهام و گروه صنعتی برای یک لیست از نمادها."""
     rows = []
     for i, sym in enumerate(symbols):
         try:
             t = tse.Ticker(sym)
-            shares = getattr(t, 'shares_outstanding', None) or getattr(t, 'total_shares', None)
+
+            shares = None
+            for attr in ('shares_outstanding', 'total_shares'):
+                try:
+                    v = getattr(t, attr, None)
+                    if v is not None:
+                        shares = v
+                        break
+                except Exception:
+                    continue
+
             rows.append({
                 "نماد": sym,
-                "نام شرکت": getattr(t, 'title', ''),
-                "گروه": getattr(t, 'group_name', 'نامشخص') or 'نامشخص',
+                "نام شرکت": safe_attr_extract(t, ['title', 'name'], default=''),
+                "گروه": safe_attr_extract(
+                    t,
+                    ['group_name', 'sector_name', 'industry_name',
+                     'sector', 'industry', 'group', 'groupName'],
+                    default='نامشخص'
+                ),
                 "تعداد سهام": shares,
             })
         except Exception:
             continue
-        # به‌روزرسانی نوار پیشرفت هر ۵ مورد (نه هر مورد)
         if i % 5 == 0:
             done = already_done + i + 1
             pct = min(done / total, 1.0)
@@ -114,51 +176,53 @@ with st.sidebar:
     st.header("⚙️ تنظیمات")
 
     age = cache_age_hours()
-    if age is not None and age <= CACHE_TTL_HOURS:
+    if age is not None and age <= CACHE_TTL_HOURS and DATA_FILE.exists():
         st.success(f"📦 کش معتبر ({age:.1f} ساعت پیش)")
-    elif age is not None:
-        st.warning(f"⚠️ کش قدیمی ({age:.1f} ساعت)")
     else:
-        st.info("ℹ️ کش موجود نیست")
+        st.info("ℹ️ کش معتبر موجود نیست")
 
     st.markdown("---")
 
     batch_size = st.slider(
         "اندازه هر دسته:", min_value=10, max_value=200, value=50, step=10,
-        help="دسته‌های کوچک‌تر فشار کمتری به CPU وارد می‌کنند"
     )
 
     st.markdown("---")
 
-    if st.button("🗑️ پاک کردن کش", use_container_width=True):
+    if st.button("🗑️ پاک کردن کامل کش", use_container_width=True):
         clear_all_cache()
-        st.session_state.pop('df', None)
+        for k in ['df', 'symbols']:
+            st.session_state.pop(k, None)
         st.success("کش پاک شد")
         st.rerun()
 
 
 # ==================== بارگذاری از کش ====================
 if 'df' not in st.session_state:
-    cached = load_cache()
-    st.session_state.df = cached if cached is not None else None
+    st.session_state.df = load_cache()
 
 if 'symbols' not in st.session_state:
     st.session_state.symbols = None
 
-
-# ==================== نمایش داده ====================
 df = st.session_state.df
 
+
+# ==================== نمایش داده ====================
 if df is not None and not df.empty:
 
-    # اگر دیتافریم قدیمی ستون گروه را نداشت، هشدار می‌دهیم
-    if 'گروه' not in df.columns:
-        st.warning(
-            "⚠️ داده‌های کش‌شده قدیمی هستند و ستون «گروه» را ندارند. "
-            "لطفاً از سایدبار کش را پاک کرده و داده‌ها را دوباره دریافت کنید."
-        )
-
     st.success(f"✅ {len(df)} شرکت در پایگاه داده")
+
+    # ---- دیباگ ----
+    with st.expander("🔍 اطلاعات دیباگ (برای عیب‌یابی)"):
+        st.write("**ستون‌های موجود:**", df.columns.tolist())
+        st.write("**تعداد رکوردها:**", len(df))
+        if 'گروه' in df.columns:
+            vc = df['گروه'].fillna('نامشخص').value_counts()
+            st.write("**توزیع گروه‌ها (۱۰ گروه اول):**")
+            st.dataframe(vc.head(10).rename_axis("گروه").reset_index(name="تعداد"))
+            st.write("**تعداد گروه‌های یکتا:**", df['گروه'].nunique())
+        else:
+            st.error("ستون «گروه» در داده وجود ندارد! لطفاً کش را پاک کنید و داده را دوباره دریافت کنید.")
 
     # ---- فیلترها ----
     col1, col2, col3 = st.columns([2, 2, 2])
@@ -169,30 +233,39 @@ if df is not None and not df.empty:
     with col2:
         if 'گروه' in df.columns:
             available_groups = sorted(
-                [g for g in df['گروه'].dropna().unique().tolist() if g and g != 'نامشخص']
+                [g for g in df['گروه'].dropna().unique().tolist()
+                 if g and g != 'نامشخص']
             )
         else:
             available_groups = []
-        selected_groups = st.multiselect(
-            "🏷️ فیلتر گروه صنعتی:",
-            options=available_groups,
-            default=[],
-            help="اگر خالی باشد، همه گروه‌ها نمایش داده می‌شوند"
-        )
+
+        if available_groups:
+            selected_groups = st.multiselect(
+                "🏷️ فیلتر گروه صنعتی:",
+                options=available_groups,
+                default=[],
+                help="اگر خالی باشد، همه گروه‌ها نمایش داده می‌شوند"
+            )
+        else:
+            st.multiselect(
+                "🏷️ فیلتر گروه صنعتی:",
+                options=[],
+                default=[],
+                disabled=True,
+                help="هیچ گروهی در داده یافت نشد. کش را پاک کرده و داده را دوباره دریافت کنید."
+            )
+            selected_groups = []
 
     with col3:
         max_shares = st.number_input(
             "📉 حداکثر تعداد سهام:",
-            min_value=0,
-            value=0,
-            step=1_000_000,
+            min_value=0, value=0, step=1_000_000,
             help="مقدار ۰ به معنای عدم اعمال فیلتر است"
         )
 
     # ---- اعمال فیلترها ----
     df_view = df.copy()
 
-    # فیلتر جستجو
     if search:
         mask_search = (
             df_view['نماد'].astype(str).str.contains(search, case=False, na=False) |
@@ -200,11 +273,9 @@ if df is not None and not df.empty:
         )
         df_view = df_view[mask_search]
 
-    # فیلتر گروه صنعتی
     if selected_groups and 'گروه' in df_view.columns:
         df_view = df_view[df_view['گروه'].isin(selected_groups)]
 
-    # فیلتر حداکثر تعداد سهام
     if max_shares > 0:
         shares_numeric = pd.to_numeric(df_view['تعداد سهام'], errors='coerce')
         df_view = df_view[shares_numeric.notna() & (shares_numeric <= max_shares)]
@@ -218,29 +289,24 @@ if df is not None and not df.empty:
         )
     with sort_dir:
         ascending = st.radio(
-            "ترتیب:", ["صعودی", "نزولی"], horizontal=True, label_visibility="collapsed"
+            "ترتیب:", ["صعودی", "نزولی"], horizontal=True,
+            label_visibility="collapsed"
         ) == "صعودی"
 
     if sort_by != "—" and sort_by in df_view.columns:
         df_view = df_view.sort_values(sort_by, ascending=ascending, na_position='last')
 
-    # ---- خلاصه فیلتر ----
     st.caption(f"📊 {len(df_view)} رکورد از {len(df)} رکورد مطابق فیلترها یافت شد.")
 
     # ---- صفحه‌بندی ----
     total = len(df_view)
     if total > 0:
         total_pages = max(1, (total - 1) // PAGE_SIZE + 1)
-        page = st.number_input(
-            "صفحه", min_value=1, max_value=total_pages, value=1, step=1
-        )
+        page = st.number_input("صفحه", min_value=1, max_value=total_pages, value=1, step=1)
         start = (page - 1) * PAGE_SIZE
         end = start + PAGE_SIZE
-
         st.caption(f"نمایش {start+1} تا {min(end, total)} از {total} رکورد")
-        st.dataframe(
-            df_view.iloc[start:end], use_container_width=True, hide_index=True
-        )
+        st.dataframe(df_view.iloc[start:end], use_container_width=True, hide_index=True)
     else:
         st.info("هیچ رکوردی با فیلترهای انتخابی یافت نشد.")
 
@@ -280,27 +346,27 @@ if df is not None and not df.empty:
     else:
         st.success("🎉 تمام نمادها دریافت شد!")
 
-    if st.button("🔄 بروزرسانی کامل داده‌ها"):
-        st.session_state.df = None
-        if DATA_FILE.exists():
-            DATA_FILE.unlink()
-        if META_FILE.exists():
-            META_FILE.unlink()
+    if st.button("🔄 بروزرسانی کامل داده‌ها (پاک کردن کش و دریافت مجدد)"):
+        clear_all_cache()
+        for k in ['df', 'symbols']:
+            st.session_state.pop(k, None)
         st.rerun()
 
 else:
     # ==================== بدون کش: دریافت اولیه ====================
-    st.info("📥 هنوز داده‌ای بارگذاری نشده است.")
+    st.info("📥 داده‌ای برای نمایش موجود نیست.")
+
+    if DATA_FILE.exists():
+        st.warning(
+            "⚠️ فایل کش موجود است اما معتبر نیست "
+            "(احتمالاً قدیمی است یا ستون «گروه» را ندارد). "
+            "برای ساخت داده جدید، روی دکمه زیر کلیک کنید یا از سایدبار کش را پاک کنید."
+        )
 
     st.subheader("🆕 دریافت اولیه")
-    st.caption(
-        "برای جلوگیری از Throttle، با تعداد کمی نماد شروع کنید. "
-        "پس از دریافت موفق، می‌توانید دسته‌های بعدی را اضافه کنید."
-    )
 
     initial_count = st.number_input(
-        "تعداد نماد برای شروع:",
-        min_value=10, max_value=300, value=50, step=10
+        "تعداد نماد برای شروع:", min_value=10, max_value=300, value=50, step=10
     )
 
     if st.button("🚀 شروع دریافت", type="primary", use_container_width=True):
@@ -315,14 +381,10 @@ else:
             progress_bar = st.progress(0, text="شروع...")
             all_dfs = []
 
-            # پردازش دسته‌ای با وقفه بین دسته‌ها
             for bstart in range(0, len(initial), batch_size):
                 bsymbols = initial[bstart:bstart + batch_size]
-                bdf = fetch_shares_for(
-                    bsymbols, progress_bar, bstart, len(initial)
-                )
+                bdf = fetch_shares_for(bsymbols, progress_bar, bstart, len(initial))
                 all_dfs.append(bdf)
-                # وقفه برای کاهش فشار روی CPU
                 if bstart + batch_size < len(initial):
                     time.sleep(BATCH_PAUSE_SECONDS)
 
@@ -338,16 +400,19 @@ else:
 
 # ==================== راهنما ====================
 st.markdown("---")
-with st.expander("💡 راهنما و نکات"):
+with st.expander("💡 راهنما و عیب‌یابی"):
     st.markdown("""
-    **فیلترها:**
-    - **جستجو**: در نماد و نام شرکت جستجو می‌کند.
-    - **گروه صنعتی**: می‌توانید چند گروه (مثلاً بانکی و دارویی) را همزمان انتخاب کنید. اگر خالی باشد، همه گروه‌ها نمایش داده می‌شوند.
-    - **حداکثر تعداد سهام**: اگر عددی بزرگ‌تر از صفر وارد کنید، فقط شرکت‌هایی نمایش داده می‌شوند که تعداد سهام آن‌ها کمتر یا مساوی این عدد باشد.
+    **اگر فیلتر گروه خالی است:**
+    1. از سایدبار دکمه **«🗑️ پاک کردن کامل کش»** را بزنید.
+    2. سپس روی **«🚀 شروع دریافت»** کلیک کنید.
+    3. بعد از دریافت، بخش **«🔍 اطلاعات دیباگ»** را باز کنید و ببینید آیا گروه‌ها پر شده‌اند یا نه.
 
-    **جلوگیری از Throttle:**
-    - **از کش استفاده کنید**: داده‌ها در پوشه `cache/` ذخیره می‌شوند و فقط با کلیک شما بروزرسانی می‌شوند.
-    - **دسته‌های کوچک**: با ۵۰ نماد شروع کنید و به تدریج اضافه کنید.
-    - **وقفه بین دسته‌ها**: بین هر دسته ۰.۸ ثانیه وقفه وجود دارد تا CPU نفس بکشد.
-    - **عدم دریافت مجدد**: تا ۱۲ ساعت داده‌ها از کش خوانده می‌شوند.
+    اگر در دیباگ دیدید که همه گروه‌ها «نامشخص» هستند، یعنی نسخه‌ی `pytse-client` شما این اطلاعات را برنمی‌گرداند. در این صورت، گزینه‌ها:
+    - ارتقاء به نسخه git: در `requirements.txt` بنویسید `git+https://github.com/Glyphack/pytse-client.git`
+    - یا با یک کتابخانه دیگر مثل `pytsetmc-api` ادغام کنید.
+
+    **فیلترها:**
+    - **جستجو**: در نماد و نام شرکت.
+    - **گروه صنعتی**: می‌توانید چند گروه را همزمان انتخاب کنید.
+    - **حداکثر تعداد سهام**: اگر بزرگ‌تر از صفر باشد، شرکت‌های با تعداد سهام بیشتر حذف می‌شوند.
     """)
