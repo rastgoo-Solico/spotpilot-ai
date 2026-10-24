@@ -1,3 +1,4 @@
 streamlit
-git+https://github.com/Glyphack/pytse-client.git
 pandas
+lxml>=4.9.4
+pytse-client
