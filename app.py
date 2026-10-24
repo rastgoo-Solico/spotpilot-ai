@@ -12,10 +12,10 @@ CACHE_DIR = Path("cache")
 CACHE_DIR.mkdir(exist_ok=True)
 DATA_FILE = CACHE_DIR / "shares_data.parquet"
 META_FILE = CACHE_DIR / "meta.json"
-SYMBOLS_META_FILE = CACHE_DIR / "symbols_with_sectors.parquet"
+SYMBOLS_FILE = CACHE_DIR / "symbols.json"
 CACHE_TTL_HOURS = 12
 PAGE_SIZE = 50
-BATCH_PAUSE_SECONDS = 0.8
+BATCH_PAUSE_SECONDS = 0.5
 
 st.set_page_config(page_title="داشبورد بورس", page_icon="📊", layout="wide")
 st.title("📊 داشبورد تحلیل بازار بورس ایران")
@@ -24,6 +24,7 @@ st.title("📊 داشبورد تحلیل بازار بورس ایران")
 # ==================== توابع کمکی ====================
 
 def safe_attr_extract(obj, candidate_names, default='نامشخص'):
+    """تلاش برای خواندن یک ویژگی با چند نام مختلف."""
     for name in candidate_names:
         try:
             val = getattr(obj, name, None)
@@ -87,7 +88,7 @@ def save_cache(df):
 
 
 def clear_all_cache():
-    for f in [DATA_FILE, META_FILE, SYMBOLS_META_FILE]:
+    for f in [DATA_FILE, META_FILE, SYMBOLS_FILE]:
         if f.exists():
             try:
                 f.unlink()
@@ -95,68 +96,40 @@ def clear_all_cache():
                 pass
 
 
-# ==================== لیست نمادها با گروه (یک درخواست سبک) ====================
-
-def get_symbols_with_sectors():
+def get_symbol_list():
     """
-    لیست همه نمادها با گروه صنعتی‌شان را با یک درخواست سبک برمی‌گرداند.
-    اگر کش موجود و معتبر باشد، از کش می‌خواند.
+    دریافت لیست نمادها با API سبک tse.all_symbols().
+    اگر این تابع موجود نباشد، از tse.download استفاده می‌شود (سنگین‌تر).
     """
-    # تلاش برای خواندن از کش
-    if SYMBOLS_META_FILE.exists():
+    if SYMBOLS_FILE.exists():
         try:
-            df = pd.read_parquet(SYMBOLS_META_FILE)
-            if df is not None and not df.empty and 'sector' in df.columns:
-                return df
+            return json.loads(SYMBOLS_FILE.read_text())
         except Exception:
             pass
 
-    # دریافت از TSETMC
+    # تلاش ۱: تابع سبک all_symbols
     try:
-        from pytse_client import SymbolList
-        sl = SymbolList()
-        try:
-            df = sl.all_symbols(show_progress=False)
-        except TypeError:
-            df = sl.all_symbols()
+        symbols = tse.all_symbols()
+        if symbols:
+            symbols = [str(s) for s in symbols]
+            SYMBOLS_FILE.write_text(json.dumps(symbols))
+            return symbols
+    except Exception:
+        pass
 
-        if df is None or df.empty:
-            return None
-
-        df = df.copy()
-        # استانداردسازی نام ستون‌ها
-        rename_map = {}
-        for c in df.columns:
-            cl = c.lower()
-            if cl in ('symbol', 'ticker', 'نماد'):
-                rename_map[c] = 'symbol'
-            elif cl in ('name', 'title', 'company_name', 'نام'):
-                rename_map[c] = 'name'
-            elif cl in ('sector', 'sector_name', 'group', 'group_name',
-                        'industry', 'industry_name'):
-                rename_map[c] = 'sector'
-        df = df.rename(columns=rename_map)
-
-        if 'symbol' not in df.columns or 'sector' not in df.columns:
-            return None
-
-        df['sector'] = df['sector'].fillna('نامشخص').astype(str).str.strip()
-        df = df[df['sector'] != '']
-
-        # ذخیره در کش
-        try:
-            df.to_parquet(SYMBOLS_META_FILE, index=False)
-        except Exception:
-            pass
-
-        return df
-
+    # تلاش ۲: fallback به download
+    try:
+        d = tse.download(symbols="all", write_to_csv=False)
+        symbols = list(d.keys())
+        SYMBOLS_FILE.write_text(json.dumps(symbols))
+        return symbols
     except Exception as e:
-        st.error(f"خطا در دریافت لیست نمادها با گروه: {type(e).__name__}: {e}")
-        return None
+        st.error(f"خطا در دریافت لیست نمادها: {type(e).__name__}: {e}")
+        return []
 
 
 def fetch_shares_for(symbols, progress_bar, already_done, total):
+    """دریافت تعداد سهام + نام + گروه برای لیست نمادها."""
     rows = []
     errors = []
     for i, sym in enumerate(symbols):
@@ -185,29 +158,62 @@ def fetch_shares_for(symbols, progress_bar, already_done, total):
         except Exception as e:
             errors.append(f"{sym}: {type(e).__name__}: {e}")
             continue
-        if i % 5 == 0:
+
+        if i % 3 == 0:
             done = already_done + i + 1
-            pct = min(done / total, 1.0)
+            pct = min(done / max(total, 1), 1.0)
             progress_bar.progress(pct, text=f"{done}/{total}: {sym}")
     return pd.DataFrame(rows), errors
+
+
+def fetch_in_batches(symbols, batch_size, status_container=None, progress_bar=None):
+    """دریافت دسته‌ای با وقفه."""
+    all_dfs = []
+    all_errors = []
+    total = len(symbols)
+
+    if progress_bar is None:
+        progress_bar = st.progress(0, text="شروع...")
+
+    for bstart in range(0, total, batch_size):
+        bsymbols = symbols[bstart:bstart + batch_size]
+        if status_container is not None:
+            status_container.write(
+                f"   دسته {bstart // batch_size + 1}/"
+                f"{(total - 1) // batch_size + 1}: {len(bsymbols)} نماد..."
+            )
+        bdf, berrors = fetch_shares_for(bsymbols, progress_bar, bstart, total)
+        all_dfs.append(bdf)
+        all_errors.extend(berrors)
+        if bstart + batch_size < total:
+            time.sleep(BATCH_PAUSE_SECONDS)
+
+    progress_bar.empty()
+    if all_dfs and any(not d.empty for d in all_dfs):
+        return pd.concat([d for d in all_dfs if not d.empty], ignore_index=True), all_errors
+    return pd.DataFrame(), all_errors
 
 
 # ==================== سایدبار ====================
 with st.sidebar:
     st.header("⚙️ تنظیمات")
+
     age = cache_age_hours()
     if age is not None and age <= CACHE_TTL_HOURS and DATA_FILE.exists():
         st.success(f"📦 کش معتبر ({age:.1f} ساعت پیش)")
+    elif age is not None:
+        st.warning(f"⚠️ کش قدیمی ({age:.1f} ساعت)")
     else:
-        st.info("ℹ️ کش معتبر موجود نیست")
+        st.info("ℹ️ کش موجود نیست")
 
     st.markdown("---")
-    batch_size = st.slider("اندازه هر دسته:", 10, 200, 50, 10)
+    batch_size = st.slider("اندازه هر دسته:", 10, 100, 25, 5,
+                           help="کوچک‌تر = فشار کمتر به CPU")
     st.markdown("---")
 
     if st.button("🗑️ پاک کردن کامل کش", use_container_width=True):
         clear_all_cache()
-        for k in ['df', 'meta_df']:
+        for k in ['df', 'symbol_list']:
             st.session_state.pop(k, None)
         st.success("کش پاک شد")
         st.rerun()
@@ -216,8 +222,8 @@ with st.sidebar:
 # ==================== بارگذاری state ====================
 if 'df' not in st.session_state:
     st.session_state.df = load_cache()
-if 'meta_df' not in st.session_state:
-    st.session_state.meta_df = None  # DataFrame با ستون‌های symbol, name, sector
+if 'symbol_list' not in st.session_state:
+    st.session_state.symbol_list = None
 
 df = st.session_state.df
 
@@ -240,21 +246,34 @@ if df is not None and not df.empty:
     with col1:
         search = st.text_input("🔍 جستجو:", placeholder="نام نماد یا شرکت...")
     with col2:
-        available_groups = sorted(
-            [g for g in df['گروه'].dropna().unique().tolist()
-             if g and g != 'نامشخص']
-        ) if 'گروه' in df.columns else []
-        selected_groups = st.multiselect(
-            "🏷️ فیلتر گروه صنعتی:",
-            options=available_groups, default=[],
-            help="اگر خالی باشد، همه گروه‌ها نمایش داده می‌شوند"
-        )
+        if 'گروه' in df.columns:
+            available_groups = sorted(
+                [g for g in df['گروه'].dropna().unique().tolist()
+                 if g and g != 'نامشخص']
+            )
+        else:
+            available_groups = []
+
+        if available_groups:
+            selected_groups = st.multiselect(
+                "🏷️ فیلتر گروه صنعتی:",
+                options=available_groups, default=[],
+                help="اگر خالی باشد، همه گروه‌ها نمایش داده می‌شوند"
+            )
+        else:
+            st.multiselect(
+                "🏷️ فیلتر گروه صنعتی:",
+                options=[], default=[], disabled=True,
+                help="هنوز گروهی در داده وجود ندارد"
+            )
+            selected_groups = []
     with col3:
         max_shares = st.number_input(
             "📉 حداکثر تعداد سهام:", min_value=0, value=0, step=1_000_000,
             help="مقدار ۰ = بدون فیلتر"
         )
 
+    # ---- اعمال فیلترها ----
     df_view = df.copy()
     if search:
         mask = (
@@ -299,218 +318,224 @@ if df is not None and not df.empty:
 
     st.markdown("---")
 
-    # ---- افزودن گروه‌های جدید ----
-    st.subheader("➕ افزودن گروه صنعتی دیگر")
+    # ---- افزودن نمادهای بیشتر ----
+    st.subheader("➕ افزودن نمادهای بیشتر")
 
-    if st.session_state.meta_df is None:
-        with st.spinner("دریافت لیست گروه‌ها (یک درخواست سبک)..."):
-            st.session_state.meta_df = get_symbols_with_sectors()
+    if st.session_state.symbol_list is None:
+        with st.spinner("دریافت لیست نمادها..."):
+            st.session_state.symbol_list = get_symbol_list()
 
-    meta_df = st.session_state.meta_df
-    if meta_df is None or meta_df.empty:
-        st.error("دریافت لیست گروه‌ها ناموفق بود. لطفاً صفحه را رفرش کنید.")
+    all_symbols = st.session_state.symbol_list or []
+    existing_symbols = set(df['نماد'].astype(str).tolist())
+    remaining_symbols = [s for s in all_symbols if s not in existing_symbols]
+
+    if not remaining_symbols:
+        st.success("🎉 همه نمادها دریافت شده‌اند!")
     else:
-        # گروه‌های موجود در متادیتا
-        all_sectors = sorted(meta_df['sector'].dropna().unique().tolist())
+        st.write(
+            f"**{len(remaining_symbols)}** نماد هنوز دریافت نشده‌اند "
+            f"(از {len(all_symbols)} نماد کل)."
+        )
 
-        # گروه‌هایی که قبلاً دریافت شده‌اند
-        existing_groups = set(df['گروه'].dropna().unique()) if 'گروه' in df.columns else set()
-
-        # گروه‌های قابل افزودن (گروه‌هایی که بخشی از نمادهاشان هنوز نیامده)
-        existing_symbols = set(df['نماد'].astype(str).tolist())
-        rows_before = len(df)
-
-        addable_sectors = []
-        for sector in all_sectors:
-            sector_syms = meta_df[meta_df['sector'] == sector]['symbol'].astype(str).tolist()
-            if any(s not in existing_symbols for s in sector_syms):
-                addable_sectors.append(sector)
-
-        if not addable_sectors:
-            st.success("🎉 همه گروه‌ها و نمادها دریافت شده‌اند!")
-        else:
-            sectors_to_add = st.multiselect(
-                "گروه‌های جدید برای افزودن:",
-                options=addable_sectors, default=[]
+        col_a, col_b = st.columns([2, 1])
+        with col_a:
+            count = st.number_input(
+                "تعداد نماد برای افزودن:",
+                min_value=10, max_value=min(500, len(remaining_symbols)),
+                value=min(50, len(remaining_symbols)), step=10
             )
-
-            if sectors_to_add:
-                # لیست نمادهای گروه‌های انتخاب‌شده که هنوز در df نیستند
-                symbols_to_fetch = []
-                for sector in sectors_to_add:
-                    sector_syms = meta_df[meta_df['sector'] == sector]['symbol'].astype(str).tolist()
-                    for s in sector_syms:
-                        if s not in existing_symbols:
-                            symbols_to_fetch.append(s)
-                # حذف تکراری‌ها ولی حفظ ترتیب
-                symbols_to_fetch = list(dict.fromkeys(symbols_to_fetch))
-
-                st.write(f"**تعداد نمادهای جدید:** {len(symbols_to_fetch)}")
-
-                if st.button(f"⬇️ دریافت {len(symbols_to_fetch)} نماد", type="primary"):
-                    progress = st.progress(0, text="شروع...")
-                    all_dfs = []
-                    all_errors = []
-                    for bstart in range(0, len(symbols_to_fetch), batch_size):
-                        bsymbols = symbols_to_fetch[bstart:bstart + batch_size]
-                        bdf, berrors = fetch_shares_for(
-                            bsymbols, progress, bstart, len(symbols_to_fetch)
-                        )
-                        all_dfs.append(bdf)
-                        all_errors.extend(berrors)
-                        if bstart + batch_size < len(symbols_to_fetch):
-                            time.sleep(BATCH_PAUSE_SECONDS)
-                    progress.empty()
-
-                    if all_dfs and any(not d.empty for d in all_dfs):
-                        new_df = pd.concat([d for d in all_dfs if not d.empty], ignore_index=True)
-                        merged = pd.concat([df, new_df], ignore_index=True)
-                        # حذف تکراری‌ها بر اساس نماد
-                        merged = merged.drop_duplicates(subset=['نماد'], keep='last')
-                        save_cache(merged)
-                        st.session_state.df = merged
-                        st.success(f"✅ {len(new_df)} نماد جدید اضافه شد")
-                        if all_errors:
-                            st.warning(f"⚠️ {len(all_errors)} خطا در دریافت")
-                        time.sleep(0.5)
-                        st.rerun()
-                    else:
-                        st.error("❌ هیچ نمادی دریافت نشد.")
-                        if all_errors:
-                            st.code("\n".join(all_errors[:10]))
+        with col_b:
+            st.write("")
+            st.write("")
+            if st.button(f"⬇️ افزودن {count} نماد", type="primary", use_container_width=True):
+                to_fetch = remaining_symbols[:count]
+                status = st.status("دریافت...", expanded=True)
+                with st.spinner(f"دریافت {len(to_fetch)} نماد..."):
+                    new_df, errors = fetch_in_batches(to_fetch, batch_size, status)
+                if not new_df.empty:
+                    merged = pd.concat([df, new_df], ignore_index=True)
+                    merged = merged.drop_duplicates(subset=['نماد'], keep='last')
+                    save_cache(merged)
+                    st.session_state.df = merged
+                    status.update(label=f"✅ {len(new_df)} نماد اضافه شد", state="complete")
+                    if errors:
+                        st.warning(f"⚠️ {len(errors)} خطا")
+                    time.sleep(0.4)
+                    st.rerun()
+                else:
+                    status.update(label="❌ ناموفق", state="error")
+                    if errors:
+                        st.code("\n".join(errors[:10]))
 
     if st.button("🔄 بروزرسانی کامل (پاک کردن کش)"):
         clear_all_cache()
-        for k in ['df', 'meta_df']:
+        for k in ['df', 'symbol_list']:
             st.session_state.pop(k, None)
         st.rerun()
 
 else:
-    # ==================== صفحه راه‌اندازی: انتخاب گروه ====================
-    st.info("📥 برای شروع، یک گروه صنعتی انتخاب کنید تا فقط نمادهای آن دریافت شود.")
+    # ==================== صفحه شروع ====================
+    st.info("📥 برای شروع، یکی از گزینه‌های زیر را انتخاب کنید.")
 
-    # دریافت لیست گروه‌ها
-    if st.session_state.meta_df is None:
-        with st.spinner("دریافت لیست گروه‌ها از TSETMC (یک درخواست سبک)..."):
-            st.session_state.meta_df = get_symbols_with_sectors()
+    # ---- دریافت لیست نمادها ----
+    if st.session_state.symbol_list is None:
+        with st.spinner("دریافت لیست نمادها از TSETMC..."):
+            st.session_state.symbol_list = get_symbol_list()
 
-    meta_df = st.session_state.meta_df
+    all_symbols = st.session_state.symbol_list or []
 
-    if meta_df is None or meta_df.empty:
+    if not all_symbols:
         st.error(
-            "❌ دریافت لیست گروه‌ها ناموفق بود. "
-            "ممکن است اتصال به TSETMC برقرار نباشد یا کتابخانه مشکل داشته باشد."
+            "❌ **دریافت لیست نمادها ناموفق بود.**\n\n"
+            "برای عیب‌یابی، از ابزار زیر استفاده کنید:"
         )
-
-        with st.expander("🔬 ابزار عیب‌یابی"):
+        with st.expander("🔬 تست اتصال به TSETMC", expanded=True):
             if st.button("🔬 تست دریافت یک نماد (فولاد)"):
                 try:
                     with st.spinner("در حال تست..."):
                         t = tse.Ticker("فولاد")
-                    st.success("✅ اتصال موفق")
+                    st.success("✅ اتصال موفق!")
                     st.write("**عنوان:**", getattr(t, 'title', 'N/A'))
                     st.write("**تعداد سهام:**", getattr(t, 'shares_outstanding', 'N/A'))
-                    attrs = [a for a in dir(t) if not a.startswith('_') and not callable(getattr(t, a, None))]
-                    st.write("**ویژگی‌ها:**")
+                    attrs = [a for a in dir(t) if not a.startswith('_')
+                             and not callable(getattr(t, a, None))]
+                    st.write("**ویژگی‌های موجود:**")
                     st.code(", ".join(attrs[:40]))
                 except Exception as e:
                     st.error(f"❌ خطا: {type(e).__name__}: {e}")
                     st.code(traceback.format_exc())
         st.stop()
 
-    # گروه‌ها و تعداد نمادهاشان
-    sector_counts = (
-        meta_df.groupby('sector')['symbol']
-        .count()
-        .sort_values(ascending=False)
-    )
+    # لیست نمادها موفق دریافت شد
+    st.success(f"✅ **{len(all_symbols)}** نماد شناسایی شد.")
 
-    st.markdown(f"**{len(sector_counts)}** گروه صنعتی در دسترس است:")
+    st.markdown("### 🎯 انتخاب نحوه شروع")
 
-    # نمایش سریع در جدول کوچک
-    with st.expander("مشاهده لیست کامل گروه‌ها", expanded=False):
-        show_df = sector_counts.reset_index()
-        show_df.columns = ['گروه صنعتی', 'تعداد نماد']
-        st.dataframe(show_df, use_container_width=True, hide_index=True)
+    tab1, tab2, tab3 = st.tabs([
+        "🚀 دریافت کامل (توصیه‌شده)",
+        "⚡ دریافت سریع (تست)",
+        "✍️ دریافت دستی نمادها"
+    ])
 
-    st.markdown("### 🏷️ انتخاب گروه برای شروع:")
+    # ---------- Tab 1: دریافت کامل ----------
+    with tab1:
+        st.markdown(f"""
+        **همه {len(all_symbols)} نماد دریافت می‌شود** (همراه با گروه صنعتی).
 
-    selected_sectors = st.multiselect(
-        "گروه‌های مورد نظر:",
-        options=sector_counts.index.tolist(),
-        default=[],
-        help="می‌توانید چند گروه را همزمان انتخاب کنید. سپس فقط نمادهای همان گروه‌ها دریافت می‌شوند."
-    )
+        ⏱ **زمان تقریبی:** {len(all_symbols) * 1.5 / 60:.0f} تا {len(all_symbols) * 3 / 60:.0f} دقیقه
 
-    # پیش‌نمایش
-    if selected_sectors:
-        symbols_to_fetch = []
-        for sector in selected_sectors:
-            syms = meta_df[meta_df['sector'] == sector]['symbol'].astype(str).tolist()
-            symbols_to_fetch.extend(syms)
-        symbols_to_fetch = list(dict.fromkeys(symbols_to_fetch))
+        ✅ **مزیت:** بعد از این یک‌بار، همه گروه‌ها در فیلترها ظاهر می‌شوند و تا ۱۲ ساعت نیازی به دریافت مجدد نیست.
 
-        st.info(f"📊 **{len(symbols_to_fetch)}** نماد از گروه‌های انتخابی دریافت خواهد شد.")
+        💡 این تنها راه دسترسی به **فیلتر گروه صنعتی** است، چون اطلاعات گروه فقط از طریق `Ticker` قابل دریافت است.
+        """)
 
-        with st.expander("پیش‌نمایش نمادها"):
-            preview = meta_df[meta_df['sector'].isin(selected_sectors)][['symbol', 'sector', 'name']]
-            st.dataframe(preview, use_container_width=True, hide_index=True)
-
-        if st.button(f"🚀 شروع دریافت {len(symbols_to_fetch)} نماد", type="primary", use_container_width=True):
+        if st.button("🚀 دریافت کامل همه نمادها", type="primary", use_container_width=True):
             status = st.status("در حال دریافت...", expanded=True)
-            progress = st.progress(0, text="شروع...")
+            df_new, errors = fetch_in_batches(all_symbols, batch_size, status)
 
-            all_dfs = []
-            all_errors = []
-            for bstart in range(0, len(symbols_to_fetch), batch_size):
-                bsymbols = symbols_to_fetch[bstart:bstart + batch_size]
-                status.write(f"   دسته {bstart//batch_size + 1}: {len(bsymbols)} نماد...")
-                bdf, berrors = fetch_shares_for(
-                    bsymbols, progress, bstart, len(symbols_to_fetch)
-                )
-                all_dfs.append(bdf)
-                all_errors.extend(berrors)
-                if bstart + batch_size < len(symbols_to_fetch):
-                    time.sleep(BATCH_PAUSE_SECONDS)
-
-            progress.empty()
-
-            if all_dfs and any(not d.empty for d in all_dfs):
-                new_df = pd.concat([d for d in all_dfs if not d.empty], ignore_index=True)
-                save_cache(new_df)
-                st.session_state.df = new_df
+            if not df_new.empty:
+                save_cache(df_new)
+                st.session_state.df = df_new
                 status.update(
-                    label=f"✅ {len(new_df)} شرکت دریافت شد",
+                    label=f"✅ {len(df_new)} شرکت دریافت شد ({len(errors)} خطا)",
                     state="complete"
                 )
-                if all_errors:
-                    st.warning(f"⚠️ {len(all_errors)} خطا در دریافت")
+                st.balloons()
                 time.sleep(0.5)
                 st.rerun()
             else:
                 status.update(label="❌ هیچ داده‌ای دریافت نشد", state="error")
-                st.error("دریافت ناموفق. علت‌های محتمل: اتصال به TSETMC، مشکل کتابخانه.")
-                if all_errors:
-                    st.code("\n".join(all_errors[:10]))
+                if errors:
+                    st.code("\n".join(errors[:10]))
+
+    # ---------- Tab 2: دریافت سریع ----------
+    with tab2:
+        st.markdown("برای تست سریع عملکرد برنامه، فقط چند نماد اول را دریافت کنید.")
+
+        quick_count = st.number_input(
+            "تعداد نماد:", min_value=10, max_value=300, value=100, step=10,
+            key="quick_count"
+        )
+
+        st.caption(
+            "⚠️ با این روش، فیلتر گروه فقط شامل گروه‌های همان چند نماد خواهد بود. "
+            "برای فیلتر کامل، از تب «دریافت کامل» استفاده کنید."
+        )
+
+        if st.button(f"⚡ دریافت {quick_count} نماد اول", use_container_width=True):
+            subset = all_symbols[:quick_count]
+            status = st.status("در حال دریافت...", expanded=True)
+            df_new, errors = fetch_in_batches(subset, batch_size, status)
+
+            if not df_new.empty:
+                save_cache(df_new)
+                st.session_state.df = df_new
+                status.update(
+                    label=f"✅ {len(df_new)} شرکت دریافت شد", state="complete"
+                )
+                if errors:
+                    st.warning(f"⚠️ {len(errors)} خطا")
+                time.sleep(0.4)
+                st.rerun()
+            else:
+                status.update(label="❌ ناموفق", state="error")
+                if errors:
+                    st.code("\n".join(errors[:10]))
+
+    # ---------- Tab 3: دریافت دستی ----------
+    with tab3:
+        st.markdown("""
+        نام نمادهای مورد نظر را وارد کنید (با کاما یا فاصله یا خط جدید جدا کنید).
+        مثال: `فولاد, خودرو, شپنا, خساپا`
+        """)
+
+        manual_input = st.text_area(
+            "نام نمادها:",
+            placeholder="فولاد, خودرو, شپنا",
+            height=100
+        )
+
+        if st.button("دریافت نمادهای وارد شده", use_container_width=True):
+            raw = manual_input.replace('\n', ',').replace(' ', ',').replace('،', ',')
+            user_symbols = [s.strip() for s in raw.split(',') if s.strip()]
+
+            if not user_symbols:
+                st.warning("هیچ نمادی وارد نشده است.")
+            else:
+                status = st.status("در حال دریافت...", expanded=True)
+                df_new, errors = fetch_in_batches(user_symbols, batch_size, status)
+
+                if not df_new.empty:
+                    save_cache(df_new)
+                    st.session_state.df = df_new
+                    status.update(
+                        label=f"✅ {len(df_new)} نماد دریافت شد", state="complete"
+                    )
+                    if errors:
+                        st.warning(f"⚠️ {len(errors)} خطا")
+                        st.code("\n".join(errors[:5]))
+                    time.sleep(0.4)
+                    st.rerun()
+                else:
+                    status.update(label="❌ ناموفق", state="error")
+                    if errors:
+                        st.code("\n".join(errors[:10]))
 
 
 # ==================== راهنما ====================
 st.markdown("---")
 with st.expander("💡 راهنما"):
     st.markdown("""
-    ### 🎯 چطور فقط گروه دلخواهم را دریافت کنم؟
-    1. در صفحه شروع، از لیست گروه‌ها (مثل «بانک‌ها و موسسات اعتباری»، «دارو») یکی را انتخاب کنید.
-    2. تعداد نمادها نمایش داده می‌شود (مثلاً ۳۰ نماد).
-    3. روی **🚀 شروع دریافت** کلیک کنید. فقط همان ۳۰ نماد دریافت می‌شوند.
-    4. بعداً می‌توانید از داشبورد، گروه دیگری را از بخش **➕ افزودن گروه صنعتی دیگر** اضافه کنید.
+    ### چرا گروه صنعتی بدون دریافت همه نمادها ممکن نیست؟
+    سایت TSETMC گروه صنعتی را در API لیست نمادها برنمی‌گرداند. تنها راه، فراخوانی
+    `Ticker(symbol)` برای هر نماد است که هم‌زمان تعداد سهام و گروه را می‌دهد.
+    به همین دلیل، برای دسترسی به فیلتر گروه، یک‌بار باید همه نمادها دریافت شوند.
 
-    ### 💡 چرا این روش بهتر است؟
-    - به‌جای دریافت تصادفی ۵۰ نماد و هدر دادن CPU، فقط نمادهای گروه انتخابی دریافت می‌شوند.
-    - لیست گروه‌ها از یک API سبک خوانده می‌شود (نه ۵۰۰ درخواست).
-    - هر گروه معمولاً ۱۰ تا ۴۰ نماد دارد → خیلی سریع و بدون Throttle.
+    ### راهکارها برای جلوگیری از Throttle
+    - **دریافت کامل یک‌بار:** بعد از آن، تا ۱۲ ساعت از کش استفاده می‌شود.
+    - **دسته‌بندی:** اندازه دسته را در سایدبار کوچک نگه دارید (مثلاً ۲۵).
+    - **وقفه:** بین دسته‌ها ۰.۵ ثانیه وقفه وجود دارد.
 
-    ### 🛡 جلوگیری از Throttle
-    - کش ۱۲ ساعته
-    - دریافت هدفمند گروه‌به‌گروه
-    - وقفه ۰.۸ ثانیه بین دسته‌ها
-    """)
+    ### اگر تعداد سهام یا گروه «نامشخص» است
+    نسخه `pytse-client` ممکن است ویژگی `group_name` را نداشته باشد.
+    در `requirements.txt` می‌توانید از نسخه git استفاده کنید:
